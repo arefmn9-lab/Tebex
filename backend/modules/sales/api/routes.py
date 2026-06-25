@@ -111,3 +111,27 @@ def update_opportunity(
         )
 
     return opportunity
+
+
+@router.delete(
+    "/{opportunity_id}",
+)
+def delete_opportunity(
+    opportunity_id: int,
+    db: Session = Depends(get_db),
+):
+
+    opportunity = OpportunityService.delete(
+        db,
+        opportunity_id,
+    )
+
+    if opportunity is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Opportunity not found",
+        )
+
+    return {
+        "message": "Opportunity deleted successfully",
+    }

@@ -2,8 +2,8 @@ from sqlalchemy.orm import Session
 
 from modules.sales.repository.opportunity_repository import OpportunityRepository
 from modules.sales.schemas.opportunity_create import OpportunityCreate
-from modules.sales.schemas.opportunity_update import OpportunityUpdate
 from modules.sales.schemas.opportunity_search import OpportunitySearch
+from modules.sales.schemas.opportunity_update import OpportunityUpdate
 
 
 class OpportunityService:
@@ -81,4 +81,23 @@ class OpportunityService:
             db,
             opportunity,
             data,
+        )
+
+    @staticmethod
+    def delete(
+        db: Session,
+        opportunity_id: int,
+    ):
+
+        opportunity = OpportunityRepository.get_by_id(
+            db,
+            opportunity_id,
+        )
+
+        if opportunity is None:
+            return None
+
+        return OpportunityRepository.delete(
+            db,
+            opportunity,
         )
