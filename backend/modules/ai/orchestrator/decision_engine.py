@@ -36,6 +36,21 @@ class DecisionEngine:
 
         return default_platform or "unknown", "no adapter available"
 
+    @classmethod
+    def select_platform_from_ai_output(
+        cls,
+        ai_output: str,
+        available_platforms: list[str],
+    ):
+        output = ai_output.lower()
+        normalized_platforms = {platform.lower(): platform for platform in available_platforms}
+
+        for platform_name, original_name in normalized_platforms.items():
+            if platform_name in output:
+                return original_name, "ai provider selected platform"
+
+        return None, "ai provider did not return a supported platform"
+
     @staticmethod
     def _build_context(job_input: Any):
         if isinstance(job_input, dict):
