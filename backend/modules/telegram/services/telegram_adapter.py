@@ -1,8 +1,9 @@
 import logging
-from typing import Protocol
 
 from sqlalchemy.orm import Session
 
+from modules.platform.schemas.message import UnifiedMessageSchema
+from modules.platform.services.base_adapter import BaseAdapter
 from modules.telegram.exceptions import InvalidSession
 from modules.telegram.repository.telegram_account_repository import (
     TelegramAccountRepository,
@@ -13,30 +14,7 @@ from modules.telegram.services.telegram_client import TelegramClient
 logger = logging.getLogger(__name__)
 
 
-class PlatformAdapter(Protocol):
-    def connect(self, db: Session, *args, **kwargs):
-        ...
-
-    def disconnect(self, db: Session, communication_account_id: int):
-        ...
-
-    def send_message(
-        self,
-        db: Session,
-        communication_account_id: int,
-        target: str,
-        text: str,
-    ):
-        ...
-
-    def receive_message(self, db: Session, communication_account_id: int):
-        ...
-
-    def health_check(self, db: Session, communication_account_id: int | None = None):
-        ...
-
-
-class TelegramAdapter:
+class TelegramAdapter(BaseAdapter):
     def __init__(self, client: TelegramClient | None = None):
         self.client = client or TelegramClient()
 
@@ -77,12 +55,23 @@ class TelegramAdapter:
         self,
         db: Session,
         communication_account_id: int,
-        target: str,
-        text: str,
+        message: UnifiedMessageSchema | None = None,
+        target: str | None = None,
+        text: str | None = None,
     ):
+        if message is None:
+            message = UnifiedMessageSchema(
+                chat_id=target or "",
+                message=text or "",
+            )
+
         account = self._get_account(db, communication_account_id)
         try:
-            result = self.client.send_message(account, target, text)
+            result = self.client.send_message(
+                account,
+                message.chat_id,
+                message.message,
+            )
             logger.info("Telegram mock send completed for account %s", account.id)
             return result
         except Exception:
@@ -109,7 +98,7 @@ class TelegramAdapter:
 
         return self.client.health_check(account)
 
-    def status(self, db: Session, communication_account_id: int | None = None):
+    def get_status(self, db: Session, communication_account_id: int | None = None):
         account = None
         if communication_account_id is not None:
             account = TelegramAccountRepository.get_by_communication_account_id(
@@ -124,6 +113,9 @@ class TelegramAdapter:
             "session_valid": session_valid,
             "account": account,
         }
+
+    def status(self, db: Session, communication_account_id: int | None = None):
+        return self.get_status(db, communication_account_id)
 
     def _get_account(self, db: Session, communication_account_id: int):
         account = TelegramAccountRepository.get_by_communication_account_id(

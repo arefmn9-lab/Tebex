@@ -85,7 +85,7 @@ def get_status(
     db: Session = Depends(get_db),
 ):
     adapter = TelegramAdapter()
-    return adapter.status(db, communication_account_id)
+    return adapter.get_status(db, communication_account_id)
 
 
 @router.get("/health", response_model=TelegramHealthResponse)
