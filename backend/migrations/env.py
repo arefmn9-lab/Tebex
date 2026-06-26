@@ -13,7 +13,9 @@ from modules.communication.models.conversation import Conversation
 from modules.communication.models.job import Job
 from modules.communication.models.message import Message
 from modules.communication.models.platform import Platform
+from modules.queue.models.queue_item import QueueItem
 from modules.sales.models.opportunity import Opportunity
+from modules.worker.models.worker import Worker
 
 config = context.config
 
