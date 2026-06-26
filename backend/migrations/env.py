@@ -15,6 +15,7 @@ from modules.communication.models.message import Message
 from modules.communication.models.platform import Platform
 from modules.queue.models.queue_item import QueueItem
 from modules.sales.models.opportunity import Opportunity
+from modules.telegram.models.telegram_account import TelegramAccount
 from modules.worker.models.worker import Worker
 
 config = context.config
