@@ -1,11 +1,12 @@
 from dataclasses import asdict, is_dataclass
+import time
 from typing import Any
 
 from modules.account_control.account_manager import AccountManager
 from modules.account_control.models import AccountStatus
 from modules.account_control.rate_limiter import RateLimiter
 from modules.account_control.scheduler import AccountScheduler
-from modules.dashboard.schemas import DashboardOverview, RunAIRequest, SendMessageRequest
+from modules.dashboard.schemas import DashboardOverview, LoginAccountRequest, RunAIRequest, SendMessageRequest
 from modules.production.logger import ProductionLogger
 from modules.production.metrics import MetricsEngine
 from modules.sales_hub.service import SalesHubService
@@ -108,6 +109,23 @@ class DashboardService:
         }
 
     @staticmethod
+    def login_account(request: LoginAccountRequest):
+        platform = request.platform.strip().lower()
+        if platform not in {"telegram", "instagram"}:
+            return {
+                "success": False,
+                "error": "Only telegram and instagram login flows are enabled in the dashboard.",
+            }
+
+        account_id = request.account_id or int(time.time())
+        return AccountManager.start_login_flow_async(
+            account_id=account_id,
+            platform=platform,
+            username=request.username,
+            timeout_seconds=request.timeout_seconds,
+        )
+
+    @staticmethod
     def _account_dict(account):
         usage = RateLimiter.usage_for(account.id, account.platform)
         data = asdict(account) if is_dataclass(account) else dict(account)
@@ -116,7 +134,7 @@ class DashboardService:
             account.platform,
             account.platform.title(),
         )
-        data["login_status"] = "Logged in" if account.is_logged_in else account.login_status
+        data["login_status"] = account.login_status if account.is_logged_in else account.login_status
         data["is_logged_in"] = account.is_logged_in
         data["warmup_status"] = DashboardService._warmup_status(account)
         data["created_at"] = account.created_at.isoformat()

@@ -1,5 +1,7 @@
 from copy import deepcopy
 from datetime import datetime, timezone
+import threading
+import time
 from typing import Any
 
 from modules.account_control.models import (
@@ -18,6 +20,7 @@ from modules.browser.session.session_manager import SessionManager
 
 class AccountManager:
     _accounts: dict[str, Account] = {}
+    _login_threads: dict[str, threading.Thread] = {}
     ACCOUNT_CLASSES = {
         "telegram": TelegramAccount,
         "instagram": InstagramAccount,
@@ -98,7 +101,7 @@ class AccountManager:
         client = PlaywrightClient(headless=headless)
         page = client.get_page()
         page.goto(login_url or cls.LOGIN_URLS.get(account.platform, "about:blank"))
-        account.login_status = "Login pending"
+        account.login_status = "LOGGING IN"
         account.metadata["login_started_at"] = datetime.now(timezone.utc).isoformat()
         account.metadata["login_url"] = page.url
         return {
@@ -109,13 +112,123 @@ class AccountManager:
         }
 
     @classmethod
+    def start_login_flow_async(
+        cls,
+        account_id: int | str,
+        platform: str,
+        username: str | None = None,
+        timeout_seconds: int = 300,
+    ):
+        account = cls.ensure_account(account_id, platform)
+        if username:
+            account.username = username
+
+        key = cls._key(account.id, account.platform)
+        existing_thread = cls._login_threads.get(key)
+        if existing_thread and existing_thread.is_alive():
+            return {
+                "success": True,
+                "account_id": account.id,
+                "platform": account.platform,
+                "login_status": account.login_status,
+                "status": str(account.status),
+                "message": "Login flow is already running.",
+            }
+
+        account.login_status = "LOGGING IN"
+        account.metadata["login_started_at"] = datetime.now(timezone.utc).isoformat()
+        thread = threading.Thread(
+            target=cls._run_login_flow,
+            args=(account.id, account.platform, username, timeout_seconds),
+            name=f"login-{account.platform}-{account.id}",
+            daemon=True,
+        )
+        cls._login_threads[key] = thread
+        thread.start()
+        return {
+            "success": True,
+            "account_id": account.id,
+            "platform": account.platform,
+            "login_status": account.login_status,
+            "status": str(account.status),
+            "message": "Chrome login flow started. Complete the manual or QR login in the opened browser.",
+        }
+
+    @classmethod
     def save_login_session(cls, account_id: int | str, platform: str, browser_context):
         account = cls.ensure_account(account_id, platform)
         session_path = SessionManager().save_session(account.id, account.platform, browser_context)
         account.attach_session(str(session_path), {"storage_state_path": str(session_path)})
-        account.status = AccountStatus.WARMING_UP if account.status == AccountStatus.NEW else account.status
+        account.status = AccountStatus.ACTIVE
+        account.login_status = "ACTIVE"
         account.metadata["login_completed_at"] = datetime.now(timezone.utc).isoformat()
         return account
+
+    @classmethod
+    def _run_login_flow(
+        cls,
+        account_id: int | str,
+        platform: str,
+        username: str | None,
+        timeout_seconds: int,
+    ):
+        client = None
+        account = cls.ensure_account(account_id, platform)
+        try:
+            flow = cls.start_login_flow(
+                account_id=account_id,
+                platform=platform,
+                username=username,
+                headless=False,
+            )
+            client = flow["client"]
+            page = flow["page"]
+            login_url = flow["account"].metadata.get("login_url") or ""
+            started_at = time.monotonic()
+
+            while time.monotonic() - started_at < timeout_seconds:
+                time.sleep(5)
+                elapsed = time.monotonic() - started_at
+                if elapsed < 15:
+                    continue
+                if cls._login_detected(client.context, page, login_url):
+                    cls.save_login_session(account_id, platform, client.context)
+                    return
+
+            account.login_status = "NOT LOGGED IN"
+            account.metadata["login_error"] = "manual login timed out"
+            account.metadata["login_timed_out_at"] = datetime.now(timezone.utc).isoformat()
+        except Exception as exc:
+            account.login_status = "NOT LOGGED IN"
+            account.metadata["login_error"] = str(exc)
+            account.metadata["login_failed_at"] = datetime.now(timezone.utc).isoformat()
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _login_detected(context, page, login_url: str):
+        try:
+            current_url = page.url or ""
+        except Exception:
+            current_url = ""
+
+        if login_url and current_url and current_url != login_url and "login" not in current_url.lower():
+            return True
+
+        try:
+            state = context.storage_state()
+        except Exception:
+            return False
+
+        cookies = state.get("cookies") or []
+        origins = state.get("origins") or []
+        has_local_storage = any(origin.get("localStorage") for origin in origins)
+        return bool(cookies and has_local_storage)
+
 
     @classmethod
     def prepare_execution_plan(cls, plan: Any):

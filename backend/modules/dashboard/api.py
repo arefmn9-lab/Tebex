@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
-from modules.dashboard.schemas import RunAIRequest, SendMessageRequest
+from modules.dashboard.schemas import LoginAccountRequest, RunAIRequest, SendMessageRequest
 from modules.dashboard.services import DashboardService
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -55,6 +55,14 @@ def send_message(request: SendMessageRequest):
 @router.post("/run_ai")
 def run_ai(request: RunAIRequest):
     return DashboardService.run_ai(request)
+
+
+@router.post("/accounts/login")
+def login_account(request: LoginAccountRequest):
+    result = DashboardService.login_account(request)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
 
 
 DASHBOARD_HTML = """
@@ -115,7 +123,7 @@ DASHBOARD_HTML = """
     th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid #edf0f5; vertical-align: top; }
     html[dir="rtl"] th, html[dir="rtl"] td { text-align: right; }
     th { color: #5d6b83; font-weight: 600; }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
       border: 1px solid #c9d1df;
       border-radius: 6px;
@@ -136,6 +144,10 @@ DASHBOARD_HTML = """
       cursor: pointer;
     }
     button.secondary { background: #334155; }
+    button.ghost {
+      background: #e2e8f0;
+      color: #172033;
+    }
     button.language {
       background: #e2e8f0;
       color: #172033;
@@ -162,6 +174,34 @@ DASHBOARD_HTML = """
       font-size: 12px;
       font-weight: 700;
     }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .section-title h2 { margin: 0; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(15, 23, 42, 0.44);
+      z-index: 20;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: min(440px, 100%);
+      background: #ffffff;
+      border: 1px solid #d8deea;
+      border-radius: 8px;
+      padding: 18px;
+      box-shadow: 0 18px 50px rgba(15, 23, 42, 0.18);
+    }
+    .modal h2 { margin: 0 0 14px; }
     @media (max-width: 980px) {
       .metrics { grid-template-columns: repeat(2, 1fr); }
       .grid { grid-template-columns: 1fr; }
@@ -204,7 +244,10 @@ DASHBOARD_HTML = """
         <pre id="actionResult" data-i18n="empty.noAction"></pre>
       </section>
       <section>
-        <h2 data-i18n="sections.accounts"></h2>
+        <div class="section-title">
+          <h2 data-i18n="sections.accounts"></h2>
+          <button type="button" onclick="openAddAccountModal()" data-i18n="buttons.addAccount"></button>
+        </div>
         <div id="accountsTable"></div>
       </section>
       <section>
@@ -217,6 +260,23 @@ DASHBOARD_HTML = """
       </section>
     </div>
   </main>
+  <div id="addAccountModal" class="modal-backdrop" onclick="backdropClose(event)">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="addAccountTitle">
+      <h2 id="addAccountTitle" data-i18n="sections.addAccount"></h2>
+      <div class="form-row">
+        <select id="loginPlatform" aria-label="platform">
+          <option value="telegram" data-i18n="platform.telegram"></option>
+          <option value="instagram" data-i18n="platform.instagram"></option>
+        </select>
+      </div>
+      <div class="form-row"><input id="loginUsername" data-i18n-placeholder="inputs.username"></div>
+      <div class="form-row"><input id="loginAccountId" data-i18n-placeholder="inputs.optionalAccountId"></div>
+      <div class="actions">
+        <button type="button" onclick="startAccountLogin()" data-i18n="buttons.startLogin"></button>
+        <button type="button" class="ghost" onclick="closeAddAccountModal()" data-i18n="buttons.cancel"></button>
+      </div>
+    </div>
+  </div>
   <script>
     let currentLanguage = localStorage.getItem("dashboardLanguage") || "fa";
     let translations = {};
@@ -284,6 +344,30 @@ DASHBOARD_HTML = """
       document.getElementById("actionResult").textContent = JSON.stringify(result, null, 2);
       refresh();
     }
+    function openAddAccountModal() {
+      document.getElementById("addAccountModal").classList.add("open");
+    }
+    function closeAddAccountModal() {
+      document.getElementById("addAccountModal").classList.remove("open");
+    }
+    function backdropClose(event) {
+      if (event.target.id === "addAccountModal") closeAddAccountModal();
+    }
+    async function startAccountLogin() {
+      const payload = {
+        platform: document.getElementById("loginPlatform").value,
+        username: document.getElementById("loginUsername").value || null,
+        account_id: document.getElementById("loginAccountId").value || null
+      };
+      const result = await api("/dashboard/accounts/login", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      document.getElementById("actionResult").textContent = JSON.stringify(result, null, 2);
+      closeAddAccountModal();
+      refresh();
+    }
     function renderTable(rows, columns) {
       if (!rows.length) return `<div class='label'>${t("empty.noData")}</div>`;
       return "<table><thead><tr>" + columns.map(c => `<th>${t(c.labelKey)}</th>`).join("") +
@@ -326,9 +410,9 @@ DASHBOARD_HTML = """
     }
 
     function translateLoginStatus(status) {
-      const normalized = String(status || "").toLowerCase();
-      if (normalized === "logged in") return t("login.loggedIn");
-      if (normalized === "login pending") return t("login.pending");
+      const normalized = String(status || "").trim().toLowerCase();
+      if (normalized === "active" || normalized === "logged in") return t("login.active");
+      if (normalized === "logging in" || normalized === "login pending") return t("login.loggingIn");
       if (normalized === "not logged in") return t("login.notLoggedIn");
       return status || "";
     }

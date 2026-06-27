@@ -32,3 +32,10 @@ class RunAIRequest(BaseModel):
     target: str = Field(min_length=1)
     history: Optional[list[dict[str, Any]]] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LoginAccountRequest(BaseModel):
+    platform: str
+    account_id: int | str | None = None
+    username: str | None = None
+    timeout_seconds: int = Field(default=300, ge=30, le=1800)
