@@ -1,13 +1,13 @@
 class PlaywrightClient:
     def __init__(self, headless: bool = True):
         self.headless = headless
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page = None
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
 
     def start(self):
-        if self._browser is not None:
+        if self.browser is not None:
             return self
 
         try:
@@ -15,8 +15,8 @@ class PlaywrightClient:
         except ImportError as exc:
             raise RuntimeError("Playwright is not installed") from exc
 
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
             channel="chrome",
             headless=self.headless,
         )
@@ -24,32 +24,35 @@ class PlaywrightClient:
 
     def new_context(self, storage_state: str | dict | None = None, **kwargs):
         self.start()
+        if self.context is not None:
+            self.context.close()
+
         context_kwargs = dict(kwargs)
         if storage_state:
             context_kwargs["storage_state"] = storage_state
 
-        self._context = self._browser.new_context(**context_kwargs)
-        self._page = self._context.new_page()
-        return self._context
+        self.context = self.browser.new_context(**context_kwargs)
+        self.page = self.context.new_page()
+        return self.context
 
     def get_page(self):
         self.start()
-        if self._context is None:
+        if self.context is None:
             self.new_context()
-        if self._page is None:
-            self._page = self._context.new_page()
-        return self._page
+        if self.page is None:
+            self.page = self.context.new_page()
+        return self.page
 
     def close(self):
-        if self._context is not None:
-            self._context.close()
-            self._context = None
-            self._page = None
+        if self.context is not None:
+            self.context.close()
+            self.context = None
+            self.page = None
 
-        if self._browser is not None:
-            self._browser.close()
-            self._browser = None
+        if self.browser is not None:
+            self.browser.close()
+            self.browser = None
 
-        if self._playwright is not None:
-            self._playwright.stop()
-            self._playwright = None
+        if self.playwright is not None:
+            self.playwright.stop()
+            self.playwright = None

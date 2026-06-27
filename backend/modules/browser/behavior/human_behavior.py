@@ -13,8 +13,8 @@ class HumanBehavior:
         page,
         selector: str,
         text: str,
-        minimum_delay_ms: int = 40,
-        maximum_delay_ms: int = 160,
+        minimum_delay_ms: int = 100,
+        maximum_delay_ms: int = 800,
     ):
         page.click(selector)
         for character in text:
@@ -24,5 +24,5 @@ class HumanBehavior:
             )
         return page
 
-    def jitter(self, minimum: int = 40, maximum: int = 160):
+    def jitter(self, minimum: int = 100, maximum: int = 800):
         return random.randint(minimum, maximum)
