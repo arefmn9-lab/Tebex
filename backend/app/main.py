@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.routes.automation import router as automation_router
 from modules.communication.api.routes import router as communication_router
 from modules.dashboard.routes import router as dashboard_router
 from modules.platform.services.adapter_registry import AdapterRegistry
@@ -24,6 +25,7 @@ app.include_router(worker_router)
 app.include_router(telegram_router)
 app.include_router(dashboard_router)
 app.include_router(health_router)
+app.include_router(automation_router)
 
 
 @app.get("/")

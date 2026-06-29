@@ -1,0 +1,23 @@
+{
+  "name": "demo_send_message",
+  "version": "1.0",
+  "platform": "demo",
+  "steps": [
+    {
+      "action": "open_app",
+      "params": {"app": "demo_messenger"}
+    },
+    {
+      "action": "wait",
+      "params": {"seconds": 1}
+    },
+    {
+      "action": "send_message",
+      "params": {
+        "target": "demo_user",
+        "text": "Hello from ClinicOS Automation Engine"
+      }
+    }
+  ]
+}
+
