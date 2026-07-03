@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .dispatcher import ActionDispatcher, ActionNotFoundError
+from .events import STEP_COMPLETED, STEP_FAILED, STEP_STARTED, global_event_bus
 from .schemas import ScenarioDefinition, ScenarioStep, TaskResult, TaskStatus
 from .state import TaskState
 
@@ -61,9 +62,29 @@ class ScenarioEngine:
         for index, step in enumerate(scenario.steps):
             state.current_step_index = index
             state.add_log(f"Step {index} started: {step.action}")
+            global_event_bus.emit(
+                STEP_STARTED,
+                {
+                    "task_id": task_id,
+                    "scenario": scenario.name,
+                    "step_index": index,
+                    "action": step.action,
+                    "params": step.params,
+                },
+            )
             try:
                 result = self.dispatcher.execute(step.action, step.params)
             except ActionNotFoundError as exc:
+                global_event_bus.emit(
+                    STEP_FAILED,
+                    {
+                        "task_id": task_id,
+                        "scenario": scenario.name,
+                        "step_index": index,
+                        "action": step.action,
+                        "message": str(exc),
+                    },
+                )
                 state.mark_failed(str(exc))
                 return TaskResult(
                     task_id=task_id,
@@ -74,6 +95,16 @@ class ScenarioEngine:
                 )
             except Exception as exc:
                 message = f"Step {index} failed: {exc}"
+                global_event_bus.emit(
+                    STEP_FAILED,
+                    {
+                        "task_id": task_id,
+                        "scenario": scenario.name,
+                        "step_index": index,
+                        "action": step.action,
+                        "message": message,
+                    },
+                )
                 state.mark_failed(message)
                 return TaskResult(
                     task_id=task_id,
@@ -85,6 +116,16 @@ class ScenarioEngine:
 
             if not result.get("ok", False):
                 message = str(result.get("message", f"Step {index} failed"))
+                global_event_bus.emit(
+                    STEP_FAILED,
+                    {
+                        "task_id": task_id,
+                        "scenario": scenario.name,
+                        "step_index": index,
+                        "action": step.action,
+                        "message": message,
+                    },
+                )
                 state.mark_failed(message)
                 return TaskResult(
                     task_id=task_id,
@@ -95,6 +136,16 @@ class ScenarioEngine:
                 )
 
             state.add_log(f"Step {index} completed: {result.get('message', '')}")
+            global_event_bus.emit(
+                STEP_COMPLETED,
+                {
+                    "task_id": task_id,
+                    "scenario": scenario.name,
+                    "step_index": index,
+                    "action": step.action,
+                    "message": result.get("message", ""),
+                },
+            )
 
         state.mark_success()
         return TaskResult(
@@ -104,4 +155,3 @@ class ScenarioEngine:
             message="Scenario executed successfully",
             logs=state.logs,
         )
-

@@ -2,28 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-.env
+frontend/node_modules/
+frontend/dist/
 
-.vscode/
-
-.idea/
-
-backend/.pytest_cache/
-
-backend/.mypy_cache/
-
-backend/.ruff_cache/
-
-backend/htmlcov/
-
-backend/.coverage
-
-backend/*.db
-
-backend/**/*.db
-
-backend/**/*.sqlite
-
-backend/**/*.sqlite3
-
+backend/clinicos.db
 backend/runtime/
+.env
+*.log

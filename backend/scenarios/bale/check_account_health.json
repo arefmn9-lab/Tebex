@@ -1,0 +1,25 @@
+{
+  "scenario_id": "check_account_health",
+  "platform_id": "bale",
+  "name": "Check account health",
+  "type": "health_check",
+  "enabled": true,
+  "dry_run": true,
+  "context": {},
+  "elements": {
+    "login_state": "Visible logged-in Bale Web state",
+    "limitation_banner": "Visible account limitation state if present"
+  },
+  "steps": [
+    {"step_id": "open_bale_web", "action": "open_url", "description": "Open Bale Web"},
+    {"step_id": "verify_login", "action": "check_login", "description": "Check whether manual login is still valid"},
+    {"step_id": "inspect_limits", "action": "inspect_ui_state", "description": "Look for visible limitation or blocked state"},
+    {"step_id": "record_health", "action": "record_result", "description": "Record readiness state"}
+  ],
+  "limits": {},
+  "safety": {
+    "require_manual_login": true,
+    "stop_on_error": true,
+    "allow_bulk_execution": false
+  }
+}

@@ -1,0 +1,1 @@
+"""Isolated automation platform plugins."""

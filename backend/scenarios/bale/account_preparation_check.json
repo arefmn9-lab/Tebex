@@ -1,0 +1,28 @@
+{
+  "scenario_id": "account_preparation_check",
+  "platform_id": "bale",
+  "name": "Account preparation readiness check",
+  "type": "preparation",
+  "enabled": true,
+  "dry_run": true,
+  "context": {},
+  "elements": {
+    "account_record": "Persisted account governance record"
+  },
+  "steps": [
+    {"step_id": "load_account", "action": "load_account", "description": "Load selected account governance state"},
+    {"step_id": "check_ownership_rule", "action": "check_rule", "description": "Confirm only owned accounts rule is enabled"},
+    {"step_id": "check_manual_approval", "action": "check_rule", "description": "Confirm manual approval is required"},
+    {"step_id": "check_health_score", "action": "check_health_score", "description": "Check health score and failure count"},
+    {"step_id": "record_readiness", "action": "record_result", "description": "Record preparation readiness"}
+  ],
+  "limits": {
+    "max_test_messages_per_account_per_day": 3,
+    "min_delay_seconds": 300
+  },
+  "safety": {
+    "require_manual_login": true,
+    "stop_on_error": true,
+    "allow_bulk_execution": false
+  }
+}

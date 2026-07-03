@@ -1,0 +1,14 @@
+{
+  "name": "bale_open_account",
+  "version": "1.0",
+  "platform": "bale",
+  "steps": [
+    {
+      "action": "open_url",
+      "params": {
+        "url": "https://web.bale.ai",
+        "login_required": true
+      }
+    }
+  ]
+}

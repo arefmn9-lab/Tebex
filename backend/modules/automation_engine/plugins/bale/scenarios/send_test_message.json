@@ -1,0 +1,40 @@
+{
+  "name": "bale_send_test_message",
+  "version": "1.0",
+  "platform": "bale",
+  "steps": [
+    {
+      "action": "open_url",
+      "params": {
+        "url": "https://web.bale.ai",
+        "login_required": true
+      }
+    },
+    {
+      "action": "type_text",
+      "params": {
+        "selector": "__SEARCH_INPUT__",
+        "text": "{{target}}"
+      }
+    },
+    {
+      "action": "click_element",
+      "params": {
+        "selector": "__CHAT_ITEM__"
+      }
+    },
+    {
+      "action": "type_text",
+      "params": {
+        "selector": "__MESSAGE_INPUT__",
+        "text": "{{message}}"
+      }
+    },
+    {
+      "action": "click_element",
+      "params": {
+        "selector": "__SEND_BUTTON__"
+      }
+    }
+  ]
+}

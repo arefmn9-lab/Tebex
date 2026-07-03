@@ -1,0 +1,42 @@
+{
+  "scenario_id": "forward_from_source",
+  "platform_id": "bale",
+  "name": "Forward prepared source message",
+  "type": "forward_from_source",
+  "enabled": true,
+  "dry_run": true,
+  "context": {
+    "source": {
+      "source_type": "message_link",
+      "source_value": "",
+      "source_message_hint": "",
+      "description": ""
+    },
+    "target": ""
+  },
+  "elements": {
+    "source_message": "Configured source message or message link",
+    "forward_button": "Verified Bale Web forward action",
+    "target_picker": "Allowed one-test target selector"
+  },
+  "steps": [
+    {"step_id": "open_bale_web", "action": "open_url", "description": "Open Bale Web for the selected account"},
+    {"step_id": "verify_login", "action": "check_login", "description": "Verify manual login state"},
+    {"step_id": "open_source", "action": "open_source", "description": "Open configured source chat, channel, group, or message link"},
+    {"step_id": "locate_source_message", "action": "find_source_message", "description": "Locate the prepared source message"},
+    {"step_id": "open_forward_action", "action": "open_forward", "description": "Open the forward action for the prepared message"},
+    {"step_id": "choose_test_target", "action": "choose_target", "description": "Choose one allowed test target only"},
+    {"step_id": "forward_once", "action": "forward_once", "description": "Forward once only when dry_run=false and explicit test mode is requested"},
+    {"step_id": "record_result", "action": "record_result", "description": "Record dry-run or test-forward result"}
+  ],
+  "limits": {
+    "max_targets": 1,
+    "max_actions_per_request": 1,
+    "min_delay_seconds": 300
+  },
+  "safety": {
+    "require_manual_login": true,
+    "stop_on_error": true,
+    "allow_bulk_execution": false
+  }
+}
