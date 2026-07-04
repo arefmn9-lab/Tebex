@@ -97,6 +97,13 @@ export function importBulkContactList(formData) {
   });
 }
 
+export function importManualBulkContactList(payload) {
+  return request("/automation/bulk/contact-lists/manual", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function listBulkContacts(contactListId) {
   return request(`/automation/bulk/contact-lists/${encodeURIComponent(contactListId)}/contacts`);
 }

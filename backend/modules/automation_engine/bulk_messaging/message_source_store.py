@@ -8,7 +8,7 @@ from typing import Any
 from .models import MessageSource
 
 
-SOURCE_TYPES = {"channel", "group", "chat", "link"}
+SOURCE_TYPES = {"channel", "group", "chat", "link", "text_message"}
 MESSAGE_REF_TYPES = {"latest", "pinned", "specific"}
 
 

@@ -185,6 +185,14 @@ class ContactListRequest(BaseModel):
     notes: str = ""
 
 
+class ManualContactImportRequest(BaseModel):
+    name: str
+    platform_id: str = "bale"
+    campaign_tag: str = ""
+    phones_text: str
+    notes: str = ""
+
+
 class BulkCampaignRequest(BaseModel):
     campaign_id: str | None = None
     name: str
@@ -600,7 +608,7 @@ async def import_bulk_contact_list(
     _set_dashboard_cors_headers(response)
     content = await file.read()
     try:
-        return contact_importer.import_csv(
+        return contact_importer.import_file(
             content=content,
             filename=file.filename or "",
             name=name,
@@ -610,6 +618,18 @@ async def import_bulk_contact_list(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/bulk/contact-lists/manual")
+def import_manual_bulk_contact_list(request: ManualContactImportRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return contact_importer.import_manual(
+        phones_text=request.phones_text,
+        name=request.name,
+        platform_id=request.platform_id,
+        campaign_tag=request.campaign_tag,
+        notes=request.notes,
+    )
 
 
 @router.get("/bulk/contact-lists/{contact_list_id}/contacts")

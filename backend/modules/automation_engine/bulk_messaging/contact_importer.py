@@ -30,6 +30,98 @@ class ContactImporter:
     ) -> dict[str, Any]:
         text = content.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(text))
+        rows = [dict(row) for row in reader]
+        return self.import_rows(
+            rows=rows,
+            filename=filename,
+            name=name,
+            platform_id=platform_id,
+            campaign_tag=campaign_tag,
+            notes=notes,
+            first_row_number=2,
+        )
+
+    def import_manual(
+        self,
+        phones_text: str,
+        name: str,
+        platform_id: str = "bale",
+        campaign_tag: str = "",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        rows = [{"phone": line.strip()} for line in str(phones_text or "").splitlines() if line.strip()]
+        return self.import_rows(
+            rows=rows,
+            filename="manual",
+            name=name,
+            platform_id=platform_id,
+            campaign_tag=campaign_tag,
+            notes=notes,
+            first_row_number=1,
+        )
+
+    def import_xlsx(
+        self,
+        content: bytes,
+        filename: str,
+        name: str,
+        platform_id: str = "",
+        campaign_tag: str = "",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:
+            raise ValueError("xlsx_import_requires_openpyxl") from exc
+
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        sheet = workbook.worksheets[0]
+        values = [list(row) for row in sheet.iter_rows(values_only=True)]
+        if not values:
+            return self.import_rows([], filename, name, platform_id, campaign_tag, notes)
+
+        header_candidates = [str(value or "").strip() for value in values[0]]
+        normalized_headers = [_normalize_header(value) for value in header_candidates]
+        phone_index = next((index for index, value in enumerate(normalized_headers) if value in PHONE_HEADERS), None)
+        has_header = phone_index is not None
+        if phone_index is None:
+            phone_index = 0
+        headers = header_candidates if has_header else ["phone"]
+        data_rows = values[1:] if has_header else values
+        rows: list[dict[str, Any]] = []
+        for row in data_rows:
+            payload: dict[str, Any] = {}
+            for index, header in enumerate(headers):
+                if index < len(row):
+                    payload[header or f"column_{index + 1}"] = row[index]
+            if "phone" not in {_normalize_header(key) for key in payload.keys()} and phone_index < len(row):
+                payload["phone"] = row[phone_index]
+            rows.append(payload)
+        return self.import_rows(rows, filename, name, platform_id, campaign_tag, notes, first_row_number=2 if has_header else 1)
+
+    def import_file(
+        self,
+        content: bytes,
+        filename: str,
+        name: str,
+        platform_id: str = "",
+        campaign_tag: str = "",
+        notes: str = "",
+    ) -> dict[str, Any]:
+        if str(filename or "").lower().endswith(".xlsx"):
+            return self.import_xlsx(content, filename, name, platform_id, campaign_tag, notes)
+        return self.import_csv(content, filename, name, platform_id, campaign_tag, notes)
+
+    def import_rows(
+        self,
+        rows: list[dict[str, Any]],
+        filename: str,
+        name: str,
+        platform_id: str = "",
+        campaign_tag: str = "",
+        notes: str = "",
+        first_row_number: int = 2,
+    ) -> dict[str, Any]:
         contacts: list[dict[str, Any]] = []
         seen: set[str] = set()
         total_rows = 0
@@ -38,9 +130,9 @@ class ContactImporter:
         duplicate_contacts = 0
         contact_list_id = _contact_list_id(name, campaign_tag)
 
-        for row_number, row in enumerate(reader, start=2):
+        for row_number, row in enumerate(rows, start=first_row_number):
             total_rows += 1
-            raw_phone = _first_value(row, ["phone", "mobile"])
+            raw_phone = _first_value(row, list(PHONE_HEADERS))
             normalized = normalize_iranian_phone(raw_phone)
             status = "new"
             if not normalized:
@@ -126,10 +218,17 @@ def normalize_iranian_phone(value: str) -> str:
     return ""
 
 
+PHONE_HEADERS = {"phone", "mobile", "موبایل", "شماره", "شماره موبایل", "تلفن"}
+
+
+def _normalize_header(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", " ")
+
+
 def _first_value(row: dict[str, Any], keys: list[str]) -> str:
-    normalized_row = {str(key).strip().lower(): value for key, value in row.items()}
+    normalized_row = {_normalize_header(key): value for key, value in row.items()}
     for key in keys:
-        value = normalized_row.get(key)
+        value = normalized_row.get(_normalize_header(key))
         if value is not None and str(value).strip():
             return str(value).strip()
     return ""

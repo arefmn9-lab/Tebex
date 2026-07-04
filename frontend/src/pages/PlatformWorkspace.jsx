@@ -21,6 +21,7 @@ import {
   getAdsPowerConfig,
   getBulkExecutionQueueSummary,
   importBulkContactList,
+  importManualBulkContactList,
   listBaleProfileGroups,
   listBaleScenarios,
   listBulkCampaigns,
@@ -53,6 +54,18 @@ import { useLogs } from "../hooks/useLogs";
 import { useTasks } from "../hooks/useTasks";
 
 const today = new Date().toISOString().slice(0, 10);
+
+const defaultSimpleSendForm = {
+  platform_id: "bale",
+  name: "",
+  campaign_tag: "",
+  phones_text: "",
+  file: null,
+  message_text: "",
+  account_group_id: "",
+  account_id: "",
+  real_limit: 1,
+};
 
 const defaultBaleAccount = {
   phone: "",
@@ -303,6 +316,9 @@ export default function PlatformWorkspace({ platformId }) {
     limit: 1,
     account_id: "",
   });
+  const [simpleSendForm, setSimpleSendForm] = useState(defaultSimpleSendForm);
+  const [simpleSendResult, setSimpleSendResult] = useState(null);
+  const [simpleSendContactResult, setSimpleSendContactResult] = useState(null);
   const [assignmentForm, setAssignmentForm] = useState({
     planned_for_date: today,
     max_contacts_per_account: "",
@@ -639,6 +655,163 @@ export default function PlatformWorkspace({ platformId }) {
     }
   }
 
+  async function addSimpleManualContacts() {
+    if (!simpleSendForm.phones_text.trim()) {
+      setActionError("ابتدا فایل یا شماره دستی وارد کنید");
+      return null;
+    }
+    try {
+      const campaignTag = simpleSendForm.campaign_tag || `simple_${Date.now()}`;
+      const result = await importManualBulkContactList({
+        name: simpleSendForm.name || "ارسال پیام جدید",
+        platform_id: "bale",
+        campaign_tag: campaignTag,
+        phones_text: simpleSendForm.phones_text,
+      });
+      if (!result.valid_contacts) {
+        setActionError("هیچ شماره معتبری پیدا نشد");
+      }
+      setSimpleSendContactResult(result);
+      setSimpleSendForm((current) => ({ ...current, campaign_tag: campaignTag }));
+      await reloadBulkData();
+      return result;
+    } catch (error) {
+      setActionError(error.message);
+      return null;
+    }
+  }
+
+  async function importSimpleFileContacts(campaignTag) {
+    if (!simpleSendForm.file) return null;
+    const formData = new FormData();
+    formData.append("file", simpleSendForm.file);
+    formData.append("name", simpleSendForm.name || "ارسال پیام جدید");
+    formData.append("campaign_tag", campaignTag);
+    formData.append("platform_id", "bale");
+    formData.append("notes", "simple_send_wizard");
+    const result = await importBulkContactList(formData);
+    setSimpleSendContactResult(result);
+    return result;
+  }
+
+  async function prepareSimpleSend() {
+    if (!simpleSendForm.message_text.trim()) {
+      setActionError("ابتدا پیام را وارد کنید");
+      return;
+    }
+    if (!simpleSendContactResult?.contact_list_id && !simpleSendForm.file && !simpleSendForm.phones_text.trim()) {
+      setActionError("ابتدا فایل یا شماره دستی وارد کنید");
+      return;
+    }
+    try {
+      setActionError("");
+      const runKey = Date.now();
+      const campaignTag = simpleSendForm.campaign_tag || `simple_${runKey}`;
+      let contactResult = simpleSendContactResult;
+      if (!contactResult?.contact_list_id) {
+        contactResult = simpleSendForm.file ? await importSimpleFileContacts(campaignTag) : await addSimpleManualContacts();
+      }
+      if (!contactResult?.valid_contacts) {
+        setActionError("هیچ شماره معتبری پیدا نشد");
+        return;
+      }
+      const groupId = simpleSendForm.account_group_id || accountGroups[0]?.group_id || "bale_test_group";
+      const campaign = await createBulkCampaign({
+        campaign_id: `simple_send_${runKey}`,
+        name: simpleSendForm.name || "ارسال پیام جدید",
+        campaign_tag: campaignTag,
+        status: "draft",
+        dry_run: true,
+        notes: "created_by_simple_send_wizard",
+      });
+      const source = await createBulkMessageSource({
+        message_source_id: `text_message_${runKey}`,
+        platform_id: "bale",
+        name: `متن پیام ${runKey}`,
+        campaign_tag: campaignTag,
+        source_type: "text_message",
+        source_ref: simpleSendForm.message_text,
+        message_ref_type: "specific",
+        message_ref_value: simpleSendForm.message_text,
+        enabled: true,
+        notes: "created_by_simple_send_wizard",
+      });
+      await createBulkCampaignRoute(campaign.campaign_id, {
+        route_id: `route_simple_${runKey}`,
+        platform_id: "bale",
+        account_group_id: groupId,
+        message_source_id: source.message_source_id,
+        contact_list_id: contactResult.contact_list_id,
+        scenario_id: "send_test_message",
+        contact_naming_pattern: "Bale-{seq:06d}",
+        daily_limit_per_account: 10,
+        hourly_limit_per_account: 2,
+        enabled: true,
+      });
+      const assignment = await assignBulkCampaign(campaign.campaign_id, {
+        dry_run: true,
+        planned_for_date: today,
+        max_contacts_per_account: null,
+        plan_seed: `simple-${runKey}`,
+      });
+      const queueResult = await createBulkExecutionQueue(campaign.campaign_id, {
+        dry_run: true,
+        planned_for_date: today,
+      });
+      const jobs = await listBulkExecutionQueue(campaign.campaign_id);
+      const involvedAccounts = new Set((jobs || []).map((job) => job.account_id).filter(Boolean));
+      const summary = assignment.route_summaries?.[0] || {};
+      const result = {
+        campaign_id: campaign.campaign_id,
+        contact_list_id: contactResult.contact_list_id,
+        valid_contacts: contactResult.valid_contacts || 0,
+        duplicate_contacts: contactResult.duplicate_contacts || 0,
+        invalid_contacts: contactResult.invalid_contacts || 0,
+        total_jobs: queueResult.total_jobs || 0,
+        involved_accounts: involvedAccounts.size,
+        effective_daily_limit_per_account: summary.effective_daily_limit_per_account || 0,
+        effective_hourly_limit_per_account: summary.effective_hourly_limit_per_account || 0,
+        sample_jobs: (jobs || []).slice(0, 5),
+      };
+      setSimpleSendResult(result);
+      setBulkAssignmentResult(assignment);
+      setBulkQueueResult(queueResult);
+      setBulkQueueJobs((jobs || []).slice(0, 20));
+      setAssignmentForm((current) => ({ ...current, campaign_id: campaign.campaign_id, planned_for_date: today }));
+      await reloadBulkData();
+      setToast("آماده‌سازی ارسال انجام شد");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
+  function previewSimpleSend() {
+    if (!simpleSendResult) {
+      setActionError("برای اجرای واقعی، ابتدا آماده‌سازی ارسال را بزنید");
+      return;
+    }
+    setToast("پیشنمایش آماده است؛ هیچ پیامی ارسال نشد");
+  }
+
+  async function runSimpleBaleReal(limit) {
+    if (!simpleSendResult?.campaign_id) {
+      setActionError("برای اجرای واقعی، ابتدا آماده‌سازی ارسال را بزنید");
+      return;
+    }
+    try {
+      const result = await runBaleExecutionQueue(simpleSendResult.campaign_id, {
+        dry_run: false,
+        limit,
+        account_id: simpleSendForm.account_id || null,
+      });
+      setBulkRealRunResult(result);
+      await refreshBulkQueue(simpleSendResult.campaign_id);
+      setToast(result.processed_jobs ? "اجرای محدود انجام شد" : "هیچ job آماده‌ای در صف وجود ندارد");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
   async function saveBulkRoute() {
     try {
       await createBulkCampaignRoute(routeCampaignId, bulkRouteForm);
@@ -919,6 +1092,15 @@ export default function PlatformWorkspace({ platformId }) {
           onImportContacts={importContactsCsv}
           importResult={contactImportResult}
           sampleImportedContacts={sampleImportedContacts}
+          simpleSendForm={simpleSendForm}
+          setSimpleSendForm={setSimpleSendForm}
+          simpleSendResult={simpleSendResult}
+          simpleSendContactResult={simpleSendContactResult}
+          onAddManualContacts={addSimpleManualContacts}
+          onPrepareSimpleSend={prepareSimpleSend}
+          onPreviewSimpleSend={previewSimpleSend}
+          onRunSimpleTest={() => runSimpleBaleReal(1)}
+          onRunSimpleLimited={() => runSimpleBaleReal(Math.min(3, Math.max(1, Number(simpleSendForm.real_limit) || 1)))}
         />
       ) : null}
       {activeTab === "schedule" ? (
@@ -1223,6 +1405,15 @@ function CampaignsSection({
   onImportContacts,
   importResult,
   sampleImportedContacts,
+  simpleSendForm,
+  setSimpleSendForm,
+  simpleSendResult,
+  simpleSendContactResult,
+  onAddManualContacts,
+  onPrepareSimpleSend,
+  onPreviewSimpleSend,
+  onRunSimpleTest,
+  onRunSimpleLimited,
 }) {
   return (
     <div>
@@ -1258,6 +1449,15 @@ function CampaignsSection({
         onImportContacts={onImportContacts}
         importResult={importResult}
         sampleImportedContacts={sampleImportedContacts}
+        simpleSendForm={simpleSendForm}
+        setSimpleSendForm={setSimpleSendForm}
+        simpleSendResult={simpleSendResult}
+        simpleSendContactResult={simpleSendContactResult}
+        onAddManualContacts={onAddManualContacts}
+        onPrepareSimpleSend={onPrepareSimpleSend}
+        onPreviewSimpleSend={onPreviewSimpleSend}
+        onRunSimpleTest={onRunSimpleTest}
+        onRunSimpleLimited={onRunSimpleLimited}
       />
       <BaleSendSection
         accounts={accounts}
@@ -1297,11 +1497,27 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
   );
 }
 
-function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts }) {
+function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts, simpleSendForm, setSimpleSendForm, simpleSendResult, simpleSendContactResult, onAddManualContacts, onPrepareSimpleSend, onPreviewSimpleSend, onRunSimpleTest, onRunSimpleLimited }) {
   return (
     <section className="panel" style={{ marginTop: 16 }}>
       <div className="panel-header"><h3 className="panel-title">پیام انبوه</h3><span className="pill">dry-run</span></div>
+      <SimpleSendWizard
+        form={simpleSendForm}
+        setForm={setSimpleSendForm}
+        result={simpleSendResult}
+        contactResult={simpleSendContactResult}
+        accountGroups={accountGroups}
+        accounts={accounts}
+        realRunResult={realRunResult}
+        onAddManualContacts={onAddManualContacts}
+        onPrepare={onPrepareSimpleSend}
+        onPreview={onPreviewSimpleSend}
+        onRunTest={onRunSimpleTest}
+        onRunLimited={onRunSimpleLimited}
+      />
 
+      <details className="safe-policy-section" style={{ marginTop: 16 }}>
+        <summary className="panel-title">تنظیمات پیشرفته</summary>
       <section className="safe-policy-section">
         <div className="panel-header"><h3 className="panel-title">کمپین‌ها</h3><button className="secondary-button" onClick={onCreateCampaign} type="button"><Plus size={16} />کمپین جدید</button></div>
         <div className="table-scroll">
@@ -1428,6 +1644,115 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
       <BulkAssignmentPlannerSection form={assignmentForm} setForm={setAssignmentForm} result={assignmentResult} onAssign={onAssign} campaigns={campaigns} />
       <BulkExecutionQueueSection form={assignmentForm} campaigns={campaigns} result={queueResult} jobs={queueJobs} realRunResult={realRunResult} realRunForm={realRunForm} setRealRunForm={setRealRunForm} accounts={accounts} onCreateQueue={onCreateQueue} onDryRunQueue={onDryRunQueue} onRunBaleReal={onRunBaleReal} />
       <div className="empty-state" style={{ marginTop: 12 }}>الگوی نام مخاطب: {"Bale-GHAB-{seq:06d} -> Bale-GHAB-000001"}</div>
+      </details>
+    </section>
+  );
+}
+
+function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups, accounts, realRunResult, onAddManualContacts, onPrepare, onPreview, onRunTest, onRunLimited }) {
+  const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const baleAccounts = (accounts || []).filter((account) => !account.platform_id || account.platform_id === "bale" || account.platform === "bale");
+  const summary = realRunResult?.status_summary || {};
+  return (
+    <section className="safe-policy-section">
+      <div className="panel-header">
+        <div>
+          <h3 className="panel-title">ارسال پیام جدید</h3>
+          <p className="page-copy">شماره‌ها را وارد کنید، پیام را بنویسید، سپس ابتدا پیش‌نمایش و ارسال تست بگیرید.</p>
+        </div>
+        <span className="pill">ایمن / dry-run</span>
+      </div>
+      <div className="settings-grid">
+        <Field label="پلتفرم">
+          <select value={form.platform_id} onChange={(event) => update("platform_id", event.target.value)}>
+            <option value="bale">Bale</option>
+          </select>
+        </Field>
+        <Field label="نام ارسال">
+          <input value={form.name} placeholder="مثلا تست مشتریان امروز" onChange={(event) => update("name", event.target.value)} />
+        </Field>
+        <Field label="گروه اکانت">
+          <select value={form.account_group_id || accountGroups[0]?.group_id || ""} onChange={(event) => update("account_group_id", event.target.value)}>
+            {accountGroups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name || group.group_id}</option>)}
+          </select>
+        </Field>
+        <Field label="اکانت تست">
+          <input list="simple-send-accounts" value={form.account_id} placeholder="اختیاری" onChange={(event) => update("account_id", event.target.value)} />
+          <datalist id="simple-send-accounts">
+            {baleAccounts.map((account) => <option key={account.account_id} value={account.account_id}>{account.phone || account.username_or_number || account.account_id}</option>)}
+          </datalist>
+        </Field>
+      </div>
+      <div className="settings-grid" style={{ marginTop: 12 }}>
+        <Field label="ورود دستی شماره‌ها">
+          <textarea
+            value={form.phones_text}
+            placeholder={"هر شماره در یک خط، مثلا:\n09121234567\n09129876543"}
+            onChange={(event) => update("phones_text", event.target.value)}
+          />
+        </Field>
+        <Field label="آپلود فایل شماره‌ها CSV یا Excel">
+          <input type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => update("file", event.target.files?.[0] || null)} />
+        </Field>
+        <Field label="متن پیام">
+          <textarea value={form.message_text} placeholder="متن پیامی که می‌خواهید ارسال شود..." onChange={(event) => update("message_text", event.target.value)} />
+        </Field>
+        <Field label="تعداد اجرای محدود">
+          <input type="number" min="1" max="3" value={form.real_limit} onChange={(event) => update("real_limit", event.target.value)} />
+        </Field>
+      </div>
+      <div className="modal-actions">
+        <button className="secondary-button" onClick={onAddManualContacts} type="button">افزودن شماره‌های دستی</button>
+        <button className="primary-button" onClick={onPrepare} type="button">آماده‌سازی ارسال</button>
+        <button className="secondary-button" onClick={onPreview} type="button">پیش‌نمایش ارسال</button>
+        <button className="secondary-button" onClick={onRunTest} type="button">ارسال تست ۱ شماره</button>
+        <button className="danger-button" onClick={onRunLimited} type="button">اجرای محدود ۱ تا ۳ شماره</button>
+      </div>
+      {contactResult ? (
+        <section className="grid metrics">
+          <div><span>تعداد شماره‌های معتبر</span><strong>{contactResult.valid_contacts || 0}</strong></div>
+          <div><span>تکراری</span><strong>{contactResult.duplicate_contacts || 0}</strong></div>
+          <div><span>نامعتبر</span><strong>{contactResult.invalid_contacts || 0}</strong></div>
+          <div><span>وضعیت لیست</span><strong>{contactResult.status || "-"}</strong></div>
+        </section>
+      ) : null}
+      {result ? (
+        <div className="plan-preview">
+          <div className="panel-header"><h4 className="panel-title">خلاصه آماده‌سازی</h4><span className="pill">{result.campaign_id}</span></div>
+          <section className="grid metrics">
+            <div><span>تعداد شماره‌های معتبر</span><strong>{result.valid_contacts}</strong></div>
+            <div><span>تکراری/نامعتبر</span><strong>{(result.duplicate_contacts || 0) + (result.invalid_contacts || 0)}</strong></div>
+            <div><span>jobهای آماده</span><strong>{result.total_jobs}</strong></div>
+            <div><span>اکانت‌های درگیر</span><strong>{result.involved_accounts}</strong></div>
+            <div><span>محدودیت روزانه مؤثر</span><strong>{result.effective_daily_limit_per_account}</strong></div>
+            <div><span>محدودیت ساعتی مؤثر</span><strong>{result.effective_hourly_limit_per_account}</strong></div>
+          </section>
+          {result.sample_jobs?.length ? (
+            <div className="table-scroll">
+              <h4 className="panel-title">پیش‌نمایش jobها</h4>
+              <table className="table rtl-table wide-table">
+                <thead><tr><th>اکانت</th><th>شماره</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
+                <tbody>{result.sample_jobs.map((job) => (
+                  <tr key={job.job_id}>
+                    <td>{job.account_id}</td>
+                    <td>{job.normalized_phone}</td>
+                    <td>{job.contact_naming_value}</td>
+                    <td><Pill value={job.status} /></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {realRunResult ? (
+        <section className="grid metrics">
+          <div><span>processed_jobs</span><strong>{realRunResult.processed_jobs || 0}</strong></div>
+          <div><span>completed_jobs</span><strong>{realRunResult.completed_jobs || 0}</strong></div>
+          <div><span>failed_jobs</span><strong>{realRunResult.failed_jobs || 0}</strong></div>
+          <div><span>jobهای در انتظار</span><strong>{summary.pending || 0}</strong></div>
+        </section>
+      ) : null}
     </section>
   );
 }

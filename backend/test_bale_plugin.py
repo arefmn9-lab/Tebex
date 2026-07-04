@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -788,6 +789,61 @@ def test_bulk_csv_import_normalizes_duplicates_and_invalid_contacts() -> None:
         assert contacts_store.summary(result["contact_list_id"])["valid_contacts"] == 2
 
 
+def test_bulk_manual_contact_import_parses_dedupes_and_rejects_invalid() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        contact_list_store = ContactListStore(Path(tmp_dir) / "contact_lists.json")
+        contacts_store = ContactStore(Path(tmp_dir) / "bulk_contacts.json")
+        importer = ContactImporter(contacts_store=contacts_store, lists_store=contact_list_store)
+
+        result = importer.import_manual(
+            phones_text="09121234567\n09121234567\n12345\n989198765432",
+            name="Manual Contacts",
+            platform_id="bale",
+            campaign_tag="MANUAL",
+        )
+        contacts = contacts_store.list_contacts(result["contact_list_id"])
+
+        assert result["total_rows"] == 4
+        assert result["valid_contacts"] == 2
+        assert result["duplicate_contacts"] == 1
+        assert result["invalid_contacts"] == 1
+        assert sum(1 for item in contacts if item["status"] == "new") == 2
+        assert sum(1 for item in contacts if item["status"] == "duplicate") == 1
+        assert sum(1 for item in contacts if item["status"] == "invalid") == 1
+
+
+def test_bulk_xlsx_contact_import_works_when_openpyxl_available() -> None:
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        return
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        contact_list_store = ContactListStore(Path(tmp_dir) / "contact_lists.json")
+        contacts_store = ContactStore(Path(tmp_dir) / "bulk_contacts.json")
+        importer = ContactImporter(contacts_store=contacts_store, lists_store=contact_list_store)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["شماره موبایل", "name"])
+        sheet.append(["09121234567", "Customer 1"])
+        sheet.append(["09121234567", "Duplicate"])
+        sheet.append(["12345", "Bad"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        result = importer.import_xlsx(
+            content=buffer.getvalue(),
+            filename="contacts.xlsx",
+            name="Excel Contacts",
+            platform_id="bale",
+            campaign_tag="XLSX",
+        )
+
+        assert result["valid_contacts"] == 1
+        assert result["duplicate_contacts"] == 1
+        assert result["invalid_contacts"] == 1
+
+
 def test_bulk_campaign_and_route_create_work() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         store = BulkCampaignStore(Path(tmp_dir) / "bulk_campaigns.json")
@@ -1301,6 +1357,7 @@ def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
     paths = {getattr(route, "path", "") for route in app.routes}
     assert "/automation/bulk/campaigns/{campaign_id}/plan" in paths
     assert "/automation/bulk/contact-lists/import" in paths
+    assert "/automation/bulk/contact-lists/manual" in paths
     assert "/automation/bulk/contact-lists/{contact_list_id}/contacts" in paths
     assert "/automation/bulk/contact-lists/{contact_list_id}/summary" in paths
     assert "/automation/bulk/campaigns/{campaign_id}/assign" in paths
@@ -1366,6 +1423,8 @@ if __name__ == "__main__":
     test_bulk_message_source_crud_works()
     test_bulk_contact_list_metadata_crud_works()
     test_bulk_csv_import_normalizes_duplicates_and_invalid_contacts()
+    test_bulk_manual_contact_import_parses_dedupes_and_rejects_invalid()
+    test_bulk_xlsx_contact_import_works_when_openpyxl_available()
     test_bulk_campaign_and_route_create_work()
     test_bulk_dry_run_plan_calculates_capacity_and_warnings()
     test_bulk_plan_warns_for_disabled_route_source_and_group()
