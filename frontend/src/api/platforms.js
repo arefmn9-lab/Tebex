@@ -180,6 +180,13 @@ export function dryRunBulkExecutionQueue(campaignId, payload) {
   });
 }
 
+export function runBaleExecutionQueue(campaignId, payload) {
+  return request(`/automation/bulk/campaigns/${encodeURIComponent(campaignId)}/queue/bale/run`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function createPlatformAccount(platformId, payload) {
   return request(`/automation/platforms/${encodeURIComponent(platformId)}/accounts`, {
     method: "POST",

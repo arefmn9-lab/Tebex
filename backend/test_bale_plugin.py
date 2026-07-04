@@ -9,6 +9,7 @@ from app.main import app
 from fastapi.testclient import TestClient
 from modules.automation_engine.bulk_messaging import (
     AssignmentStore,
+    BaleQueueRunner,
     BulkAssignmentPlanner,
     BulkCampaignPlanner,
     BulkCampaignStore,
@@ -1156,6 +1157,146 @@ def test_bulk_execution_queue_creates_jobs_dedupes_and_dry_runs_limited() -> Non
         assert all(job["dry_run"] is True for job in jobs)
 
 
+def _queue_job(job_id: str, status: str = "pending", platform_id: str = "bale", account_id: str = "bale_real_1") -> dict[str, object]:
+    return {
+        "job_id": job_id,
+        "campaign_id": "real_campaign",
+        "route_id": "route_real",
+        "assignment_id": f"assign_{job_id}",
+        "platform_id": platform_id,
+        "account_group_id": "bale_test_group",
+        "account_id": account_id,
+        "contact_id": f"contact_{job_id}",
+        "normalized_phone": "989120000001",
+        "contact_naming_value": f"Bale-GHAB-{job_id}",
+        "message_source_id": "source_real",
+        "scenario_id": "save_contact_and_forward_from_source",
+        "status": status,
+        "dry_run": True,
+        "planned_for_date": "2026-07-04",
+    }
+
+
+class StubBalePlugin:
+    def __init__(self, ok: bool = True, error_code: str = "plugin_error") -> None:
+        self.ok = ok
+        self.error_code = error_code
+        self.calls: list[dict[str, str]] = []
+
+    def send_test_message(self, account_id: str, target: str, message: str) -> dict[str, object]:
+        self.calls.append({"account_id": account_id, "target": target, "message": message})
+        if self.ok:
+            return {"ok": True, "account_id": account_id, "target": target, "message": "sent"}
+        return {"ok": False, "account_id": account_id, "target": target, "error_code": self.error_code, "error": "stub failed"}
+
+
+def test_bale_queue_runner_rejects_missing_or_true_dry_run() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001")])
+        plugin = StubBalePlugin()
+        runner = BaleQueueRunner(queue_store, plugin)
+
+        missing = runner.run("real_campaign", {})
+        true_result = runner.run("real_campaign", {"dry_run": True, "limit": 1})
+
+        assert missing["ok"] is False
+        assert true_result["ok"] is False
+        assert missing["error_code"] == "dry_run_required_for_safe_endpoint"
+        assert plugin.calls == []
+        assert queue_store.list_jobs("real_campaign")[0]["status"] == "pending"
+
+
+def test_bale_queue_runner_caps_limit_and_selects_only_pending_bale_jobs() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs(
+            [
+                _queue_job("001"),
+                _queue_job("002"),
+                _queue_job("003"),
+                _queue_job("004"),
+                _queue_job("completed", status="completed"),
+                _queue_job("rubika", platform_id="rubika"),
+            ]
+        )
+        plugin = StubBalePlugin()
+        result = BaleQueueRunner(queue_store, plugin).run("real_campaign", {"dry_run": False, "limit": 10})
+        jobs = queue_store.list_jobs("real_campaign")
+
+        assert result["requested_limit"] == 10
+        assert result["limit"] == 3
+        assert result["processed_jobs"] == 3
+        assert result["completed_jobs"] == 3
+        assert len(plugin.calls) == 3
+        assert next(job for job in jobs if job["job_id"] == "004")["status"] == "pending"
+        assert next(job for job in jobs if job["job_id"] == "completed")["status"] == "completed"
+        assert next(job for job in jobs if job["job_id"] == "rubika")["status"] == "pending"
+
+
+def test_bale_queue_runner_respects_account_filter_and_does_not_rerun_completed() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs(
+            [
+                _queue_job("001", account_id="bale_real_1"),
+                _queue_job("002", account_id="bale_real_2"),
+                _queue_job("003", status="completed", account_id="bale_real_2"),
+            ]
+        )
+        plugin = StubBalePlugin()
+        result = BaleQueueRunner(queue_store, plugin).run(
+            "real_campaign",
+            {"dry_run": False, "limit": 3, "account_id": "bale_real_2"},
+        )
+        jobs = queue_store.list_jobs("real_campaign")
+
+        assert result["processed_jobs"] == 1
+        assert plugin.calls == [
+            {
+                "account_id": "bale_real_2",
+                "target": "989120000001",
+                "message": plugin.calls[0]["message"],
+            }
+        ]
+        assert next(job for job in jobs if job["job_id"] == "001")["status"] == "pending"
+        assert next(job for job in jobs if job["job_id"] == "002")["status"] == "completed"
+        assert next(job for job in jobs if job["job_id"] == "003")["status"] == "completed"
+
+
+def test_bale_queue_runner_marks_failed_plugin_result() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001")])
+        plugin = StubBalePlugin(ok=False, error_code="target_not_found")
+        result = BaleQueueRunner(queue_store, plugin).run("real_campaign", {"dry_run": False, "limit": 1})
+        job = queue_store.list_jobs("real_campaign")[0]
+
+        assert result["processed_jobs"] == 1
+        assert result["failed_jobs"] == 1
+        assert job["status"] == "failed"
+        assert job["error_code"] == "target_not_found"
+        assert job["execution_result"]["success"] is False
+
+
+def test_bale_queue_runner_marks_success_completed_and_stores_result() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001")])
+        plugin = StubBalePlugin(ok=True)
+        result = BaleQueueRunner(queue_store, plugin).run("real_campaign", {"dry_run": False, "limit": 1})
+        job = queue_store.list_jobs("real_campaign")[0]
+
+        assert result["processed_jobs"] == 1
+        assert result["completed_jobs"] == 1
+        assert result["failed_jobs"] == 0
+        assert job["status"] == "completed"
+        assert job["dry_run"] is False
+        assert job["execution_result"]["runner"] == "bale_queue_runner"
+        assert job["execution_result"]["action"] == "send_test_message"
+        assert job["execution_result"]["success"] is True
+
+
 def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
     paths = {getattr(route, "path", "") for route in app.routes}
     assert "/automation/bulk/campaigns/{campaign_id}/plan" in paths
@@ -1168,6 +1309,7 @@ def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
     assert "/automation/bulk/campaigns/{campaign_id}/queue" in paths
     assert "/automation/bulk/campaigns/{campaign_id}/queue/summary" in paths
     assert "/automation/bulk/campaigns/{campaign_id}/queue/dry-run" in paths
+    assert "/automation/bulk/campaigns/{campaign_id}/queue/bale/run" in paths
 
 
 def test_compliance_policy_failure_threshold_stops_scheduler() -> None:
@@ -1231,6 +1373,11 @@ if __name__ == "__main__":
     test_bulk_assignment_planner_fairly_assigns_contacts_and_respects_limits()
     test_bulk_assignment_max_contacts_override_caps_per_account()
     test_bulk_execution_queue_creates_jobs_dedupes_and_dry_runs_limited()
+    test_bale_queue_runner_rejects_missing_or_true_dry_run()
+    test_bale_queue_runner_caps_limit_and_selects_only_pending_bale_jobs()
+    test_bale_queue_runner_respects_account_filter_and_does_not_rerun_completed()
+    test_bale_queue_runner_marks_failed_plugin_result()
+    test_bale_queue_runner_marks_success_completed_and_stores_result()
     test_bulk_plan_api_route_exists_and_does_not_open_browser()
     test_compliance_policy_failure_threshold_stops_scheduler()
     test_can_account_run_scenario_returns_reason()

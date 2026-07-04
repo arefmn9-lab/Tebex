@@ -31,6 +31,7 @@ class BulkExecutionJob:
     error_code: str | None = None
     error_message: str | None = None
     dry_run_result: dict[str, Any] | None = None
+    execution_result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

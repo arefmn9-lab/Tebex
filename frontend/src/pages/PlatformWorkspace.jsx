@@ -35,6 +35,7 @@ import {
   openAccountBrowser,
   openBaleAccount,
   planBulkCampaign,
+  runBaleExecutionQueue,
   saveBaleMessageConfig,
   saveBalePreparation,
   saveAdsPowerConfig,
@@ -297,6 +298,11 @@ export default function PlatformWorkspace({ platformId }) {
   const [bulkAssignmentResult, setBulkAssignmentResult] = useState(null);
   const [bulkQueueResult, setBulkQueueResult] = useState(null);
   const [bulkQueueJobs, setBulkQueueJobs] = useState([]);
+  const [bulkRealRunResult, setBulkRealRunResult] = useState(null);
+  const [bulkRealRunForm, setBulkRealRunForm] = useState({
+    limit: 1,
+    account_id: "",
+  });
   const [assignmentForm, setAssignmentForm] = useState({
     planned_for_date: today,
     max_contacts_per_account: "",
@@ -709,6 +715,21 @@ export default function PlatformWorkspace({ platformId }) {
     }
   }
 
+  async function runBulkQueueBaleReal(campaignId) {
+    try {
+      const result = await runBaleExecutionQueue(campaignId, {
+        dry_run: false,
+        limit: Number(bulkRealRunForm.limit) || 1,
+        account_id: bulkRealRunForm.account_id || null,
+      });
+      setBulkRealRunResult(result);
+      await refreshBulkQueue(campaignId);
+      setToast(result.ok ? "اجرای واقعی محدود Bale ثبت شد" : result.error_message || "اجرای واقعی محدود Bale انجام نشد");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
   async function assignProfileGroup(accountId, deviceGroupId, browserProvider = "native_chrome") {
     try {
       await assignBaleProfileGroup(accountId, {
@@ -878,6 +899,9 @@ export default function PlatformWorkspace({ platformId }) {
           assignmentResult={bulkAssignmentResult}
           queueResult={bulkQueueResult}
           queueJobs={bulkQueueJobs}
+          realRunResult={bulkRealRunResult}
+          realRunForm={bulkRealRunForm}
+          setRealRunForm={setBulkRealRunForm}
           onCreateCampaign={() => openBulkCampaignModal()}
           onEditCampaign={openBulkCampaignModal}
           onCreateSource={() => openBulkSourceModal()}
@@ -889,6 +913,7 @@ export default function PlatformWorkspace({ platformId }) {
           onAssign={runBulkAssignment}
           onCreateQueue={createBulkQueue}
           onDryRunQueue={runBulkQueueDryRun}
+          onRunBaleReal={runBulkQueueBaleReal}
           importForm={contactImportForm}
           setImportForm={setContactImportForm}
           onImportContacts={importContactsCsv}
@@ -1178,6 +1203,9 @@ function CampaignsSection({
   assignmentResult,
   queueResult,
   queueJobs,
+  realRunResult,
+  realRunForm,
+  setRealRunForm,
   onCreateCampaign,
   onEditCampaign,
   onCreateSource,
@@ -1189,6 +1217,7 @@ function CampaignsSection({
   onAssign,
   onCreateQueue,
   onDryRunQueue,
+  onRunBaleReal,
   importForm,
   setImportForm,
   onImportContacts,
@@ -1208,6 +1237,10 @@ function CampaignsSection({
         assignmentResult={assignmentResult}
         queueResult={queueResult}
         queueJobs={queueJobs}
+        realRunResult={realRunResult}
+        realRunForm={realRunForm}
+        setRealRunForm={setRealRunForm}
+        accounts={accounts}
         onCreateCampaign={onCreateCampaign}
         onEditCampaign={onEditCampaign}
         onCreateSource={onCreateSource}
@@ -1219,6 +1252,7 @@ function CampaignsSection({
         onAssign={onAssign}
         onCreateQueue={onCreateQueue}
         onDryRunQueue={onDryRunQueue}
+        onRunBaleReal={onRunBaleReal}
         importForm={importForm}
         setImportForm={setImportForm}
         onImportContacts={onImportContacts}
@@ -1263,7 +1297,7 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
   );
 }
 
-function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts }) {
+function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts }) {
   return (
     <section className="panel" style={{ marginTop: 16 }}>
       <div className="panel-header"><h3 className="panel-title">پیام انبوه</h3><span className="pill">dry-run</span></div>
@@ -1392,7 +1426,7 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
 
       <BulkCapacitySummary result={planResult} />
       <BulkAssignmentPlannerSection form={assignmentForm} setForm={setAssignmentForm} result={assignmentResult} onAssign={onAssign} campaigns={campaigns} />
-      <BulkExecutionQueueSection form={assignmentForm} campaigns={campaigns} result={queueResult} jobs={queueJobs} onCreateQueue={onCreateQueue} onDryRunQueue={onDryRunQueue} />
+      <BulkExecutionQueueSection form={assignmentForm} campaigns={campaigns} result={queueResult} jobs={queueJobs} realRunResult={realRunResult} realRunForm={realRunForm} setRealRunForm={setRealRunForm} accounts={accounts} onCreateQueue={onCreateQueue} onDryRunQueue={onDryRunQueue} onRunBaleReal={onRunBaleReal} />
       <div className="empty-state" style={{ marginTop: 12 }}>الگوی نام مخاطب: {"Bale-GHAB-{seq:06d} -> Bale-GHAB-000001"}</div>
     </section>
   );
@@ -1502,10 +1536,12 @@ function BulkAssignmentPlannerSection({ form, setForm, result, onAssign, campaig
   );
 }
 
-function BulkExecutionQueueSection({ form, campaigns, result, jobs, onCreateQueue, onDryRunQueue }) {
+function BulkExecutionQueueSection({ form, campaigns, result, jobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateQueue, onDryRunQueue, onRunBaleReal }) {
   const selectedCampaignId = form.campaign_id || campaigns[0]?.campaign_id || "";
   const summary = result?.status_summary || {};
   const sampleJobs = Array.isArray(jobs) && jobs.length ? jobs.slice(0, 20) : result?.sample_jobs || [];
+  const realSummary = realRunResult?.status_summary || summary;
+  const updateRealRun = (key, value) => setRealRunForm((current) => ({ ...current, [key]: value }));
   return (
     <section className="safe-policy-section">
       <div className="panel-header"><h3 className="panel-title">صف اجرای کمپین</h3><span className="pill">dry-run</span></div>
@@ -1542,6 +1578,53 @@ function BulkExecutionQueueSection({ form, campaigns, result, jobs, onCreateQueu
           ) : null}
         </div>
       ) : null}
+      <div className="plan-preview">
+        <div className="panel-header"><h4 className="panel-title">اجرای واقعی محدود Bale</h4><span className="pill">فقط برای تست محدود</span></div>
+        <div className="empty-state">ارسال انبوه نیست. حداکثر ۳ job در هر اجرا.</div>
+        <div className="settings-grid" style={{ marginTop: 12 }}>
+          <Field label="limit">
+            <input type="number" min="1" max="3" value={realRunForm.limit} onChange={(event) => updateRealRun("limit", event.target.value)} />
+          </Field>
+          <Field label="account_id">
+            <input list="bale-real-run-accounts" value={realRunForm.account_id} placeholder="اختیاری" onChange={(event) => updateRealRun("account_id", event.target.value)} />
+            <datalist id="bale-real-run-accounts">
+              {(accounts || []).map((account) => <option key={account.account_id} value={account.account_id}>{account.phone || account.username_or_number || account.account_id}</option>)}
+            </datalist>
+          </Field>
+        </div>
+        <div className="modal-actions">
+          <button className="danger-button" onClick={() => selectedCampaignId && onRunBaleReal(selectedCampaignId)} type="button">اجرای واقعی ۱ تا ۳ job Bale</button>
+        </div>
+        {realRunResult ? (
+          <>
+            <section className="grid metrics">
+              <div><span>processed_jobs</span><strong>{realRunResult.processed_jobs || 0}</strong></div>
+              <div><span>completed_jobs</span><strong>{realRunResult.completed_jobs || 0}</strong></div>
+              <div><span>failed_jobs</span><strong>{realRunResult.failed_jobs || 0}</strong></div>
+              <div><span>jobهای در انتظار</span><strong>{realSummary.pending || 0}</strong></div>
+              <div><span>انجام‌شده</span><strong>{realSummary.completed || 0}</strong></div>
+              <div><span>خطاها</span><strong>{realSummary.failed || 0}</strong></div>
+            </section>
+            {(realRunResult.sample_results || []).length ? (
+              <div className="table-scroll">
+                <h4 className="panel-title">sample_results</h4>
+                <table className="table rtl-table wide-table">
+                  <thead><tr><th>job</th><th>اکانت</th><th>شماره نرمال‌شده</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
+                  <tbody>{realRunResult.sample_results.map((job) => (
+                    <tr key={job.job_id}>
+                      <td>{job.job_id}</td>
+                      <td>{job.account_id}</td>
+                      <td>{job.normalized_phone}</td>
+                      <td>{job.contact_naming_value}</td>
+                      <td><Pill value={job.status} /></td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </div>
     </section>
   );
 }

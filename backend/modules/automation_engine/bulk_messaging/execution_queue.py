@@ -29,6 +29,9 @@ class BulkExecutionQueueStore:
             return jobs
         return [item for item in jobs if item["campaign_id"] == campaign_id]
 
+    def save_jobs(self, jobs: list[dict[str, Any]]) -> None:
+        self._write_json([self._normalize_job(item).to_dict() for item in jobs])
+
     def create_from_assignments(
         self,
         campaign_id: str,
@@ -183,6 +186,7 @@ class BulkExecutionQueueStore:
             error_code=payload.get("error_code"),
             error_message=payload.get("error_message"),
             dry_run_result=payload.get("dry_run_result"),
+            execution_result=payload.get("execution_result"),
         )
 
     def _read_json(self, default: Any) -> Any:

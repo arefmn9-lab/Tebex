@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from modules.automation_engine.bulk_messaging import (
     assignment_planner,
     assignment_store,
+    bale_queue_runner,
     BulkCampaignPlanner,
     bulk_campaign_store,
     contact_importer,
@@ -220,6 +221,12 @@ class BulkQueueRequest(BaseModel):
 
 class BulkQueueDryRunRequest(BaseModel):
     limit: int = 10
+
+
+class BaleQueueRunRequest(BaseModel):
+    dry_run: bool = True
+    limit: int = 1
+    account_id: str | None = None
 
 
 class BaleProfileGroupRequest(BaseModel):
@@ -713,6 +720,12 @@ def bulk_campaign_queue_summary(campaign_id: str, response: Response) -> dict[st
 def dry_run_bulk_campaign_queue(campaign_id: str, request: BulkQueueDryRunRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     return execution_queue_store.run_dry_run(campaign_id, request.limit)
+
+
+@router.post("/bulk/campaigns/{campaign_id}/queue/bale/run")
+def run_bale_bulk_campaign_queue(campaign_id: str, request: BaleQueueRunRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_queue_runner.run(campaign_id, request.model_dump())
 
 
 @router.get("/platforms/{platform_id}/bulk/campaigns")

@@ -1,5 +1,6 @@
 from .assignment_planner import BulkAssignmentPlanner, assignment_planner
 from .assignment_store import AssignmentStore, assignment_store
+from .bale_queue_runner import BaleQueueRunner, bale_queue_runner
 from .campaign_store import BulkCampaignStore, bulk_campaign_store
 from .contact_importer import ContactImporter, contact_importer
 from .contact_list_store import ContactListStore, contact_list_store
@@ -11,6 +12,7 @@ from .planner import BulkCampaignPlanner
 __all__ = [
     "BulkCampaignPlanner",
     "BulkAssignmentPlanner",
+    "BaleQueueRunner",
     "AssignmentStore",
     "BulkCampaignStore",
     "ContactImporter",
@@ -20,6 +22,7 @@ __all__ = [
     "MessageSourceStore",
     "assignment_planner",
     "assignment_store",
+    "bale_queue_runner",
     "bulk_campaign_store",
     "contact_importer",
     "contact_list_store",
