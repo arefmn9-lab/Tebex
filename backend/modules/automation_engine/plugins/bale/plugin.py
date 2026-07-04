@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,7 +10,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from modules.automation_engine.browser import actions_browser
-from modules.automation_engine.browser.browser_manager import BrowserManager
+from modules.automation_engine.browser.browser_manager import BrowserManager, resolve_system_browser_executable
 from modules.automation_engine.browser.providers import get_provider
 
 from .account_store import bale_account_store
@@ -133,13 +135,16 @@ class BalePlugin:
             }
 
     def send_test_message(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> dict[str, Any]:
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.perf_counter()
         if not target.strip():
             return self._failed_result(account_id, "send_test_message", "target_not_found", "Target is required")
         if not message.strip():
             return self._failed_result(account_id, "send_test_message", "message_input_not_found", "Message is required")
 
         try:
-            execution_logs = self._send_test_message_steps(account_id, target, message, provider_mode)
+            execution_logs, browser_meta = self._send_test_message_steps(account_id, target, message, provider_mode)
+            finished_at = datetime.now(timezone.utc).isoformat()
             result = {
                 "ok": True,
                 "logged_in": True,
@@ -148,13 +153,18 @@ class BalePlugin:
                 "target": target,
                 "message": "One Bale test message action completed.",
                 "logs": execution_logs,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
+                **browser_meta,
             }
             self._log(account_id, "send_test_message", "success", result["message"])
             return result
         except Exception as exc:
-            error_code = getattr(exc, "error_code", "unknown_error")
+            error_code = _browser_error_code(exc)
             error = str(exc)
             browser_path = getattr(self.browser_manager, "last_browser_path", None)
+            finished_at = datetime.now(timezone.utc).isoformat()
             self._log_step(
                 account_id,
                 "send_test_message",
@@ -173,6 +183,9 @@ class BalePlugin:
                 "error_code": error_code,
                 "error": error,
                 "browser_path": browser_path,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
             }
 
     def list_logs(self) -> list[dict[str, Any]]:
@@ -213,10 +226,20 @@ class BalePlugin:
         )
         self._logs = self._logs[-500:]
 
-    def _send_test_message_steps(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> list[str]:
+    def _send_test_message_steps(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> tuple[list[str], dict[str, Any]]:
         execution_logs: list[str] = []
-        page = self._get_page(account_id, provider_mode)
+        with self._page_session(account_id, provider_mode) as (page, browser_meta):
+            self._send_test_message_on_page(page, execution_logs, account_id, target, message)
+            return execution_logs, browser_meta
 
+    def _send_test_message_on_page(
+        self,
+        page: Any,
+        execution_logs: list[str],
+        account_id: str,
+        target: str,
+        message: str,
+    ) -> None:
         self._record_step(execution_logs, account_id, "open_bale_web", "started", "Opening Bale Web")
         page.goto(self.web_url, wait_until="load")
         self.browser_manager.save_session(account_id)
@@ -297,7 +320,6 @@ class BalePlugin:
 
         self.browser_manager.save_session(account_id)
         self._record_step(execution_logs, account_id, "detect_sent", "success", f"Sent indicator detected: {sent_indicator}")
-        return execution_logs
 
     def _execute_steps(self, account_id: str, steps: list[dict[str, Any]]) -> list[str]:
         execution_logs: list[str] = []
@@ -375,6 +397,64 @@ class BalePlugin:
             login_required=True,
             profile_metadata=profile_metadata,
         )
+
+    @contextmanager
+    def _page_session(self, account_id: str, provider_mode: str | None = None) -> Any:
+        account = bale_account_store.get_account(account_id) or {}
+        effective_provider = str(provider_mode or account.get("browser_provider") or "native_chrome")
+        if effective_provider == "native_chrome" and self.browser_manager is actions_browser.browser_manager:
+            with self._isolated_native_chrome_page(account_id) as session:
+                yield session
+            return
+        yield (
+            self._get_page(account_id, provider_mode),
+            {
+                "provider_mode": effective_provider,
+                "browser_reused": True,
+                "profile_dir": str(account.get("user_data_dir") or ""),
+                "browser_path": getattr(self.browser_manager, "last_browser_path", None),
+            },
+        )
+
+    @contextmanager
+    def _isolated_native_chrome_page(self, account_id: str) -> Any:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise BalePluginError("unknown_error", "Playwright is not installed or not importable") from exc
+
+        browser_path = resolve_system_browser_executable()
+        self.browser_manager.last_browser_path = browser_path
+        if not browser_path:
+            raise BalePluginError("browser_start_timeout", "No system Chrome/Edge found")
+
+        profile_dir = _native_profile_dir(account_id)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        playwright = None
+        context = None
+        try:
+            playwright = sync_playwright().start()
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                executable_path=browser_path,
+                headless=False,
+                args=[],
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            yield (
+                page,
+                {
+                    "provider_mode": "native_chrome",
+                    "browser_reused": False,
+                    "profile_dir": str(profile_dir),
+                    "browser_path": browser_path,
+                },
+            )
+        finally:
+            if context is not None:
+                context.close()
+            if playwright is not None:
+                playwright.stop()
 
     def _first_visible_selector(
         self,
@@ -518,6 +598,23 @@ class BalePluginError(RuntimeError):
     def __init__(self, error_code: str, message: str) -> None:
         super().__init__(message)
         self.error_code = error_code
+
+
+def _native_profile_dir(account_id: str) -> Path:
+    backend_dir = Path(__file__).resolve().parents[4]
+    return backend_dir / "runtime" / "browser_profiles" / account_id
+
+
+def _browser_error_code(exc: Exception) -> str:
+    explicit = getattr(exc, "error_code", "")
+    if explicit:
+        return str(explicit)
+    message = str(exc).lower()
+    if "cannot switch to a different thread" in message or "greenlet" in message:
+        return "browser_thread_error"
+    if "timeout" in message and "browser" in message:
+        return "browser_start_timeout"
+    return "unknown_error"
 
 
 bale_plugin = BalePlugin()

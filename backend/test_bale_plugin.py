@@ -101,6 +101,17 @@ class MockBrowserManager:
         self.saved_accounts.append(account_id)
 
 
+class ThreadErrorBrowserManager(MockBrowserManager):
+    def get_page(
+        self,
+        account_id: str,
+        headless: bool = False,
+        login_required: bool = True,
+        profile_metadata: dict | None = None,
+    ) -> MockPage:
+        raise RuntimeError("Cannot switch to a different thread; greenlet mismatch")
+
+
 def test_bale_plugin_loads() -> None:
     plugin = BalePlugin()
     assert plugin.platform_id == "bale"
@@ -194,6 +205,14 @@ def test_send_test_message_send_timeout_path() -> None:
     assert result["error_code"] == "send_timeout"
     assert page.filled
     assert page.clicked
+
+
+def test_send_test_message_maps_greenlet_thread_error() -> None:
+    plugin = BalePlugin(browser_manager=ThreadErrorBrowserManager(MockPage(set())))
+    result = plugin.send_test_message("bale_test", "target", "hello")
+    assert result["ok"] is False
+    assert result["error_code"] == "browser_thread_error"
+    assert result["duration_ms"] >= 0
 
 
 def test_api_routes_import() -> None:
@@ -1336,6 +1355,26 @@ def test_bale_queue_runner_marks_failed_plugin_result() -> None:
         assert job["status"] == "failed"
         assert job["error_code"] == "target_not_found"
         assert job["execution_result"]["success"] is False
+        assert job["execution_result"]["provider_mode"] == "native_chrome"
+        assert job["execution_result"]["duration_ms"] >= 0
+
+
+def test_bale_queue_runner_greenlet_exception_marks_failed_not_running() -> None:
+    class RaisingPlugin:
+        def send_test_message(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> dict[str, object]:
+            raise RuntimeError("Cannot switch to a different thread; greenlet mismatch")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001")])
+        result = BaleQueueRunner(queue_store, RaisingPlugin()).run("real_campaign", {"dry_run": False, "limit": 1})
+        job = queue_store.list_jobs("real_campaign")[0]
+
+        assert result["failed_jobs"] == 1
+        assert job["status"] == "failed"
+        assert job["error_code"] == "browser_thread_error"
+        assert job["execution_result"]["error_code"] == "browser_thread_error"
+        assert job["execution_result"]["duration_ms"] >= 0
 
 
 def test_bale_queue_runner_marks_success_completed_and_stores_result() -> None:
@@ -1442,6 +1481,7 @@ if __name__ == "__main__":
     test_send_test_message_not_logged_in_path()
     test_send_test_message_message_input_missing_path()
     test_send_test_message_send_timeout_path()
+    test_send_test_message_maps_greenlet_thread_error()
     test_api_routes_import()
     test_browser_manager_resolves_system_browser_on_windows()
     test_bale_account_persistence_create_edit_delete()
@@ -1485,6 +1525,7 @@ if __name__ == "__main__":
     test_bale_queue_runner_caps_limit_and_selects_only_pending_bale_jobs()
     test_bale_queue_runner_respects_account_filter_and_does_not_rerun_completed()
     test_bale_queue_runner_marks_failed_plugin_result()
+    test_bale_queue_runner_greenlet_exception_marks_failed_not_running()
     test_bale_queue_runner_marks_success_completed_and_stores_result()
     test_bale_queue_runner_passes_explicit_adspower_provider_mode()
     test_bale_plugin_explicit_adspower_unavailable_returns_friendly_error()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from modules.automation_engine.plugins.bale import bale_plugin
@@ -120,7 +121,8 @@ class BaleQueueRunner:
         return selected
 
     def _run_job(self, job: dict[str, Any], provider_mode: str = "native_chrome") -> dict[str, Any]:
-        executed_at = utc_now()
+        started_at = utc_now()
+        started_monotonic = time.perf_counter()
         action = "send_test_message"
         try:
             message = _test_message(job)
@@ -131,11 +133,17 @@ class BaleQueueRunner:
                 provider_mode=provider_mode,
             )
             success = bool(plugin_result.get("ok"))
+            finished_at = utc_now()
             result = {
-                "executed_at": executed_at,
+                "started_at": plugin_result.get("started_at") or started_at,
+                "finished_at": plugin_result.get("finished_at") or finished_at,
+                "executed_at": plugin_result.get("finished_at") or finished_at,
+                "duration_ms": int(plugin_result.get("duration_ms") or ((time.perf_counter() - started_monotonic) * 1000)),
                 "runner": "bale_queue_runner",
                 "action": action,
                 "provider_mode": provider_mode,
+                "browser_reused": bool(plugin_result.get("browser_reused", False)),
+                "profile_dir": str(plugin_result.get("profile_dir") or ""),
                 "success": success,
                 "plugin_result": plugin_result,
             }
@@ -144,13 +152,17 @@ class BaleQueueRunner:
                 result["error_message"] = str(plugin_result.get("error") or plugin_result.get("message") or "Bale plugin failed")
             return result
         except Exception as exc:
+            finished_at = utc_now()
             return {
-                "executed_at": utc_now(),
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "executed_at": finished_at,
+                "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
                 "runner": "bale_queue_runner",
                 "action": action,
                 "provider_mode": provider_mode,
                 "success": False,
-                "error_code": "unknown_error",
+                "error_code": _runner_error_code(exc),
                 "error_message": str(exc),
             }
 
@@ -178,6 +190,15 @@ def _positive_int(value: Any, default: int) -> int:
 def _provider_mode(value: Any) -> str:
     provider = str(value or "native_chrome").strip()
     return provider if provider in {"native_chrome", "adspower"} else "native_chrome"
+
+
+def _runner_error_code(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "cannot switch to a different thread" in message or "greenlet" in message:
+        return "browser_thread_error"
+    if "timeout" in message and "browser" in message:
+        return "browser_start_timeout"
+    return "unknown_error"
 
 
 def _sample_result(job: dict[str, Any]) -> dict[str, Any]:
