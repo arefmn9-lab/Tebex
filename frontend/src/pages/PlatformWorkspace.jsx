@@ -5,6 +5,7 @@ import {
   assignBaleProfileGroup,
   assignBulkCampaign,
   checkAdsPowerHealth,
+  checkBaleLogin,
   createAccountGroup,
   createBulkCampaign,
   createBulkCampaignRoute,
@@ -35,6 +36,7 @@ import {
   listPlatformTasks,
   openAccountBrowser,
   openBaleAccount,
+  openBaleLogin,
   planBulkCampaign,
   runBaleExecutionQueue,
   saveBaleMessageConfig,
@@ -237,6 +239,7 @@ function statusTone(status) {
 
 function friendlyBulkError(error) {
   const text = String(error?.message || error?.error_message || error?.error_code || error || "");
+  if (text.includes("bale_install_prompt")) return "صفحه راهنمای نصب بله نمایش داده شده است. روی «متوجه شدم» بزنید، وارد بله شوید و سپس «بررسی ورود» را بزنید.";
   if (text.includes("not_logged_in")) return "ابتدا در Chrome وارد بله شوید، سپس دوباره ارسال تست را بزنید.";
   if (text.includes("account_not_found")) return "اکانت ارسال پیدا نشد.";
   if (text.includes("account_id")) return "اکانت ارسال انتخاب نشده است.";
@@ -333,6 +336,7 @@ export default function PlatformWorkspace({ platformId }) {
   const [simpleSendForm, setSimpleSendForm] = useState(defaultSimpleSendForm);
   const [simpleSendResult, setSimpleSendResult] = useState(null);
   const [simpleSendContactResult, setSimpleSendContactResult] = useState(null);
+  const [simpleBaleLoginStatus, setSimpleBaleLoginStatus] = useState(null);
   const [assignmentForm, setAssignmentForm] = useState({
     planned_for_date: today,
     max_contacts_per_account: "",
@@ -812,6 +816,53 @@ export default function PlatformWorkspace({ platformId }) {
     setToast("پیشنمایش آماده است؛ هیچ پیامی ارسال نشد");
   }
 
+  function simpleBaleAccountId() {
+    return (
+      simpleSendForm.account_id ||
+      simpleSendResult?.sample_jobs?.find((job) => job.account_id)?.account_id ||
+      platformAccounts.find((account) => account.status === "active" || account.active)?.account_id ||
+      ""
+    );
+  }
+
+  async function openSimpleBaleLogin() {
+    const accountId = simpleBaleAccountId();
+    if (!accountId) {
+      setActionError("هیچ اکانت فعالی برای ورود بله پیدا نشد.");
+      return;
+    }
+    try {
+      setActionError("");
+      const result = await openBaleLogin(accountId);
+      setSimpleBaleLoginStatus(result);
+      setToast(result.ok ? "Chrome برای ورود بله باز شد." : friendlyBulkError(result.error_code || result.message));
+    } catch (error) {
+      setActionError(friendlyBulkError(error));
+    }
+  }
+
+  async function checkSimpleBaleLogin() {
+    const accountId = simpleBaleAccountId();
+    if (!accountId) {
+      setActionError("هیچ اکانت فعالی برای بررسی ورود بله پیدا نشد.");
+      return;
+    }
+    try {
+      setActionError("");
+      const result = await checkBaleLogin(accountId);
+      setSimpleBaleLoginStatus(result);
+      if (result.logged_in) {
+        setToast("ورود بله تایید شد.");
+      } else if (result.error_code === "bale_install_prompt") {
+        setActionError("صفحه راهنمای نصب بله نمایش داده شده است. روی «متوجه شدم» بزنید، وارد بله شوید و سپس «بررسی ورود» را بزنید.");
+      } else {
+        setActionError("ورود بله تشخیص داده نشد. اگر صفحه بله باز است، وارد حساب شوید و سپس «بررسی ورود» را بزنید.");
+      }
+    } catch (error) {
+      setActionError(friendlyBulkError(error));
+    }
+  }
+
   async function runSimpleBaleReal(limit) {
     if (!simpleSendResult?.campaign_id) {
       setActionError("پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.");
@@ -1123,9 +1174,12 @@ export default function PlatformWorkspace({ platformId }) {
           setSimpleSendForm={setSimpleSendForm}
           simpleSendResult={simpleSendResult}
           simpleSendContactResult={simpleSendContactResult}
+          simpleBaleLoginStatus={simpleBaleLoginStatus}
           onAddManualContacts={addSimpleManualContacts}
           onPrepareSimpleSend={prepareSimpleSend}
           onPreviewSimpleSend={previewSimpleSend}
+          onOpenSimpleBaleLogin={openSimpleBaleLogin}
+          onCheckSimpleBaleLogin={checkSimpleBaleLogin}
           onRunSimpleTest={() => runSimpleBaleReal(1)}
           onRunSimpleLimited={() => runSimpleBaleReal(Math.min(3, Math.max(1, Number(simpleSendForm.real_limit) || 1)))}
         />
@@ -1436,9 +1490,12 @@ function CampaignsSection({
   setSimpleSendForm,
   simpleSendResult,
   simpleSendContactResult,
+  simpleBaleLoginStatus,
   onAddManualContacts,
   onPrepareSimpleSend,
   onPreviewSimpleSend,
+  onOpenSimpleBaleLogin,
+  onCheckSimpleBaleLogin,
   onRunSimpleTest,
   onRunSimpleLimited,
 }) {
@@ -1480,9 +1537,12 @@ function CampaignsSection({
         setSimpleSendForm={setSimpleSendForm}
         simpleSendResult={simpleSendResult}
         simpleSendContactResult={simpleSendContactResult}
+        simpleBaleLoginStatus={simpleBaleLoginStatus}
         onAddManualContacts={onAddManualContacts}
         onPrepareSimpleSend={onPrepareSimpleSend}
         onPreviewSimpleSend={onPreviewSimpleSend}
+        onOpenSimpleBaleLogin={onOpenSimpleBaleLogin}
+        onCheckSimpleBaleLogin={onCheckSimpleBaleLogin}
         onRunSimpleTest={onRunSimpleTest}
         onRunSimpleLimited={onRunSimpleLimited}
       />
@@ -1527,7 +1587,7 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
   );
 }
 
-function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts, simpleSendForm, setSimpleSendForm, simpleSendResult, simpleSendContactResult, onAddManualContacts, onPrepareSimpleSend, onPreviewSimpleSend, onRunSimpleTest, onRunSimpleLimited }) {
+function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts, simpleSendForm, setSimpleSendForm, simpleSendResult, simpleSendContactResult, simpleBaleLoginStatus, onAddManualContacts, onPrepareSimpleSend, onPreviewSimpleSend, onOpenSimpleBaleLogin, onCheckSimpleBaleLogin, onRunSimpleTest, onRunSimpleLimited }) {
   return (
     <section className="panel" style={{ marginTop: 16 }}>
       <div className="panel-header">
@@ -1545,9 +1605,12 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
         accountGroups={accountGroups}
         accounts={accounts}
         realRunResult={realRunResult}
+        loginStatus={simpleBaleLoginStatus}
         onAddManualContacts={onAddManualContacts}
         onPrepare={onPrepareSimpleSend}
         onPreview={onPreviewSimpleSend}
+        onOpenLogin={onOpenSimpleBaleLogin}
+        onCheckLogin={onCheckSimpleBaleLogin}
         onRunTest={onRunSimpleTest}
         onRunLimited={onRunSimpleLimited}
       />
@@ -1685,7 +1748,7 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
   );
 }
 
-function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups, accounts, realRunResult, onAddManualContacts, onPrepare, onPreview, onRunTest, onRunLimited }) {
+function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups, accounts, realRunResult, loginStatus, onAddManualContacts, onPrepare, onPreview, onOpenLogin, onCheckLogin, onRunTest, onRunLimited }) {
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const summary = realRunResult?.status_summary || {};
   const activeBaleAccounts = (accounts || []).filter((account) => account.status === "active" || account.active);
@@ -1694,6 +1757,8 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
   const failedMessages = summary.failed || realRunResult?.failed_jobs || 0;
   const remainingMessages = summary.pending ?? readyMessages;
   const needsBaleLogin = (realRunResult?.sample_results || []).some((item) => item.error_code === "not_logged_in");
+  const hasInstallPrompt = (realRunResult?.sample_results || []).some((item) => item.error_code === "bale_install_prompt") || loginStatus?.error_code === "bale_install_prompt";
+  const loginLabel = loginStatus?.logged_in ? "ورود تایید شد" : "نیاز به بررسی ورود";
   return (
     <section className="safe-policy-section">
       <section className="wizard-step">
@@ -1753,6 +1818,14 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
       <section className="wizard-step">
         <div className="empty-state" style={{ marginTop: 12 }}>ورود بله برای هر اکانت فقط یکبار لازم است و روی همین سیستم ذخیره میشود.</div>
         <div className="panel-header"><h3 className="panel-title">۴. بررسی و ارسال</h3><span className="pill">ارسال محدود و دستی</span></div>
+        <div className="plan-preview">
+          <div className="panel-header"><h4 className="panel-title">وضعیت بله</h4><span className="pill">{loginLabel}</span></div>
+          <div className="modal-actions">
+            <button className="secondary-button" onClick={onOpenLogin} type="button">باز کردن بله برای ورود</button>
+            <button className="secondary-button" onClick={onCheckLogin} type="button">بررسی ورود</button>
+          </div>
+          {loginStatus?.profile_dir ? <div className="empty-state">پروفایل ورود این اکانت روی همین سیستم ذخیره میشود.</div> : null}
+        </div>
         <div className="modal-actions">
           <button className="primary-button" onClick={onPrepare} type="button">بررسی و آماده‌سازی</button>
           <button className="secondary-button" onClick={onPreview} type="button">پیش‌نمایش ارسال</button>
@@ -1763,7 +1836,13 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
         {needsBaleLogin ? (
           <div className="error-state" style={{ marginTop: 12 }}>
             <strong>نیاز به ورود به بله</strong>
-            <p>پنجره Chrome باز شده است. وارد حساب بله شوید و بعد دوباره ارسال تست را بزنید.</p>
+            <p>ورود بله تشخیص داده نشد. اگر صفحه بله باز است، وارد حساب شوید و سپس «بررسی ورود» را بزنید.</p>
+          </div>
+        ) : null}
+        {hasInstallPrompt ? (
+          <div className="error-state" style={{ marginTop: 12 }}>
+            <strong>راهنمای نصب بله نمایش داده شده است</strong>
+            <p>روی «متوجه شدم» بزنید، وارد بله شوید و سپس «بررسی ورود» را بزنید.</p>
           </div>
         ) : null}
         <section className="grid metrics">

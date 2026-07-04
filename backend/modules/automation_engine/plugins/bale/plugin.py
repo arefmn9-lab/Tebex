@@ -102,16 +102,102 @@ class BalePlugin:
                 "browser_path": browser_path,
             }
 
+    def open_login(self, account_id: str) -> dict[str, Any]:
+        profile_dir = _native_profile_dir(account_id)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        account = bale_account_store.get_account(account_id) or {"account_id": account_id}
+        profile_metadata = {
+            **account,
+            "browser_provider": "native_chrome",
+            "adspower_profile_id": "",
+            "user_data_dir": str(profile_dir),
+        }
+        try:
+            page = self.browser_manager.get_page(
+                account_id,
+                headless=False,
+                login_required=True,
+                profile_metadata=profile_metadata,
+            )
+            page.goto(self.web_url, wait_until="load")
+            return {
+                "ok": True,
+                "platform": self.platform_id,
+                "account_id": account_id,
+                "provider_mode": "native_chrome",
+                "profile_dir": str(profile_dir),
+                "url": self.web_url,
+                "message": "Chrome opened for Bale login. Complete login manually, then check login.",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "platform": self.platform_id,
+                "account_id": account_id,
+                "provider_mode": "native_chrome",
+                "profile_dir": str(profile_dir),
+                "error_code": _browser_error_code(exc),
+                "message": "Failed to open Bale login window",
+                "error": str(exc),
+            }
+
+    def check_login(self, account_id: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        profile_dir = _native_profile_dir(account_id)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            page = self.browser_manager.get_page(
+                account_id,
+                headless=False,
+                login_required=True,
+                profile_metadata={
+                    "account_id": account_id,
+                    "browser_provider": "native_chrome",
+                    "adspower_profile_id": "",
+                    "user_data_dir": str(profile_dir),
+                },
+            )
+            page.goto(self.web_url, wait_until="load")
+            login_check = self._detect_login_state(page, timeout_ms=10000)
+            error_code = None
+            message = "Bale login detected" if login_check["logged_in"] else "Manual Bale login is required"
+            if login_check["install_prompt_detected"]:
+                error_code = "bale_install_prompt"
+                message = "Bale install/help prompt is visible. Dismiss it, then log in."
+            elif not login_check["logged_in"]:
+                error_code = "not_logged_in"
+            return {
+                "ok": bool(login_check["logged_in"]),
+                "logged_in": bool(login_check["logged_in"]),
+                "platform": self.platform_id,
+                "account_id": account_id,
+                "provider_mode": "native_chrome",
+                "profile_dir": str(profile_dir),
+                "message": message,
+                "error_code": error_code,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "login_check": login_check,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "logged_in": False,
+                "platform": self.platform_id,
+                "account_id": account_id,
+                "provider_mode": "native_chrome",
+                "profile_dir": str(profile_dir),
+                "message": "Bale login check failed",
+                "error_code": _browser_error_code(exc),
+                "error": str(exc),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+
     def validate_session(self, account_id: str) -> dict[str, Any]:
         try:
             page = self._get_page(account_id)
             page.goto(self.web_url, wait_until="load")
-            indicator = self._first_visible_selector(
-                page,
-                selectors.LOGIN_STATE_INDICATOR_SELECTORS,
-                timeout_ms=5000,
-            )
-            logged_in = indicator is not None
+            login_check = self._detect_login_state(page, timeout_ms=5000)
+            logged_in = bool(login_check["logged_in"])
             message = "Bale session appears logged in" if logged_in else "Manual Bale login is required"
             self._log_step(account_id, "validate_session", "success", message)
             return {
@@ -120,6 +206,8 @@ class BalePlugin:
                 "platform": self.platform_id,
                 "account_id": account_id,
                 "message": message,
+                "error_code": "bale_install_prompt" if login_check["install_prompt_detected"] else (None if logged_in else "not_logged_in"),
+                "login_check": login_check,
             }
         except Exception as exc:
             error = str(exc)
@@ -130,7 +218,7 @@ class BalePlugin:
                 "platform": self.platform_id,
                 "account_id": account_id,
                 "message": "Session validation failed",
-                "error_code": "unknown_error",
+                "error_code": _browser_error_code(exc),
                 "error": error,
             }
 
@@ -167,6 +255,7 @@ class BalePlugin:
             browser_path = getattr(self.browser_manager, "last_browser_path", None)
             finished_at = datetime.now(timezone.utc).isoformat()
             failure_meta = self._browser_failure_meta(account_id, effective_provider)
+            diagnostics = getattr(exc, "diagnostics", {}) or {}
             self._log_step(
                 account_id,
                 "send_test_message",
@@ -177,7 +266,7 @@ class BalePlugin:
             )
             return {
                 "ok": False,
-                "logged_in": error_code != "not_logged_in",
+                "logged_in": error_code not in {"not_logged_in", "bale_install_prompt"},
                 "platform": self.platform_id,
                 "account_id": account_id,
                 "target": target,
@@ -188,6 +277,7 @@ class BalePlugin:
                 "started_at": started_at,
                 "finished_at": finished_at,
                 "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
+                **diagnostics,
                 **failure_meta,
             }
 
@@ -249,12 +339,22 @@ class BalePlugin:
         self._record_step(execution_logs, account_id, "open_bale_web", "success", "Bale Web opened")
 
         self._record_step(execution_logs, account_id, "check_login", "started", "Checking Bale login state")
-        login_indicator = self._first_visible_selector(
-            page,
-            selectors.LOGIN_STATE_INDICATOR_SELECTORS,
-            timeout_ms=5000,
-        )
-        if login_indicator is None:
+        login_check = self._detect_login_state(page, timeout_ms=10000)
+        if login_check["install_prompt_detected"]:
+            self._record_step(
+                execution_logs,
+                account_id,
+                "check_login",
+                "failed",
+                "Bale install/help prompt is visible",
+                error_code="bale_install_prompt",
+            )
+            raise BalePluginError(
+                "bale_install_prompt",
+                "صفحه راهنمای نصب بله نمایش داده شده است. روی «متوجه شدم» بزنید و وارد بله شوید.",
+                {"login_check": login_check, **self._page_debug_info(page, account_id)},
+            )
+        if not login_check["logged_in"]:
             self._record_step(
                 execution_logs,
                 account_id,
@@ -263,8 +363,12 @@ class BalePlugin:
                 "Manual Bale login is required before sending a test message",
                 error_code="not_logged_in",
             )
-            raise BalePluginError("not_logged_in", "Manual Bale login is required before sending a test message")
-        self._record_step(execution_logs, account_id, "check_login", "success", f"Logged-in UI detected: {login_indicator}")
+            raise BalePluginError(
+                "not_logged_in",
+                "Manual Bale login is required before sending a test message",
+                {"login_check": login_check, **self._page_debug_info(page, account_id)},
+            )
+        self._record_step(execution_logs, account_id, "check_login", "success", f"Logged-in UI detected: {login_check.get('matched_selector')}")
 
         search_input = self._require_selector(
             page,
@@ -475,6 +579,46 @@ class BalePlugin:
             "profile_dir": str(account.get("user_data_dir") or ""),
         }
 
+    def _detect_login_state(self, page: Any, timeout_ms: int = 5000) -> dict[str, Any]:
+        current_url = _safe_page_url(page)
+        login_page_detected = "/login" in current_url.lower()
+        install_prompt = self._first_visible_selector(page, _INSTALL_PROMPT_SELECTORS, timeout_ms=1000)
+        login_form = self._first_visible_selector(page, _LOGIN_FORM_SELECTORS, timeout_ms=1000)
+
+        matched_selector = self._first_visible_selector(
+            page,
+            _CHAT_UI_SELECTORS,
+            timeout_ms=timeout_ms,
+        )
+        search_selector = self._first_visible_selector(page, selectors.SEARCH_INPUT_SELECTORS, timeout_ms=1000)
+        message_selector = self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=1000)
+        chat_ui_detected = any([matched_selector, search_selector, message_selector])
+        blocking_login_ui = bool(login_form or install_prompt)
+        logged_in = bool(chat_ui_detected and not blocking_login_ui)
+
+        return {
+            "logged_in": logged_in,
+            "current_url": current_url,
+            "matched_selector": matched_selector or search_selector or message_selector or "",
+            "login_page_detected": bool(login_page_detected or login_form),
+            "install_prompt_detected": bool(install_prompt),
+            "chat_ui_detected": bool(chat_ui_detected),
+            "search_input_detected": bool(search_selector),
+            "message_input_detected": bool(message_selector),
+            "login_form_selector": login_form or "",
+            "install_prompt_selector": install_prompt or "",
+        }
+
+    def _page_debug_info(self, page: Any, account_id: str) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "current_url": _safe_page_url(page),
+            "page_title": _safe_page_title(page),
+        }
+        screenshot_path = _save_login_debug_screenshot(page, account_id)
+        if screenshot_path:
+            info["screenshot_path"] = screenshot_path
+        return info
+
     def _first_visible_selector(
         self,
         page: Any,
@@ -614,14 +758,89 @@ class BalePlugin:
 
 
 class BalePluginError(RuntimeError):
-    def __init__(self, error_code: str, message: str) -> None:
+    def __init__(self, error_code: str, message: str, diagnostics: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.error_code = error_code
+        self.diagnostics = diagnostics or {}
 
 
 def _native_profile_dir(account_id: str) -> Path:
     backend_dir = Path(__file__).resolve().parents[4]
     return backend_dir / "runtime" / "browser_profiles" / account_id
+
+
+_CHAT_UI_SELECTORS = [
+    *selectors.LOGIN_STATE_INDICATOR_SELECTORS,
+    *selectors.SEARCH_INPUT_SELECTORS,
+    *selectors.MESSAGE_INPUT_SELECTORS,
+    "[data-testid*='sidebar']",
+    "[class*='sidebar']",
+    "[data-testid*='conversation']",
+    "[class*='conversation']",
+    "[class*='chat-list']",
+    "[class*='ChatList']",
+    "main",
+]
+
+_LOGIN_FORM_SELECTORS = [
+    "input[type='tel']",
+    "input[name*='phone']",
+    "input[autocomplete='tel']",
+    "[data-testid*='login']",
+    "[class*='login']",
+    "text=ورود",
+    "text=شماره موبایل",
+]
+
+_INSTALL_PROMPT_SELECTORS = [
+    "text=متوجه شدم",
+    "text=نصب",
+    "text=install",
+    "text=Install",
+    "[data-testid*='install']",
+    "[class*='install']",
+]
+
+
+def _safe_page_url(page: Any) -> str:
+    try:
+        value = getattr(page, "url", "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        urls = getattr(page, "urls", [])
+        if urls:
+            return str(urls[-1])
+    except Exception:
+        pass
+    return ""
+
+
+def _safe_page_title(page: Any) -> str:
+    try:
+        title = getattr(page, "title", None)
+        if callable(title):
+            return str(title())
+        return str(title or "")
+    except Exception:
+        return ""
+
+
+def _save_login_debug_screenshot(page: Any, account_id: str) -> str:
+    try:
+        screenshot = getattr(page, "screenshot", None)
+        if not callable(screenshot):
+            return ""
+        debug_dir = Path(__file__).resolve().parents[4] / "runtime" / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        screenshot_path = debug_dir / f"bale_login_{account_id}_{timestamp}.png"
+        screenshot(path=str(screenshot_path), full_page=True)
+        return str(screenshot_path)
+    except Exception:
+        return ""
 
 
 def _browser_error_code(exc: Exception) -> str:

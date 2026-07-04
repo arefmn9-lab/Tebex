@@ -50,14 +50,16 @@ class MockLocator:
 
 
 class MockPage:
-    def __init__(self, visible_selectors: set[str]) -> None:
+    def __init__(self, visible_selectors: set[str], url: str = "https://web.bale.ai/") -> None:
         self.visible_selectors = visible_selectors
         self.filled: list[tuple[str, str]] = []
         self.clicked: list[str] = []
         self.urls: list[str] = []
+        self.url = url
 
     def goto(self, url: str, wait_until: str = "load") -> None:
         self.urls.append(url)
+        self.url = url
 
     def locator(self, selector: str) -> MockLocator:
         return MockLocator(selector, self.visible_selectors)
@@ -71,6 +73,12 @@ class MockPage:
         if selector not in self.visible_selectors:
             raise TimeoutError(f"Cannot click missing selector: {selector}")
         self.clicked.append(selector)
+
+    def title(self) -> str:
+        return "Bale Web"
+
+    def screenshot(self, path: str, full_page: bool = True) -> None:
+        Path(path).write_bytes(b"mock screenshot")
 
 
 class MockSessionManager:
@@ -156,6 +164,14 @@ def test_validate_session_not_logged_in_mocked() -> None:
     result = plugin.validate_session("bale_test")
     assert result["ok"] is False
     assert result["logged_in"] is False
+    assert result["login_check"]["chat_ui_detected"] is False
+
+
+def test_validate_session_greenlet_error_is_browser_thread_error() -> None:
+    plugin = BalePlugin(browser_manager=ThreadErrorBrowserManager(MockPage(set())))
+    result = plugin.validate_session("bale_test")
+    assert result["ok"] is False
+    assert result["error_code"] == "browser_thread_error"
 
 
 def test_send_test_message_requires_target() -> None:
@@ -173,6 +189,31 @@ def test_send_test_message_not_logged_in_path() -> None:
     assert result["ok"] is False
     assert result["logged_in"] is False
     assert result["error_code"] == "not_logged_in"
+    assert result["profile_dir"]
+    assert "bale_test" in result["profile_dir"]
+    assert result["login_check"]["chat_ui_detected"] is False
+    assert result["current_url"] == "https://web.bale.ai"
+
+
+def test_send_test_message_install_prompt_maps_error() -> None:
+    page = MockPage({"text=متوجه شدم"}, url="https://web.bale.ai/login?redirectTo=/")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.send_test_message("bale_test", "target", "hello")
+    assert result["ok"] is False
+    assert result["logged_in"] is False
+    assert result["error_code"] == "bale_install_prompt"
+    assert result["profile_dir"]
+    assert result["login_check"]["install_prompt_detected"] is True
+
+
+def test_open_login_returns_profile_dir_without_real_browser() -> None:
+    page = MockPage(set())
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_login("bale_login_1")
+    assert result["ok"] is True
+    assert result["profile_dir"]
+    assert "bale_login_1" in result["profile_dir"]
+    assert page.urls[-1] == plugin.web_url
 
 
 def test_send_test_message_message_input_missing_path() -> None:
@@ -218,6 +259,8 @@ def test_send_test_message_maps_greenlet_thread_error() -> None:
 def test_api_routes_import() -> None:
     paths = {getattr(route, "path", "") for route in app.routes}
     assert "/automation/platforms/bale/open-account" in paths
+    assert "/automation/platforms/bale/accounts/{account_id}/open-login" in paths
+    assert "/automation/platforms/bale/accounts/{account_id}/check-login" in paths
     assert "/automation/platforms/bale/send-test" in paths
     assert "/automation/platforms/bale/message-config" in paths
     assert "/automation/platforms/bale/profile-groups" in paths
@@ -1554,8 +1597,11 @@ if __name__ == "__main__":
     test_selectors_exist()
     test_validate_session_can_be_mocked()
     test_validate_session_not_logged_in_mocked()
+    test_validate_session_greenlet_error_is_browser_thread_error()
     test_send_test_message_requires_target()
     test_send_test_message_not_logged_in_path()
+    test_send_test_message_install_prompt_maps_error()
+    test_open_login_returns_profile_dir_without_real_browser()
     test_send_test_message_message_input_missing_path()
     test_send_test_message_send_timeout_path()
     test_send_test_message_maps_greenlet_thread_error()

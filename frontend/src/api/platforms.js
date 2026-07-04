@@ -260,6 +260,18 @@ export function openBaleAccount(accountId) {
   });
 }
 
+export function openBaleLogin(accountId) {
+  return request(`/automation/platforms/bale/accounts/${encodeURIComponent(accountId)}/open-login`, {
+    method: "POST",
+  });
+}
+
+export function checkBaleLogin(accountId) {
+  return request(`/automation/platforms/bale/accounts/${encodeURIComponent(accountId)}/check-login`, {
+    method: "POST",
+  });
+}
+
 export function sendBaleTestMessage(payload) {
   return request("/automation/platforms/bale/send-test", {
     method: "POST",

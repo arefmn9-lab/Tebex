@@ -1152,6 +1152,18 @@ def open_bale_account(
     return bale_plugin.open_account(request.account_id)
 
 
+@router.post("/platforms/bale/accounts/{account_id}/open-login")
+def open_bale_login(account_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_plugin.open_login(account_id)
+
+
+@router.post("/platforms/bale/accounts/{account_id}/check-login")
+def check_bale_login(account_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_plugin.check_login(account_id)
+
+
 @router.post("/platforms/bale/send-test")
 def send_bale_test(
     request: BaleSendTestRequest,
