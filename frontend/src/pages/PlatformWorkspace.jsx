@@ -235,6 +235,18 @@ function statusTone(status) {
   return "neutral";
 }
 
+function friendlyBulkError(error) {
+  const text = String(error?.message || error?.error_message || error?.error_code || error || "");
+  if (text.includes("account_not_found")) return "اکانت ارسال پیدا نشد.";
+  if (text.includes("account_id")) return "اکانت ارسال انتخاب نشده است.";
+  if (text.includes("no pending") || text.includes("pending")) return "پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.";
+  if (text.includes("dry_run") || text.includes("dry-run")) return "این عملیات فقط از دکمه ارسال تست انجام می‌شود.";
+  if (text.includes("target_not_found") || text.includes("target")) return "هیچ شماره معتبری برای ارسال وجود ندارد.";
+  if (text.includes("source") || text.includes("message")) return "متن پیام خالی است.";
+  if (text.includes("group")) return "هیچ گروه ارسال فعالی پیدا نشد.";
+  return text || "درخواست انجام نشد.";
+}
+
 function Modal({ title, children, onClose }) {
   return (
     <div className="modal-backdrop" role="presentation">
@@ -716,6 +728,11 @@ export default function PlatformWorkspace({ platformId }) {
         return;
       }
       const groupId = simpleSendForm.account_group_id || accountGroups[0]?.group_id || "bale_test_group";
+      const activeBaleAccounts = platformAccounts.filter((account) => account.status === "active" || account.active);
+      if (!groupId || activeBaleAccounts.length === 0) {
+        setActionError("هیچ اکانت فعالی برای ارسال پیدا نشد. ابتدا از بخش اکانت‌ها یک اکانت بله فعال کنید.");
+        return;
+      }
       const campaign = await createBulkCampaign({
         campaign_id: `simple_send_${runKey}`,
         name: simpleSendForm.name || "ارسال پیام جدید",
@@ -779,15 +796,15 @@ export default function PlatformWorkspace({ platformId }) {
       setBulkQueueJobs((jobs || []).slice(0, 20));
       setAssignmentForm((current) => ({ ...current, campaign_id: campaign.campaign_id, planned_for_date: today }));
       await reloadBulkData();
-      setToast("آماده‌سازی ارسال انجام شد");
+      setToast(`آماده شد. ${result.total_jobs} پیام برای ارسال آماده است.`);
     } catch (error) {
-      setActionError(error.message);
+      setActionError(friendlyBulkError(error));
     }
   }
 
   function previewSimpleSend() {
     if (!simpleSendResult) {
-      setActionError("برای اجرای واقعی، ابتدا آماده‌سازی ارسال را بزنید");
+      setActionError("پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.");
       return;
     }
     setToast("پیشنمایش آماده است؛ هیچ پیامی ارسال نشد");
@@ -795,7 +812,7 @@ export default function PlatformWorkspace({ platformId }) {
 
   async function runSimpleBaleReal(limit) {
     if (!simpleSendResult?.campaign_id) {
-      setActionError("برای اجرای واقعی، ابتدا آماده‌سازی ارسال را بزنید");
+      setActionError("پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.");
       return;
     }
     try {
@@ -806,9 +823,9 @@ export default function PlatformWorkspace({ platformId }) {
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(simpleSendResult.campaign_id);
-      setToast(result.processed_jobs ? "اجرای محدود انجام شد" : "هیچ job آماده‌ای در صف وجود ندارد");
+      setToast(result.processed_jobs ? "ارسال مرحله‌ای انجام شد" : "پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.");
     } catch (error) {
-      setActionError(error.message);
+      setActionError(friendlyBulkError(error));
     }
   }
 
@@ -1459,15 +1476,18 @@ function CampaignsSection({
         onRunSimpleTest={onRunSimpleTest}
         onRunSimpleLimited={onRunSimpleLimited}
       />
-      <BaleSendSection
-        accounts={accounts}
-        config={quickMessageConfig}
-        setConfig={setQuickMessageConfig}
-        onSave={onSaveQuickMessage}
-        onDryRun={onQuickDryRun}
-        onControlledTest={onQuickControlledTest}
-        planResult={quickPlanResult}
-      />
+      <details className="safe-policy-section" style={{ marginTop: 16 }}>
+        <summary className="panel-title">جزئیات فنی و تست ارسال از پیام آماده</summary>
+        <BaleSendSection
+          accounts={accounts}
+          config={quickMessageConfig}
+          setConfig={setQuickMessageConfig}
+          onSave={onSaveQuickMessage}
+          onDryRun={onQuickDryRun}
+          onControlledTest={onQuickControlledTest}
+          planResult={quickPlanResult}
+        />
+      </details>
     </div>
   );
 }
@@ -1476,7 +1496,7 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
   const update = (key, value) => setConfig((current) => ({ ...current, [key]: value }));
   return (
     <section className="panel" style={{ marginTop: 16 }}>
-      <div className="panel-header"><h3 className="panel-title">پیام متنی سریع</h3><span className="pill">فوروارد از منبع</span></div>
+      <div className="panel-header"><h3 className="panel-title">ارسال از پیام آماده</h3><span className="pill">جزئیات فنی</span></div>
       <p className="page-copy">روش اصلی ارسال، فوروارد پیام آماده از منبع است تا از آپلود تکراری عکس و ویدیو جلوگیری شود.</p>
       <div className="settings-grid" style={{ marginTop: 14 }}>
         <Field label="انتخاب اکانت"><select value={config.account_id} onChange={(event) => update("account_id", event.target.value)}><option value="">انتخاب اکانت</option>{accounts.map((account) => <option key={account.account_id} value={account.account_id}>{account.phone || account.account_id}</option>)}</select></Field>
@@ -1489,8 +1509,8 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
       </div>
       <div className="modal-actions">
         <button className="secondary-button" onClick={onSave} type="button"><Save size={16} />ذخیره تنظیمات</button>
-        <button className="primary-button" onClick={onDryRun} type="button">تست خشک</button>
-        <button className="secondary-button" onClick={onControlledTest} type="button">تست فوروارد کنترل‌شده</button>
+        <button className="primary-button" onClick={onDryRun} type="button">پیش‌نمایش بدون ارسال</button>
+        <button className="secondary-button" onClick={onControlledTest} type="button">ارسال از پیام آماده</button>
       </div>
       <PlanPreview result={planResult} />
     </section>
@@ -1500,7 +1520,13 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
 function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts, simpleSendForm, setSimpleSendForm, simpleSendResult, simpleSendContactResult, onAddManualContacts, onPrepareSimpleSend, onPreviewSimpleSend, onRunSimpleTest, onRunSimpleLimited }) {
   return (
     <section className="panel" style={{ marginTop: 16 }}>
-      <div className="panel-header"><h3 className="panel-title">پیام انبوه</h3><span className="pill">dry-run</span></div>
+      <div className="panel-header">
+        <div>
+          <h3 className="panel-title">ارسال پیام</h3>
+          <p className="page-copy">شماره‌ها را وارد کنید، پیام را بنویسید و ارسال را مرحله‌به‌مرحله انجام دهید.</p>
+        </div>
+        <span className="pill">پیش‌نمایش</span>
+      </div>
       <SimpleSendWizard
         form={simpleSendForm}
         setForm={setSimpleSendForm}
@@ -1517,7 +1543,7 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
       />
 
       <details className="safe-policy-section" style={{ marginTop: 16 }}>
-        <summary className="panel-title">تنظیمات پیشرفته</summary>
+        <summary className="panel-title">جزئیات فنی و تست</summary>
       <section className="safe-policy-section">
         <div className="panel-header"><h3 className="panel-title">کمپین‌ها</h3><button className="secondary-button" onClick={onCreateCampaign} type="button"><Plus size={16} />کمپین جدید</button></div>
         <div className="table-scroll">
@@ -1544,7 +1570,7 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
       </section>
 
       <section className="safe-policy-section">
-        <div className="panel-header"><h3 className="panel-title">منابع پیام</h3><button className="secondary-button" onClick={onCreateSource} type="button"><Plus size={16} />منبع جدید</button></div>
+        <div className="panel-header"><h3 className="panel-title">تنظیمات پیام</h3><button className="secondary-button" onClick={onCreateSource} type="button"><Plus size={16} />منبع جدید</button></div>
         <div className="table-scroll">
           <table className="table rtl-table wide-table">
             <thead><tr><th>نام</th><th>platform</th><th>tag</th><th>type</th><th>ref</th><th>فعال</th><th>عملیات</th></tr></thead>
@@ -1651,17 +1677,95 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
 
 function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups, accounts, realRunResult, onAddManualContacts, onPrepare, onPreview, onRunTest, onRunLimited }) {
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const summary = realRunResult?.status_summary || {};
+  const activeBaleAccounts = (accounts || []).filter((account) => account.status === "active" || account.active);
+  const readyMessages = result?.total_jobs || 0;
+  const sentMessages = summary.completed || realRunResult?.completed_jobs || 0;
+  const failedMessages = summary.failed || realRunResult?.failed_jobs || 0;
+  const remainingMessages = summary.pending ?? readyMessages;
+  return (
+    <section className="safe-policy-section">
+      <section className="wizard-step">
+        <div className="panel-header"><h3 className="panel-title">۱. گیرندگان</h3><span className="pill">Excel / CSV</span></div>
+        <div className="settings-grid">
+          <Field label="آپلود فایل شماره‌ها">
+            <input type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => update("file", event.target.files?.[0] || null)} />
+            <small className="field-helper">فایل Excel یا CSV شامل شماره موبایل</small>
+          </Field>
+          <Field label="یا ورود دستی شماره‌ها">
+            <textarea
+              value={form.phones_text}
+              placeholder={"هر شماره در یک خط:\n09121234567\n09129876543"}
+              onChange={(event) => update("phones_text", event.target.value)}
+            />
+          </Field>
+        </div>
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={onAddManualContacts} type="button">افزودن شماره‌های دستی</button>
+        </div>
+        {contactResult ? (
+          <section className="grid metrics">
+            <div><span>شماره‌های معتبر</span><strong>{contactResult.valid_contacts || 0}</strong></div>
+            <div><span>شماره‌های تکراری</span><strong>{contactResult.duplicate_contacts || 0}</strong></div>
+            <div><span>شماره‌های نامعتبر</span><strong>{contactResult.invalid_contacts || 0}</strong></div>
+          </section>
+        ) : null}
+      </section>
+
+      <section className="wizard-step">
+        <div className="panel-header"><h3 className="panel-title">۲. متن پیام</h3></div>
+        <Field label="متن پیام">
+          <textarea value={form.message_text} placeholder="متن پیامی که می‌خواهید ارسال شود را بنویسید..." onChange={(event) => update("message_text", event.target.value)} />
+        </Field>
+      </section>
+
+      <section className="wizard-step">
+        <div className="panel-header"><h3 className="panel-title">۳. تنظیمات ارسال</h3></div>
+        <div className="settings-grid">
+          <Field label="پیام‌رسان">
+            <select value={form.platform_id} onChange={(event) => update("platform_id", event.target.value)}>
+              <option value="bale">بله</option>
+            </select>
+          </Field>
+          <Field label="گروه ارسال">
+            <select value={form.account_group_id || accountGroups[0]?.group_id || ""} onChange={(event) => update("account_group_id", event.target.value)}>
+              {accountGroups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name || group.group_id}</option>)}
+            </select>
+            <small className="field-helper">معمولاً نیازی به تغییر ندارد. سیستم از اکانت‌های فعال این گروه استفاده می‌کند.</small>
+          </Field>
+        </div>
+        {activeBaleAccounts.length === 0 ? (
+          <div className="error-state" style={{ marginTop: 12 }}>هیچ اکانت فعالی برای ارسال پیدا نشد. ابتدا از بخش اکانت‌ها یک اکانت بله فعال کنید.</div>
+        ) : null}
+      </section>
+
+      <section className="wizard-step">
+        <div className="panel-header"><h3 className="panel-title">۴. بررسی و ارسال</h3><span className="pill">ارسال محدود و دستی</span></div>
+        <div className="modal-actions">
+          <button className="primary-button" onClick={onPrepare} type="button">بررسی و آماده‌سازی</button>
+          <button className="secondary-button" onClick={onPreview} type="button">پیش‌نمایش ارسال</button>
+          <button className="secondary-button" onClick={onRunTest} type="button">ارسال تست به ۱ شماره</button>
+          <button className="danger-button" onClick={onRunLimited} type="button">شروع ارسال مرحله‌ای</button>
+        </div>
+        {result ? <div className="empty-state">آماده شد. {readyMessages} پیام برای ارسال آماده است.</div> : null}
+        <section className="grid metrics">
+          <div><span>آماده ارسال</span><strong>{readyMessages}</strong></div>
+          <div><span>در حال ارسال</span><strong>{summary.running || 0}</strong></div>
+          <div><span>ارسال‌شده</span><strong>{sentMessages}</strong></div>
+          <div><span>ناموفق</span><strong>{failedMessages}</strong></div>
+          <div><span>باقی‌مانده</span><strong>{remainingMessages}</strong></div>
+        </section>
+      </section>
+    </section>
+  );
+}
+
+function LegacySimpleSendWizard({ form, setForm, result, contactResult, accountGroups, accounts, realRunResult, onAddManualContacts, onPrepare, onPreview, onRunTest, onRunLimited }) {
+  const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const baleAccounts = (accounts || []).filter((account) => !account.platform_id || account.platform_id === "bale" || account.platform === "bale");
   const summary = realRunResult?.status_summary || {};
   return (
     <section className="safe-policy-section">
-      <div className="panel-header">
-        <div>
-          <h3 className="panel-title">ارسال پیام جدید</h3>
-          <p className="page-copy">شماره‌ها را وارد کنید، پیام را بنویسید، سپس ابتدا پیش‌نمایش و ارسال تست بگیرید.</p>
-        </div>
-        <span className="pill">ایمن / dry-run</span>
-      </div>
       <div className="settings-grid">
         <Field label="پلتفرم">
           <select value={form.platform_id} onChange={(event) => update("platform_id", event.target.value)}>
@@ -1747,10 +1851,10 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
       ) : null}
       {realRunResult ? (
         <section className="grid metrics">
-          <div><span>processed_jobs</span><strong>{realRunResult.processed_jobs || 0}</strong></div>
-          <div><span>completed_jobs</span><strong>{realRunResult.completed_jobs || 0}</strong></div>
-          <div><span>failed_jobs</span><strong>{realRunResult.failed_jobs || 0}</strong></div>
-          <div><span>jobهای در انتظار</span><strong>{summary.pending || 0}</strong></div>
+          <div><span>تعداد بررسی‌شده</span><strong>{realRunResult.processed_jobs || 0}</strong></div>
+          <div><span>ارسال‌شده</span><strong>{realRunResult.completed_jobs || 0}</strong></div>
+          <div><span>ناموفق</span><strong>{realRunResult.failed_jobs || 0}</strong></div>
+          <div><span>در انتظار</span><strong>{summary.pending || 0}</strong></div>
         </section>
       ) : null}
     </section>
@@ -1791,7 +1895,7 @@ function BulkAssignmentPlannerSection({ form, setForm, result, onAssign, campaig
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   return (
     <section className="safe-policy-section">
-      <div className="panel-header"><h3 className="panel-title">تقسیم مخاطبین بین اکانت‌ها</h3><span className="pill">dry-run</span></div>
+      <div className="panel-header"><h3 className="panel-title">تقسیم بین اکانت‌ها</h3><span className="pill">پیش‌نمایش</span></div>
       <div className="settings-grid">
         <Field label="کمپین">
           <select value={selectedCampaignId} onChange={(event) => update("campaign_id", event.target.value)}>
@@ -1809,7 +1913,7 @@ function BulkAssignmentPlannerSection({ form, setForm, result, onAssign, campaig
         </Field>
       </div>
       <div className="modal-actions">
-        <button className="primary-button" onClick={() => selectedCampaignId && onAssign(selectedCampaignId)} type="button">ساخت تقسیم‌بندی آزمایشی</button>
+        <button className="primary-button" onClick={() => selectedCampaignId && onAssign(selectedCampaignId)} type="button">ساخت پیش‌نمایش تقسیم</button>
       </div>
       {result ? (
         <div className="plan-preview">
@@ -1869,16 +1973,16 @@ function BulkExecutionQueueSection({ form, campaigns, result, jobs, realRunResul
   const updateRealRun = (key, value) => setRealRunForm((current) => ({ ...current, [key]: value }));
   return (
     <section className="safe-policy-section">
-      <div className="panel-header"><h3 className="panel-title">صف اجرای کمپین</h3><span className="pill">dry-run</span></div>
+      <div className="panel-header"><h3 className="panel-title">صف ارسال</h3><span className="pill">پیش‌نمایش</span></div>
       <div className="modal-actions">
-        <button className="primary-button" onClick={() => selectedCampaignId && onCreateQueue(selectedCampaignId)} type="button">ساخت صف اجرای آزمایشی</button>
-        <button className="secondary-button" onClick={() => selectedCampaignId && onDryRunQueue(selectedCampaignId)} type="button">اجرای آزمایشی ۱۰ job</button>
+        <button className="primary-button" onClick={() => selectedCampaignId && onCreateQueue(selectedCampaignId)} type="button">ساخت صف ارسال آزمایشی</button>
+        <button className="secondary-button" onClick={() => selectedCampaignId && onDryRunQueue(selectedCampaignId)} type="button">پیش‌نمایش ۱۰ پیام</button>
       </div>
       {result ? (
         <div className="plan-preview">
-          <div className="panel-header"><h4 className="panel-title">خلاصه صف</h4><span className="pill">تعداد jobهای ساخته‌شده {result.total_jobs ?? result.created_jobs ?? 0}</span></div>
+          <div className="panel-header"><h4 className="panel-title">خلاصه صف ارسال</h4><span className="pill">تعداد پیام‌های ساخته‌شده {result.total_jobs ?? result.created_jobs ?? 0}</span></div>
           <section className="grid metrics">
-            <div><span>jobهای در انتظار</span><strong>{summary.pending || 0}</strong></div>
+            <div><span>در انتظار</span><strong>{summary.pending || 0}</strong></div>
             <div><span>انجام‌شده</span><strong>{summary.completed || 0}</strong></div>
             <div><span>خطاها</span><strong>{summary.failed || 0}</strong></div>
             <div><span>ردشده</span><strong>{summary.skipped || 0}</strong></div>
@@ -1886,9 +1990,9 @@ function BulkExecutionQueueSection({ form, campaigns, result, jobs, realRunResul
           </section>
           {sampleJobs.length ? (
             <div className="table-scroll">
-              <h4 className="panel-title">نمونه jobها</h4>
+              <h4 className="panel-title">نمونه پیام‌ها</h4>
               <table className="table rtl-table wide-table">
-                <thead><tr><th>job</th><th>اکانت</th><th>شماره نرمال‌شده</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
+                <thead><tr><th>شناسه فنی</th><th>اکانت</th><th>شماره نرمال‌شده</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
                 <tbody>{sampleJobs.map((job) => (
                   <tr key={job.job_id}>
                     <td>{job.job_id}</td>
@@ -1904,8 +2008,8 @@ function BulkExecutionQueueSection({ form, campaigns, result, jobs, realRunResul
         </div>
       ) : null}
       <div className="plan-preview">
-        <div className="panel-header"><h4 className="panel-title">اجرای واقعی محدود Bale</h4><span className="pill">فقط برای تست محدود</span></div>
-        <div className="empty-state">ارسال انبوه نیست. حداکثر ۳ job در هر اجرا.</div>
+        <div className="panel-header"><h4 className="panel-title">ارسال تست</h4><span className="pill">فقط برای تست محدود</span></div>
+        <div className="empty-state">ارسال انبوه نیست. حداکثر ۳ پیام در هر اجرا.</div>
         <div className="settings-grid" style={{ marginTop: 12 }}>
           <Field label="limit">
             <input type="number" min="1" max="3" value={realRunForm.limit} onChange={(event) => updateRealRun("limit", event.target.value)} />
@@ -1918,23 +2022,23 @@ function BulkExecutionQueueSection({ form, campaigns, result, jobs, realRunResul
           </Field>
         </div>
         <div className="modal-actions">
-          <button className="danger-button" onClick={() => selectedCampaignId && onRunBaleReal(selectedCampaignId)} type="button">اجرای واقعی ۱ تا ۳ job Bale</button>
+          <button className="danger-button" onClick={() => selectedCampaignId && onRunBaleReal(selectedCampaignId)} type="button">ارسال تست به ۱ شماره</button>
         </div>
         {realRunResult ? (
           <>
             <section className="grid metrics">
-              <div><span>processed_jobs</span><strong>{realRunResult.processed_jobs || 0}</strong></div>
-              <div><span>completed_jobs</span><strong>{realRunResult.completed_jobs || 0}</strong></div>
-              <div><span>failed_jobs</span><strong>{realRunResult.failed_jobs || 0}</strong></div>
-              <div><span>jobهای در انتظار</span><strong>{realSummary.pending || 0}</strong></div>
+              <div><span>تعداد بررسی‌شده</span><strong>{realRunResult.processed_jobs || 0}</strong></div>
+              <div><span>ارسال‌شده</span><strong>{realRunResult.completed_jobs || 0}</strong></div>
+              <div><span>ناموفق</span><strong>{realRunResult.failed_jobs || 0}</strong></div>
+              <div><span>در انتظار</span><strong>{realSummary.pending || 0}</strong></div>
               <div><span>انجام‌شده</span><strong>{realSummary.completed || 0}</strong></div>
-              <div><span>خطاها</span><strong>{realSummary.failed || 0}</strong></div>
+              <div><span>ناموفق</span><strong>{realSummary.failed || 0}</strong></div>
             </section>
             {(realRunResult.sample_results || []).length ? (
               <div className="table-scroll">
-                <h4 className="panel-title">sample_results</h4>
+                <h4 className="panel-title">نتیجه تست</h4>
                 <table className="table rtl-table wide-table">
-                  <thead><tr><th>job</th><th>اکانت</th><th>شماره نرمال‌شده</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
+                  <thead><tr><th>شناسه فنی</th><th>اکانت</th><th>شماره نرمال‌شده</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
                   <tbody>{realRunResult.sample_results.map((job) => (
                     <tr key={job.job_id}>
                       <td>{job.job_id}</td>
