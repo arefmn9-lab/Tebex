@@ -6,6 +6,7 @@ from typing import Any
 from modules.automation_engine.plugins.bale import bale_plugin
 
 from .execution_queue import BulkExecutionQueueStore, execution_queue_store
+from .message_source_store import MessageSourceStore, message_source_store
 from .models import utc_now
 
 
@@ -17,9 +18,11 @@ class BaleQueueRunner:
         self,
         queue_store: BulkExecutionQueueStore | None = None,
         plugin: Any | None = None,
+        source_store: MessageSourceStore | None = None,
     ) -> None:
         self.queue_store = queue_store or execution_queue_store
         self.plugin = plugin or bale_plugin
+        self.source_store = source_store or message_source_store
 
     def run(self, campaign_id: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = request or {}
@@ -130,15 +133,24 @@ class BaleQueueRunner:
     def _run_job(self, job: dict[str, Any], provider_mode: str = "native_chrome") -> dict[str, Any]:
         started_at = utc_now()
         started_monotonic = time.perf_counter()
-        action = "send_test_message"
+        action = "send_text_message"
         try:
-            message = _test_message(job)
-            plugin_result = self.plugin.send_test_message(
-                account_id=str(job.get("account_id") or ""),
-                target=str(job.get("normalized_phone") or ""),
-                message=message,
-                provider_mode=provider_mode,
-            )
+            message = self._message_text_for_job(job)
+            if hasattr(self.plugin, "send_text_message"):
+                plugin_result = self.plugin.send_text_message(
+                    account_id=str(job.get("account_id") or ""),
+                    normalized_phone=str(job.get("normalized_phone") or ""),
+                    contact_naming_value=str(job.get("contact_naming_value") or ""),
+                    message_text=message,
+                    provider_mode=provider_mode,
+                )
+            else:
+                plugin_result = self.plugin.send_test_message(
+                    account_id=str(job.get("account_id") or ""),
+                    target=str(job.get("normalized_phone") or ""),
+                    message=message,
+                    provider_mode=provider_mode,
+                )
             success = bool(plugin_result.get("ok"))
             finished_at = utc_now()
             result = {
@@ -172,6 +184,15 @@ class BaleQueueRunner:
                 "error_code": _runner_error_code(exc),
                 "error_message": str(exc),
             }
+
+    def _message_text_for_job(self, job: dict[str, Any]) -> str:
+        source_id = str(job.get("message_source_id") or "")
+        source = self.source_store.get_source(source_id) if source_id else None
+        if source and str(source.get("source_type") or "") == "text_message":
+            return str(source.get("message_ref_value") or source.get("source_ref") or "")
+        if source:
+            return str(source.get("message_ref_value") or source.get("source_ref") or "")
+        return _test_message(job)
 
 
 def _test_message(job: dict[str, Any]) -> str:
@@ -209,6 +230,8 @@ def _runner_error_code(exc: Exception) -> str:
 
 
 def _sample_result(job: dict[str, Any]) -> dict[str, Any]:
+    execution_result = job.get("execution_result") or {}
+    plugin_result = execution_result.get("plugin_result") or {}
     return {
         "job_id": job["job_id"],
         "account_id": job["account_id"],
@@ -217,6 +240,11 @@ def _sample_result(job: dict[str, Any]) -> dict[str, Any]:
         "status": job["status"],
         "error_code": job.get("error_code"),
         "error_message": job.get("error_message"),
+        "failed_step": plugin_result.get("failed_step") or execution_result.get("failed_step"),
+        "contact_save_status": plugin_result.get("contact_save_status") or execution_result.get("contact_save_status"),
+        "search_attempts": plugin_result.get("search_attempts") or execution_result.get("search_attempts") or [],
+        "screenshot_path": plugin_result.get("screenshot_path") or execution_result.get("screenshot_path"),
+        "step_results": plugin_result.get("step_results") or execution_result.get("step_results") or [],
     }
 
 

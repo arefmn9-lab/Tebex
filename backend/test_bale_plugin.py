@@ -39,30 +39,58 @@ from modules.automation_engine.scheduling.scheduler_history import SchedulerHist
 
 
 class MockLocator:
-    def __init__(self, selector: str, visible_selectors: set[str]) -> None:
+    def __init__(self, selector: str, page: "MockPage") -> None:
         self.selector = selector
-        self.visible_selectors = visible_selectors
+        self.page = page
         self.first = self
 
     def wait_for(self, state: str, timeout: int) -> None:
-        if state != "visible" or self.selector not in self.visible_selectors:
+        if state != "visible" or self.selector not in self.page.visible_selectors:
             raise TimeoutError(f"Selector not visible: {self.selector}")
+
+    def click(self, timeout: int) -> None:
+        self.page.click(self.selector, timeout)
+
+    def fill(self, text: str, timeout: int) -> None:
+        self.page.fill(self.selector, text, timeout)
+
+    def type(self, text: str, timeout: int) -> None:
+        self.page.typed.append((self.selector, text))
+
+    def inner_text(self, timeout: int) -> str:
+        return self.page.selector_text.get(self.selector, "")
+
+
+class MockKeyboard:
+    def __init__(self) -> None:
+        self.pressed: list[str] = []
+
+    def press(self, key: str) -> None:
+        self.pressed.append(key)
 
 
 class MockPage:
-    def __init__(self, visible_selectors: set[str], url: str = "https://web.bale.ai/") -> None:
+    def __init__(
+        self,
+        visible_selectors: set[str],
+        url: str = "https://web.bale.ai/",
+        selector_text: dict[str, str] | None = None,
+    ) -> None:
         self.visible_selectors = visible_selectors
+        self.selector_text = selector_text or {}
         self.filled: list[tuple[str, str]] = []
+        self.typed: list[tuple[str, str]] = []
         self.clicked: list[str] = []
         self.urls: list[str] = []
         self.url = url
+        self.keyboard = MockKeyboard()
 
     def goto(self, url: str, wait_until: str = "load") -> None:
         self.urls.append(url)
         self.url = url
 
     def locator(self, selector: str) -> MockLocator:
-        return MockLocator(selector, self.visible_selectors)
+        return MockLocator(selector, self)
 
     def fill(self, selector: str, text: str, timeout: int) -> None:
         if selector not in self.visible_selectors:
@@ -167,6 +195,22 @@ def test_validate_session_not_logged_in_mocked() -> None:
     assert result["login_check"]["chat_ui_detected"] is False
 
 
+def test_validate_session_logged_in_with_dialog_item() -> None:
+    page = MockPage({selectors.CHAT_ITEM_SELECTORS[0]}, url="https://web.bale.ai/chat?uid=123")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.validate_session("bale_test")
+    assert result["ok"] is True
+    assert result["login_check"]["dialog_items_detected"] is True
+
+
+def test_validate_session_logged_in_with_editable_message_text() -> None:
+    page = MockPage({selectors.MESSAGE_INPUT_SELECTORS[0]}, url="https://web.bale.ai/chat?uid=123")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.validate_session("bale_test")
+    assert result["ok"] is True
+    assert result["login_check"]["message_input_detected"] is True
+
+
 def test_validate_session_greenlet_error_is_browser_thread_error() -> None:
     plugin = BalePlugin(browser_manager=ThreadErrorBrowserManager(MockPage(set())))
     result = plugin.validate_session("bale_test")
@@ -214,6 +258,66 @@ def test_open_login_returns_profile_dir_without_real_browser() -> None:
     assert result["profile_dir"]
     assert "bale_login_1" in result["profile_dir"]
     assert page.urls[-1] == plugin.web_url
+
+
+def test_send_text_message_uses_captured_message_input_and_enter_without_fake_success() -> None:
+    page = MockPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-GHAB-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.send_text_message(
+        "bale_test",
+        normalized_phone="989120000001",
+        contact_naming_value="Bale-GHAB-000001",
+        message_text="hello real text",
+    )
+    assert result["ok"] is False
+    assert result["error_code"] == "send_confirmation_not_implemented"
+    assert result["contact_save_status"] == "not_supported_yet"
+    assert (selectors.MESSAGE_INPUT_SELECTORS[0], "hello real text") in page.filled
+    assert "Enter" in page.keyboard.pressed
+    assert result["failed_step"] == "confirm_sent"
+
+
+def test_send_text_message_target_not_found_returns_open_target_chat_failure() -> None:
+    page = MockPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.send_text_message("bale_test", "989120000001", "hello", "Bale-GHAB-000001")
+    assert result["ok"] is False
+    assert result["error_code"] == "target_not_found"
+    assert result["failed_step"] == "open_target_chat"
+    assert result["search_attempts"]
+
+
+def test_send_text_message_message_input_missing_returns_structured_error() -> None:
+    page = MockPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "989120000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.send_text_message("bale_test", "989120000001", "hello", "Bale-GHAB-000001")
+    assert result["ok"] is False
+    assert result["error_code"] == "message_input_not_found"
+    assert result["failed_step"] == "type_message"
 
 
 def test_send_test_message_message_input_missing_path() -> None:
@@ -1319,6 +1423,42 @@ class StubBalePlugin:
             return {"ok": True, "message": "sent", **base_result}
         return {"ok": False, "error_code": self.error_code, "error": "stub failed", **base_result}
 
+    def send_text_message(
+        self,
+        account_id: str,
+        normalized_phone: str,
+        message_text: str,
+        contact_naming_value: str = "",
+        provider_mode: str | None = None,
+    ) -> dict[str, object]:
+        effective_provider = provider_mode or "native_chrome"
+        profile_dir = str(Path("backend") / "runtime" / "browser_profiles" / account_id) if effective_provider == "native_chrome" else ""
+        self.calls.append(
+            {
+                "account_id": account_id,
+                "target": normalized_phone,
+                "message": message_text,
+                "provider_mode": effective_provider,
+            }
+        )
+        base_result = {
+            "account_id": account_id,
+            "target": normalized_phone,
+            "normalized_phone": normalized_phone,
+            "contact_naming_value": contact_naming_value,
+            "provider_mode": effective_provider,
+            "profile_dir": profile_dir,
+            "browser_reused": False,
+            "started_at": "2026-07-04T00:00:00+00:00",
+            "finished_at": "2026-07-04T00:00:01+00:00",
+            "duration_ms": 1000,
+            "contact_save_status": "not_supported_yet",
+            "step_results": [],
+        }
+        if self.ok:
+            return {"ok": True, "message": "sent", **base_result}
+        return {"ok": False, "error_code": self.error_code, "error": "stub failed", **base_result}
+
 
 def test_bale_queue_runner_rejects_missing_or_true_dry_run() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1511,9 +1651,33 @@ def test_bale_queue_runner_marks_success_completed_and_stores_result() -> None:
         assert job["status"] == "completed"
         assert job["dry_run"] is False
         assert job["execution_result"]["runner"] == "bale_queue_runner"
-        assert job["execution_result"]["action"] == "send_test_message"
+        assert job["execution_result"]["action"] == "send_text_message"
         assert job["execution_result"]["provider_mode"] == "native_chrome"
         assert job["execution_result"]["success"] is True
+
+
+def test_bale_queue_runner_calls_send_text_message_with_text_source() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        source_store = MessageSourceStore(Path(tmp_dir) / "message_sources.json")
+        source_store.create_source(
+            {
+                "message_source_id": "source_real",
+                "platform_id": "bale",
+                "name": "Real Text",
+                "source_type": "text_message",
+                "source_ref": "سلام از متن واقعی",
+                "message_ref_value": "سلام از متن واقعی",
+            }
+        )
+        queue_store.save_jobs([_queue_job("001")])
+        plugin = StubBalePlugin(ok=True)
+        result = BaleQueueRunner(queue_store, plugin, source_store=source_store).run("real_campaign", {"dry_run": False, "limit": 1})
+
+        assert result["completed_jobs"] == 1
+        assert plugin.calls[0]["message"] == "سلام از متن واقعی"
+        assert plugin.calls[0]["target"] == "989120000001"
+        assert queue_store.list_jobs("real_campaign")[0]["execution_result"]["action"] == "send_text_message"
 
 
 def test_bale_queue_runner_passes_explicit_adspower_provider_mode() -> None:
@@ -1597,11 +1761,16 @@ if __name__ == "__main__":
     test_selectors_exist()
     test_validate_session_can_be_mocked()
     test_validate_session_not_logged_in_mocked()
+    test_validate_session_logged_in_with_dialog_item()
+    test_validate_session_logged_in_with_editable_message_text()
     test_validate_session_greenlet_error_is_browser_thread_error()
     test_send_test_message_requires_target()
     test_send_test_message_not_logged_in_path()
     test_send_test_message_install_prompt_maps_error()
     test_open_login_returns_profile_dir_without_real_browser()
+    test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
+    test_send_text_message_target_not_found_returns_open_target_chat_failure()
+    test_send_text_message_message_input_missing_returns_structured_error()
     test_send_test_message_message_input_missing_path()
     test_send_test_message_send_timeout_path()
     test_send_test_message_maps_greenlet_thread_error()
@@ -1653,6 +1822,7 @@ if __name__ == "__main__":
     test_bale_queue_runner_completed_jobs_are_not_retried()
     test_bale_queue_runner_greenlet_exception_marks_failed_not_running()
     test_bale_queue_runner_marks_success_completed_and_stores_result()
+    test_bale_queue_runner_calls_send_text_message_with_text_source()
     test_bale_queue_runner_passes_explicit_adspower_provider_mode()
     test_bale_plugin_explicit_adspower_unavailable_returns_friendly_error()
     test_bulk_plan_api_route_exists_and_does_not_open_browser()

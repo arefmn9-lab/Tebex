@@ -765,7 +765,7 @@ export default function PlatformWorkspace({ platformId }) {
         account_group_id: groupId,
         message_source_id: source.message_source_id,
         contact_list_id: contactResult.contact_list_id,
-        scenario_id: "send_test_message",
+        scenario_id: "send_text_message",
         contact_naming_pattern: "Bale-{seq:06d}",
         daily_limit_per_account: 10,
         hourly_limit_per_account: 2,
@@ -2147,6 +2147,12 @@ function BulkExecutionQueueSection({ form, campaigns, result, jobs, realRunResul
                   ))}</tbody>
                 </table>
               </div>
+            ) : null}
+            {(realRunResult.sample_results || []).length ? (
+              <details className="empty-state" style={{ marginTop: 12 }}>
+                <summary>جزئیات فنی اجرای بله</summary>
+                <pre>{JSON.stringify(realRunResult.sample_results, null, 2)}</pre>
+              </details>
             ) : null}
           </>
         ) : null}
