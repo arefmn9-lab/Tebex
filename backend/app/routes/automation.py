@@ -16,6 +16,7 @@ from modules.automation_engine.bulk_messaging import (
     contact_importer,
     contact_list_store,
     contact_store,
+    execution_queue_store,
     message_source_store,
 )
 from modules.automation_engine.db.database import DATABASE_PATH
@@ -210,6 +211,15 @@ class BulkAssignmentRequest(BaseModel):
     planned_for_date: str | None = None
     max_contacts_per_account: int | None = None
     plan_seed: str | None = None
+
+
+class BulkQueueRequest(BaseModel):
+    dry_run: bool = True
+    planned_for_date: str | None = None
+
+
+class BulkQueueDryRunRequest(BaseModel):
+    limit: int = 10
 
 
 class BaleProfileGroupRequest(BaseModel):
@@ -675,6 +685,34 @@ def list_bulk_campaign_assignments(campaign_id: str, response: Response) -> list
 def bulk_campaign_assignment_summary(campaign_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     return assignment_store.summary(campaign_id)
+
+
+@router.post("/bulk/campaigns/{campaign_id}/queue")
+def create_bulk_campaign_queue(campaign_id: str, request: BulkQueueRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return execution_queue_store.create_from_assignments(
+        campaign_id=campaign_id,
+        dry_run=request.dry_run,
+        planned_for_date=request.planned_for_date or "",
+    )
+
+
+@router.get("/bulk/campaigns/{campaign_id}/queue")
+def list_bulk_campaign_queue(campaign_id: str, response: Response) -> list[dict[str, Any]]:
+    _set_dashboard_cors_headers(response)
+    return execution_queue_store.list_jobs(campaign_id)
+
+
+@router.get("/bulk/campaigns/{campaign_id}/queue/summary")
+def bulk_campaign_queue_summary(campaign_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return execution_queue_store.summary(campaign_id)
+
+
+@router.post("/bulk/campaigns/{campaign_id}/queue/dry-run")
+def dry_run_bulk_campaign_queue(campaign_id: str, request: BulkQueueDryRunRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return execution_queue_store.run_dry_run(campaign_id, request.limit)
 
 
 @router.get("/platforms/{platform_id}/bulk/campaigns")

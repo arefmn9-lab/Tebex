@@ -12,6 +12,7 @@ from modules.automation_engine.bulk_messaging import (
     BulkAssignmentPlanner,
     BulkCampaignPlanner,
     BulkCampaignStore,
+    BulkExecutionQueueStore,
     ContactImporter,
     ContactListStore,
     ContactStore,
@@ -1077,6 +1078,84 @@ def test_bulk_assignment_max_contacts_override_caps_per_account() -> None:
         assert result["total_remaining_contacts"] == 2
 
 
+def test_bulk_execution_queue_creates_jobs_dedupes_and_dry_runs_limited() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        assignment_store = AssignmentStore(Path(tmp_dir) / "bulk_assignments.json")
+        assignment_store.replace_campaign_assignments(
+            "queue_campaign",
+            "2026-07-04",
+            [
+                {
+                    "assignment_id": "assign_001",
+                    "campaign_id": "queue_campaign",
+                    "route_id": "route_001",
+                    "platform_id": "bale",
+                    "account_group_id": "bale_test_group",
+                    "account_id": "bale_001",
+                    "contact_id": "contact_001",
+                    "contact_list_id": "list_001",
+                    "normalized_phone": "989120000001",
+                    "message_source_id": "source_001",
+                    "scenario_id": "save_contact_and_forward_from_source",
+                    "contact_naming_value": "Bale-GHAB-000001",
+                    "planned_status": "planned",
+                    "planned_for_date": "2026-07-04",
+                },
+                {
+                    "assignment_id": "assign_002",
+                    "campaign_id": "queue_campaign",
+                    "route_id": "route_001",
+                    "platform_id": "bale",
+                    "account_group_id": "bale_test_group",
+                    "account_id": "bale_002",
+                    "contact_id": "contact_002",
+                    "contact_list_id": "list_001",
+                    "normalized_phone": "989120000002",
+                    "message_source_id": "source_001",
+                    "scenario_id": "save_contact_and_forward_from_source",
+                    "contact_naming_value": "Bale-GHAB-000002",
+                    "planned_status": "planned",
+                    "planned_for_date": "2026-07-04",
+                },
+                {
+                    "assignment_id": "assign_skipped",
+                    "campaign_id": "queue_campaign",
+                    "route_id": "route_001",
+                    "platform_id": "bale",
+                    "account_group_id": "bale_test_group",
+                    "account_id": "bale_003",
+                    "contact_id": "contact_003",
+                    "contact_list_id": "list_001",
+                    "normalized_phone": "989120000003",
+                    "message_source_id": "source_001",
+                    "scenario_id": "save_contact_and_forward_from_source",
+                    "contact_naming_value": "Bale-GHAB-000003",
+                    "planned_status": "skipped",
+                    "planned_for_date": "2026-07-04",
+                },
+            ],
+        )
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json", assignment_store)
+
+        created = queue_store.create_from_assignments("queue_campaign", dry_run=True, planned_for_date="2026-07-04")
+        duplicate = queue_store.create_from_assignments("queue_campaign", dry_run=True, planned_for_date="2026-07-04")
+        summary = queue_store.summary("queue_campaign")
+        dry_run = queue_store.run_dry_run("queue_campaign", limit=1)
+        jobs = queue_store.list_jobs("queue_campaign")
+
+        assert created["created_jobs"] == 2
+        assert created["existing_jobs"] == 0
+        assert duplicate["created_jobs"] == 0
+        assert duplicate["existing_jobs"] == 2
+        assert summary["total_jobs"] == 2
+        assert summary["status_summary"]["pending"] == 2
+        assert dry_run["processed_jobs"] == 1
+        assert dry_run["status_summary"]["completed"] == 1
+        assert dry_run["status_summary"]["pending"] == 1
+        assert sum(1 for job in jobs if job["status"] == "completed" and job["dry_run_result"]) == 1
+        assert all(job["dry_run"] is True for job in jobs)
+
+
 def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
     paths = {getattr(route, "path", "") for route in app.routes}
     assert "/automation/bulk/campaigns/{campaign_id}/plan" in paths
@@ -1086,6 +1165,9 @@ def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
     assert "/automation/bulk/campaigns/{campaign_id}/assign" in paths
     assert "/automation/bulk/campaigns/{campaign_id}/assignments" in paths
     assert "/automation/bulk/campaigns/{campaign_id}/assignments/summary" in paths
+    assert "/automation/bulk/campaigns/{campaign_id}/queue" in paths
+    assert "/automation/bulk/campaigns/{campaign_id}/queue/summary" in paths
+    assert "/automation/bulk/campaigns/{campaign_id}/queue/dry-run" in paths
 
 
 def test_compliance_policy_failure_threshold_stops_scheduler() -> None:
@@ -1148,6 +1230,7 @@ if __name__ == "__main__":
     test_bulk_dry_run_planner_uses_imported_contact_count()
     test_bulk_assignment_planner_fairly_assigns_contacts_and_respects_limits()
     test_bulk_assignment_max_contacts_override_caps_per_account()
+    test_bulk_execution_queue_creates_jobs_dedupes_and_dry_runs_limited()
     test_bulk_plan_api_route_exists_and_does_not_open_browser()
     test_compliance_policy_failure_threshold_stops_scheduler()
     test_can_account_run_scenario_returns_reason()

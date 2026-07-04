@@ -158,6 +158,28 @@ export function getBulkAssignmentSummary(campaignId) {
   return request(`/automation/bulk/campaigns/${encodeURIComponent(campaignId)}/assignments/summary`);
 }
 
+export function createBulkExecutionQueue(campaignId, payload) {
+  return request(`/automation/bulk/campaigns/${encodeURIComponent(campaignId)}/queue`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listBulkExecutionQueue(campaignId) {
+  return request(`/automation/bulk/campaigns/${encodeURIComponent(campaignId)}/queue`);
+}
+
+export function getBulkExecutionQueueSummary(campaignId) {
+  return request(`/automation/bulk/campaigns/${encodeURIComponent(campaignId)}/queue/summary`);
+}
+
+export function dryRunBulkExecutionQueue(campaignId, payload) {
+  return request(`/automation/bulk/campaigns/${encodeURIComponent(campaignId)}/queue/dry-run`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function createPlatformAccount(platformId, payload) {
   return request(`/automation/platforms/${encodeURIComponent(platformId)}/accounts`, {
     method: "POST",

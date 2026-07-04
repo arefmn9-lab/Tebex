@@ -9,20 +9,24 @@ import {
   createBulkCampaign,
   createBulkCampaignRoute,
   createBulkContactList,
+  createBulkExecutionQueue,
   createBulkMessageSource,
   createPlatformAccount,
   deleteBaleAccount,
+  dryRunBulkExecutionQueue,
   dryRunBalePreparation,
   dryRunBaleSchedule,
   getBaleMessageConfig,
   getBalePreparation,
   getAdsPowerConfig,
+  getBulkExecutionQueueSummary,
   importBulkContactList,
   listBaleProfileGroups,
   listBaleScenarios,
   listBulkCampaigns,
   listBulkContactLists,
   listBulkContacts,
+  listBulkExecutionQueue,
   listBulkMessageSources,
   listPlatformAccountGroups,
   listPlatformAccounts,
@@ -291,6 +295,8 @@ export default function PlatformWorkspace({ platformId }) {
   const [bulkContactLists, setBulkContactLists] = useState([]);
   const [bulkPlanResult, setBulkPlanResult] = useState(null);
   const [bulkAssignmentResult, setBulkAssignmentResult] = useState(null);
+  const [bulkQueueResult, setBulkQueueResult] = useState(null);
+  const [bulkQueueJobs, setBulkQueueJobs] = useState([]);
   const [assignmentForm, setAssignmentForm] = useState({
     planned_for_date: today,
     max_contacts_per_account: "",
@@ -667,6 +673,42 @@ export default function PlatformWorkspace({ platformId }) {
     }
   }
 
+  async function refreshBulkQueue(campaignId) {
+    if (!campaignId) return;
+    const [summary, jobs] = await Promise.all([
+      getBulkExecutionQueueSummary(campaignId),
+      listBulkExecutionQueue(campaignId),
+    ]);
+    setBulkQueueResult(summary);
+    setBulkQueueJobs(Array.isArray(jobs) ? jobs.slice(0, 20) : []);
+  }
+
+  async function createBulkQueue(campaignId) {
+    try {
+      const result = await createBulkExecutionQueue(campaignId, {
+        dry_run: true,
+        planned_for_date: assignmentForm.planned_for_date || today,
+      });
+      setBulkQueueResult(result);
+      const jobs = await listBulkExecutionQueue(campaignId);
+      setBulkQueueJobs(Array.isArray(jobs) ? jobs.slice(0, 20) : []);
+      setToast("صف اجرای آزمایشی ساخته شد");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
+  async function runBulkQueueDryRun(campaignId) {
+    try {
+      const result = await dryRunBulkExecutionQueue(campaignId, { limit: 10 });
+      setBulkQueueResult(result);
+      await refreshBulkQueue(campaignId);
+      setToast("اجرای آزمایشی ۱۰ job انجام شد");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
   async function assignProfileGroup(accountId, deviceGroupId, browserProvider = "native_chrome") {
     try {
       await assignBaleProfileGroup(accountId, {
@@ -834,6 +876,8 @@ export default function PlatformWorkspace({ platformId }) {
           assignmentForm={assignmentForm}
           setAssignmentForm={setAssignmentForm}
           assignmentResult={bulkAssignmentResult}
+          queueResult={bulkQueueResult}
+          queueJobs={bulkQueueJobs}
           onCreateCampaign={() => openBulkCampaignModal()}
           onEditCampaign={openBulkCampaignModal}
           onCreateSource={() => openBulkSourceModal()}
@@ -843,6 +887,8 @@ export default function PlatformWorkspace({ platformId }) {
           onAddRoute={openBulkRouteModal}
           onPlan={runBulkPlan}
           onAssign={runBulkAssignment}
+          onCreateQueue={createBulkQueue}
+          onDryRunQueue={runBulkQueueDryRun}
           importForm={contactImportForm}
           setImportForm={setContactImportForm}
           onImportContacts={importContactsCsv}
@@ -1130,6 +1176,8 @@ function CampaignsSection({
   assignmentForm,
   setAssignmentForm,
   assignmentResult,
+  queueResult,
+  queueJobs,
   onCreateCampaign,
   onEditCampaign,
   onCreateSource,
@@ -1139,6 +1187,8 @@ function CampaignsSection({
   onAddRoute,
   onPlan,
   onAssign,
+  onCreateQueue,
+  onDryRunQueue,
   importForm,
   setImportForm,
   onImportContacts,
@@ -1156,6 +1206,8 @@ function CampaignsSection({
         assignmentForm={assignmentForm}
         setAssignmentForm={setAssignmentForm}
         assignmentResult={assignmentResult}
+        queueResult={queueResult}
+        queueJobs={queueJobs}
         onCreateCampaign={onCreateCampaign}
         onEditCampaign={onEditCampaign}
         onCreateSource={onCreateSource}
@@ -1165,6 +1217,8 @@ function CampaignsSection({
         onAddRoute={onAddRoute}
         onPlan={onPlan}
         onAssign={onAssign}
+        onCreateQueue={onCreateQueue}
+        onDryRunQueue={onDryRunQueue}
         importForm={importForm}
         setImportForm={setImportForm}
         onImportContacts={onImportContacts}
@@ -1209,7 +1263,7 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
   );
 }
 
-function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts }) {
+function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts }) {
   return (
     <section className="panel" style={{ marginTop: 16 }}>
       <div className="panel-header"><h3 className="panel-title">پیام انبوه</h3><span className="pill">dry-run</span></div>
@@ -1338,6 +1392,7 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
 
       <BulkCapacitySummary result={planResult} />
       <BulkAssignmentPlannerSection form={assignmentForm} setForm={setAssignmentForm} result={assignmentResult} onAssign={onAssign} campaigns={campaigns} />
+      <BulkExecutionQueueSection form={assignmentForm} campaigns={campaigns} result={queueResult} jobs={queueJobs} onCreateQueue={onCreateQueue} onDryRunQueue={onDryRunQueue} />
       <div className="empty-state" style={{ marginTop: 12 }}>الگوی نام مخاطب: {"Bale-GHAB-{seq:06d} -> Bale-GHAB-000001"}</div>
     </section>
   );
@@ -1436,6 +1491,50 @@ function BulkAssignmentPlannerSection({ form, setForm, result, onAssign, campaig
                     <td>{item.contact_naming_value}</td>
                     <td>{item.route_id}</td>
                     <td>{item.platform_id}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function BulkExecutionQueueSection({ form, campaigns, result, jobs, onCreateQueue, onDryRunQueue }) {
+  const selectedCampaignId = form.campaign_id || campaigns[0]?.campaign_id || "";
+  const summary = result?.status_summary || {};
+  const sampleJobs = Array.isArray(jobs) && jobs.length ? jobs.slice(0, 20) : result?.sample_jobs || [];
+  return (
+    <section className="safe-policy-section">
+      <div className="panel-header"><h3 className="panel-title">صف اجرای کمپین</h3><span className="pill">dry-run</span></div>
+      <div className="modal-actions">
+        <button className="primary-button" onClick={() => selectedCampaignId && onCreateQueue(selectedCampaignId)} type="button">ساخت صف اجرای آزمایشی</button>
+        <button className="secondary-button" onClick={() => selectedCampaignId && onDryRunQueue(selectedCampaignId)} type="button">اجرای آزمایشی ۱۰ job</button>
+      </div>
+      {result ? (
+        <div className="plan-preview">
+          <div className="panel-header"><h4 className="panel-title">خلاصه صف</h4><span className="pill">تعداد jobهای ساخته‌شده {result.total_jobs ?? result.created_jobs ?? 0}</span></div>
+          <section className="grid metrics">
+            <div><span>jobهای در انتظار</span><strong>{summary.pending || 0}</strong></div>
+            <div><span>انجام‌شده</span><strong>{summary.completed || 0}</strong></div>
+            <div><span>خطاها</span><strong>{summary.failed || 0}</strong></div>
+            <div><span>ردشده</span><strong>{summary.skipped || 0}</strong></div>
+            <div><span>لغوشده</span><strong>{summary.cancelled || 0}</strong></div>
+          </section>
+          {sampleJobs.length ? (
+            <div className="table-scroll">
+              <h4 className="panel-title">نمونه jobها</h4>
+              <table className="table rtl-table wide-table">
+                <thead><tr><th>job</th><th>اکانت</th><th>شماره نرمال‌شده</th><th>نام مخاطب</th><th>وضعیت</th></tr></thead>
+                <tbody>{sampleJobs.map((job) => (
+                  <tr key={job.job_id}>
+                    <td>{job.job_id}</td>
+                    <td>{job.account_id}</td>
+                    <td>{job.normalized_phone}</td>
+                    <td>{job.contact_naming_value}</td>
+                    <td><Pill value={job.status} /></td>
                   </tr>
                 ))}</tbody>
               </table>
