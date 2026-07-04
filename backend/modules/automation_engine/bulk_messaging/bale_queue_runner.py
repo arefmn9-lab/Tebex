@@ -38,8 +38,9 @@ class BaleQueueRunner:
         limit = min(requested_limit, REAL_RUN_LIMIT_CAP)
         account_id = str(payload.get("account_id") or "").strip()
         provider_mode = _provider_mode(payload.get("provider_mode"))
+        retry_failed = bool(payload.get("retry_failed", False))
         jobs = self.queue_store.list_jobs()
-        selected_indexes = self._select_job_indexes(jobs, campaign_id, limit, account_id)
+        selected_indexes = self._select_job_indexes(jobs, campaign_id, limit, account_id, retry_failed)
         if not selected_indexes:
             return {
                 "ok": True,
@@ -51,6 +52,7 @@ class BaleQueueRunner:
                 "completed_jobs": 0,
                 "failed_jobs": 0,
                 "provider_mode": provider_mode,
+                "retry_failed": retry_failed,
                 "status_summary": self.queue_store.status_summary(campaign_id),
                 "sample_results": [],
             }
@@ -60,6 +62,8 @@ class BaleQueueRunner:
             jobs[index]["status"] = "running"
             jobs[index]["dry_run"] = False
             jobs[index]["updated_at"] = now
+            jobs[index]["error_code"] = None
+            jobs[index]["error_message"] = None
         self.queue_store.save_jobs(jobs)
 
         sample_results: list[dict[str, Any]] = []
@@ -94,6 +98,7 @@ class BaleQueueRunner:
             "completed_jobs": completed,
             "failed_jobs": failed,
             "provider_mode": provider_mode,
+            "retry_failed": retry_failed,
             "status_summary": self.queue_store.status_summary(campaign_id),
             "sample_results": sample_results,
         }
@@ -104,14 +109,16 @@ class BaleQueueRunner:
         campaign_id: str,
         limit: int,
         account_id: str,
+        retry_failed: bool = False,
     ) -> list[int]:
         selected: list[int] = []
+        eligible_statuses = {"pending", "failed"} if retry_failed else {"pending"}
         for index, job in enumerate(jobs):
             if len(selected) >= limit:
                 break
             if job.get("campaign_id") != campaign_id:
                 continue
-            if job.get("status") != "pending":
+            if job.get("status") not in eligible_statuses:
                 continue
             if job.get("platform_id") != "bale":
                 continue
@@ -208,6 +215,8 @@ def _sample_result(job: dict[str, Any]) -> dict[str, Any]:
         "normalized_phone": job["normalized_phone"],
         "contact_naming_value": job["contact_naming_value"],
         "status": job["status"],
+        "error_code": job.get("error_code"),
+        "error_message": job.get("error_message"),
     }
 
 

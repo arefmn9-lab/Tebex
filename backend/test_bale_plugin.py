@@ -1259,10 +1259,22 @@ class StubBalePlugin:
         self.calls: list[dict[str, str]] = []
 
     def send_test_message(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> dict[str, object]:
-        self.calls.append({"account_id": account_id, "target": target, "message": message, "provider_mode": provider_mode or ""})
+        effective_provider = provider_mode or "native_chrome"
+        profile_dir = str(Path("backend") / "runtime" / "browser_profiles" / account_id) if effective_provider == "native_chrome" else ""
+        base_result = {
+            "account_id": account_id,
+            "target": target,
+            "provider_mode": effective_provider,
+            "profile_dir": profile_dir,
+            "browser_reused": False,
+            "started_at": "2026-07-04T00:00:00+00:00",
+            "finished_at": "2026-07-04T00:00:01+00:00",
+            "duration_ms": 1000,
+        }
+        self.calls.append({"account_id": account_id, "target": target, "message": message, "provider_mode": effective_provider})
         if self.ok:
-            return {"ok": True, "account_id": account_id, "target": target, "message": "sent"}
-        return {"ok": False, "account_id": account_id, "target": target, "error_code": self.error_code, "error": "stub failed"}
+            return {"ok": True, "message": "sent", **base_result}
+        return {"ok": False, "error_code": self.error_code, "error": "stub failed", **base_result}
 
 
 def test_bale_queue_runner_rejects_missing_or_true_dry_run() -> None:
@@ -1357,6 +1369,71 @@ def test_bale_queue_runner_marks_failed_plugin_result() -> None:
         assert job["execution_result"]["success"] is False
         assert job["execution_result"]["provider_mode"] == "native_chrome"
         assert job["execution_result"]["duration_ms"] >= 0
+
+
+def test_bale_queue_runner_native_chrome_profile_dir_is_recorded() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001", account_id="bale_profile_1")])
+        result = BaleQueueRunner(queue_store, StubBalePlugin(ok=True)).run(
+            "real_campaign",
+            {"dry_run": False, "limit": 1, "provider_mode": "native_chrome"},
+        )
+        job = queue_store.list_jobs("real_campaign")[0]
+        profile_dir = job["execution_result"]["profile_dir"]
+
+        assert result["completed_jobs"] == 1
+        assert profile_dir
+        assert "bale_profile_1" in profile_dir
+        assert job["execution_result"]["provider_mode"] == "native_chrome"
+
+
+def test_bale_queue_runner_not_logged_in_retry_does_not_duplicate_queue_jobs() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001", account_id="bale_retry_1")])
+        first_plugin = StubBalePlugin(ok=False, error_code="not_logged_in")
+        first_result = BaleQueueRunner(queue_store, first_plugin).run(
+            "real_campaign",
+            {"dry_run": False, "limit": 1, "provider_mode": "native_chrome"},
+        )
+        failed_job = queue_store.list_jobs("real_campaign")[0]
+
+        assert first_result["failed_jobs"] == 1
+        assert failed_job["status"] == "failed"
+        assert failed_job["error_code"] == "not_logged_in"
+        assert failed_job["execution_result"]["profile_dir"]
+        assert "bale_retry_1" in failed_job["execution_result"]["profile_dir"]
+        assert len(queue_store.list_jobs("real_campaign")) == 1
+
+        retry_plugin = StubBalePlugin(ok=True)
+        retry_result = BaleQueueRunner(queue_store, retry_plugin).run(
+            "real_campaign",
+            {"dry_run": False, "limit": 1, "provider_mode": "native_chrome", "retry_failed": True},
+        )
+        retried_job = queue_store.list_jobs("real_campaign")[0]
+
+        assert retry_result["processed_jobs"] == 1
+        assert retry_result["completed_jobs"] == 1
+        assert retried_job["status"] == "completed"
+        assert retried_job["error_code"] is None
+        assert len(queue_store.list_jobs("real_campaign")) == 1
+
+
+def test_bale_queue_runner_completed_jobs_are_not_retried() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001", status="completed", account_id="bale_done_1")])
+        plugin = StubBalePlugin(ok=True)
+        result = BaleQueueRunner(queue_store, plugin).run(
+            "real_campaign",
+            {"dry_run": False, "limit": 1, "provider_mode": "native_chrome", "retry_failed": True},
+        )
+        job = queue_store.list_jobs("real_campaign")[0]
+
+        assert result["processed_jobs"] == 0
+        assert plugin.calls == []
+        assert job["status"] == "completed"
 
 
 def test_bale_queue_runner_greenlet_exception_marks_failed_not_running() -> None:
@@ -1525,6 +1602,9 @@ if __name__ == "__main__":
     test_bale_queue_runner_caps_limit_and_selects_only_pending_bale_jobs()
     test_bale_queue_runner_respects_account_filter_and_does_not_rerun_completed()
     test_bale_queue_runner_marks_failed_plugin_result()
+    test_bale_queue_runner_native_chrome_profile_dir_is_recorded()
+    test_bale_queue_runner_not_logged_in_retry_does_not_duplicate_queue_jobs()
+    test_bale_queue_runner_completed_jobs_are_not_retried()
     test_bale_queue_runner_greenlet_exception_marks_failed_not_running()
     test_bale_queue_runner_marks_success_completed_and_stores_result()
     test_bale_queue_runner_passes_explicit_adspower_provider_mode()

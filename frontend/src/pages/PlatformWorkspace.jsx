@@ -237,6 +237,7 @@ function statusTone(status) {
 
 function friendlyBulkError(error) {
   const text = String(error?.message || error?.error_message || error?.error_code || error || "");
+  if (text.includes("not_logged_in")) return "ابتدا در Chrome وارد بله شوید، سپس دوباره ارسال تست را بزنید.";
   if (text.includes("account_not_found")) return "اکانت ارسال پیدا نشد.";
   if (text.includes("account_id")) return "اکانت ارسال انتخاب نشده است.";
   if (text.includes("no pending") || text.includes("pending")) return "پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.";
@@ -822,9 +823,14 @@ export default function PlatformWorkspace({ platformId }) {
         limit,
         account_id: simpleSendForm.account_id || null,
         provider_mode: "native_chrome",
+        retry_failed: true,
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(simpleSendResult.campaign_id);
+      if (result.failed_jobs) {
+        const failed = result.sample_results?.find((item) => item.status === "failed") || {};
+        setActionError(friendlyBulkError(failed.error_code || failed.error_message || "not_logged_in"));
+      }
       setToast(result.processed_jobs ? "ارسال مرحله‌ای انجام شد" : "پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.");
     } catch (error) {
       setActionError(friendlyBulkError(error));
@@ -914,6 +920,7 @@ export default function PlatformWorkspace({ platformId }) {
         limit: Number(bulkRealRunForm.limit) || 1,
         account_id: bulkRealRunForm.account_id || null,
         provider_mode: "native_chrome",
+        retry_failed: true,
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(campaignId);
@@ -1686,6 +1693,7 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
   const sentMessages = summary.completed || realRunResult?.completed_jobs || 0;
   const failedMessages = summary.failed || realRunResult?.failed_jobs || 0;
   const remainingMessages = summary.pending ?? readyMessages;
+  const needsBaleLogin = (realRunResult?.sample_results || []).some((item) => item.error_code === "not_logged_in");
   return (
     <section className="safe-policy-section">
       <section className="wizard-step">
@@ -1743,6 +1751,7 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
       </section>
 
       <section className="wizard-step">
+        <div className="empty-state" style={{ marginTop: 12 }}>ورود بله برای هر اکانت فقط یکبار لازم است و روی همین سیستم ذخیره میشود.</div>
         <div className="panel-header"><h3 className="panel-title">۴. بررسی و ارسال</h3><span className="pill">ارسال محدود و دستی</span></div>
         <div className="modal-actions">
           <button className="primary-button" onClick={onPrepare} type="button">بررسی و آماده‌سازی</button>
@@ -1751,6 +1760,12 @@ function SimpleSendWizard({ form, setForm, result, contactResult, accountGroups,
           <button className="danger-button" onClick={onRunLimited} type="button">شروع ارسال مرحله‌ای</button>
         </div>
         {result ? <div className="empty-state">آماده شد. {readyMessages} پیام برای ارسال آماده است.</div> : null}
+        {needsBaleLogin ? (
+          <div className="error-state" style={{ marginTop: 12 }}>
+            <strong>نیاز به ورود به بله</strong>
+            <p>پنجره Chrome باز شده است. وارد حساب بله شوید و بعد دوباره ارسال تست را بزنید.</p>
+          </div>
+        ) : null}
         <section className="grid metrics">
           <div><span>آماده ارسال</span><strong>{readyMessages}</strong></div>
           <div><span>در حال ارسال</span><strong>{summary.running || 0}</strong></div>

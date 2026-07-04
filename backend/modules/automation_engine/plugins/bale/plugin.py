@@ -137,6 +137,7 @@ class BalePlugin:
     def send_test_message(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> dict[str, Any]:
         started_at = datetime.now(timezone.utc).isoformat()
         started_monotonic = time.perf_counter()
+        effective_provider = str(provider_mode or "native_chrome")
         if not target.strip():
             return self._failed_result(account_id, "send_test_message", "target_not_found", "Target is required")
         if not message.strip():
@@ -165,6 +166,7 @@ class BalePlugin:
             error = str(exc)
             browser_path = getattr(self.browser_manager, "last_browser_path", None)
             finished_at = datetime.now(timezone.utc).isoformat()
+            failure_meta = self._browser_failure_meta(account_id, effective_provider)
             self._log_step(
                 account_id,
                 "send_test_message",
@@ -186,6 +188,7 @@ class BalePlugin:
                 "started_at": started_at,
                 "finished_at": finished_at,
                 "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
+                **failure_meta,
             }
 
     def list_logs(self) -> list[dict[str, Any]]:
@@ -455,6 +458,22 @@ class BalePlugin:
                 context.close()
             if playwright is not None:
                 playwright.stop()
+
+    def _browser_failure_meta(self, account_id: str, provider_mode: str) -> dict[str, Any]:
+        if provider_mode == "native_chrome":
+            profile_dir = _native_profile_dir(account_id)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "provider_mode": "native_chrome",
+                "browser_reused": False,
+                "profile_dir": str(profile_dir),
+            }
+        account = bale_account_store.get_account(account_id) or {}
+        return {
+            "provider_mode": provider_mode,
+            "browser_reused": True,
+            "profile_dir": str(account.get("user_data_dir") or ""),
+        }
 
     def _first_visible_selector(
         self,

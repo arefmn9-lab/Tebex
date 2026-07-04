@@ -236,6 +236,7 @@ class BaleQueueRunRequest(BaseModel):
     limit: int = 1
     account_id: str | None = None
     provider_mode: str = "native_chrome"
+    retry_failed: bool = False
 
 
 class BaleProfileGroupRequest(BaseModel):
