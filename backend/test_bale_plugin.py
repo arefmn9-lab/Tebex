@@ -1239,8 +1239,8 @@ class StubBalePlugin:
         self.error_code = error_code
         self.calls: list[dict[str, str]] = []
 
-    def send_test_message(self, account_id: str, target: str, message: str) -> dict[str, object]:
-        self.calls.append({"account_id": account_id, "target": target, "message": message})
+    def send_test_message(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> dict[str, object]:
+        self.calls.append({"account_id": account_id, "target": target, "message": message, "provider_mode": provider_mode or ""})
         if self.ok:
             return {"ok": True, "account_id": account_id, "target": target, "message": "sent"}
         return {"ok": False, "account_id": account_id, "target": target, "error_code": self.error_code, "error": "stub failed"}
@@ -1284,7 +1284,9 @@ def test_bale_queue_runner_caps_limit_and_selects_only_pending_bale_jobs() -> No
         assert result["limit"] == 3
         assert result["processed_jobs"] == 3
         assert result["completed_jobs"] == 3
+        assert result["provider_mode"] == "native_chrome"
         assert len(plugin.calls) == 3
+        assert {call["provider_mode"] for call in plugin.calls} == {"native_chrome"}
         assert next(job for job in jobs if job["job_id"] == "004")["status"] == "pending"
         assert next(job for job in jobs if job["job_id"] == "completed")["status"] == "completed"
         assert next(job for job in jobs if job["job_id"] == "rubika")["status"] == "pending"
@@ -1313,6 +1315,7 @@ def test_bale_queue_runner_respects_account_filter_and_does_not_rerun_completed(
                 "account_id": "bale_real_2",
                 "target": "989120000001",
                 "message": plugin.calls[0]["message"],
+                "provider_mode": "native_chrome",
             }
         ]
         assert next(job for job in jobs if job["job_id"] == "001")["status"] == "pending"
@@ -1350,7 +1353,53 @@ def test_bale_queue_runner_marks_success_completed_and_stores_result() -> None:
         assert job["dry_run"] is False
         assert job["execution_result"]["runner"] == "bale_queue_runner"
         assert job["execution_result"]["action"] == "send_test_message"
+        assert job["execution_result"]["provider_mode"] == "native_chrome"
         assert job["execution_result"]["success"] is True
+
+
+def test_bale_queue_runner_passes_explicit_adspower_provider_mode() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs([_queue_job("001")])
+        plugin = StubBalePlugin(ok=False, error_code="adspower_unavailable")
+        result = BaleQueueRunner(queue_store, plugin).run(
+            "real_campaign",
+            {"dry_run": False, "limit": 1, "provider_mode": "adspower"},
+        )
+        job = queue_store.list_jobs("real_campaign")[0]
+
+        assert result["provider_mode"] == "adspower"
+        assert plugin.calls[0]["provider_mode"] == "adspower"
+        assert result["failed_jobs"] == 1
+        assert job["status"] == "failed"
+        assert job["error_code"] == "adspower_unavailable"
+
+
+def test_bale_plugin_explicit_adspower_unavailable_returns_friendly_error() -> None:
+    from modules.automation_engine.plugins.bale import plugin as bale_plugin_module
+
+    class UnavailableProvider:
+        def health_check(self) -> dict[str, object]:
+            return {"ok": False, "message": "AdsPower local API is not reachable"}
+
+    original_get_provider = bale_plugin_module.get_provider
+    page = MockPage(set())
+    try:
+        bale_plugin_module.get_provider = lambda provider_id: UnavailableProvider()
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page, available=True))
+        result = plugin.send_test_message(
+            "bale_test",
+            "989120000001",
+            "hello",
+            provider_mode="adspower",
+        )
+    finally:
+        bale_plugin_module.get_provider = original_get_provider
+
+    assert result["ok"] is False
+    assert result["error_code"] == "adspower_unavailable"
+    assert "Chrome" in result["error"]
+    assert page.urls == []
 
 
 def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
@@ -1437,6 +1486,8 @@ if __name__ == "__main__":
     test_bale_queue_runner_respects_account_filter_and_does_not_rerun_completed()
     test_bale_queue_runner_marks_failed_plugin_result()
     test_bale_queue_runner_marks_success_completed_and_stores_result()
+    test_bale_queue_runner_passes_explicit_adspower_provider_mode()
+    test_bale_plugin_explicit_adspower_unavailable_returns_friendly_error()
     test_bulk_plan_api_route_exists_and_does_not_open_browser()
     test_compliance_policy_failure_threshold_stops_scheduler()
     test_can_account_run_scenario_returns_reason()

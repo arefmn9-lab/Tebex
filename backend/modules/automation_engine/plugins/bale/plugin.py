@@ -132,14 +132,14 @@ class BalePlugin:
                 "error": error,
             }
 
-    def send_test_message(self, account_id: str, target: str, message: str) -> dict[str, Any]:
+    def send_test_message(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> dict[str, Any]:
         if not target.strip():
             return self._failed_result(account_id, "send_test_message", "target_not_found", "Target is required")
         if not message.strip():
             return self._failed_result(account_id, "send_test_message", "message_input_not_found", "Message is required")
 
         try:
-            execution_logs = self._send_test_message_steps(account_id, target, message)
+            execution_logs = self._send_test_message_steps(account_id, target, message, provider_mode)
             result = {
                 "ok": True,
                 "logged_in": True,
@@ -213,9 +213,9 @@ class BalePlugin:
         )
         self._logs = self._logs[-500:]
 
-    def _send_test_message_steps(self, account_id: str, target: str, message: str) -> list[str]:
+    def _send_test_message_steps(self, account_id: str, target: str, message: str, provider_mode: str | None = None) -> list[str]:
         execution_logs: list[str] = []
-        page = self._get_page(account_id)
+        page = self._get_page(account_id, provider_mode)
 
         self._record_step(execution_logs, account_id, "open_bale_web", "started", "Opening Bale Web")
         page.goto(self.web_url, wait_until="load")
@@ -351,17 +351,29 @@ class BalePlugin:
 
         return replace_value(data)
 
-    def _get_page(self, account_id: str) -> Any:
+    def _get_page(self, account_id: str, provider_mode: str | None = None) -> Any:
         if not self.browser_manager.is_available():
             raise BalePluginError(
                 "unknown_error",
                 "Playwright is not available. Install dependencies and browser binaries.",
             )
+        account = bale_account_store.get_account(account_id) or {}
+        effective_provider = str(provider_mode or account.get("browser_provider") or "native_chrome")
+        if effective_provider == "adspower":
+            health = get_provider("adspower").health_check()
+            if not health.get("ok"):
+                raise BalePluginError(
+                    "adspower_unavailable",
+                    "AdsPower در دسترس نیست. برای تست محلی از Chrome معمولی استفاده کنید.",
+                )
+        profile_metadata = {**account, "browser_provider": effective_provider}
+        if effective_provider == "native_chrome":
+            profile_metadata["adspower_profile_id"] = ""
         return self.browser_manager.get_page(
             account_id,
             headless=False,
             login_required=True,
-            profile_metadata=bale_account_store.get_account(account_id),
+            profile_metadata=profile_metadata,
         )
 
     def _first_visible_selector(

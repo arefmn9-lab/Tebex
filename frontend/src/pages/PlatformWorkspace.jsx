@@ -241,6 +241,7 @@ function friendlyBulkError(error) {
   if (text.includes("account_id")) return "اکانت ارسال انتخاب نشده است.";
   if (text.includes("no pending") || text.includes("pending")) return "پیامی آماده ارسال نیست. ابتدا بررسی و آماده‌سازی را بزنید.";
   if (text.includes("dry_run") || text.includes("dry-run")) return "این عملیات فقط از دکمه ارسال تست انجام می‌شود.";
+  if (text.includes("AdsPower local API is not reachable") || text.includes("adspower_unavailable")) return "AdsPower در دسترس نیست. برای تست فعلی باید از Chrome معمولی استفاده شود.";
   if (text.includes("target_not_found") || text.includes("target")) return "هیچ شماره معتبری برای ارسال وجود ندارد.";
   if (text.includes("source") || text.includes("message")) return "متن پیام خالی است.";
   if (text.includes("group")) return "هیچ گروه ارسال فعالی پیدا نشد.";
@@ -820,6 +821,7 @@ export default function PlatformWorkspace({ platformId }) {
         dry_run: false,
         limit,
         account_id: simpleSendForm.account_id || null,
+        provider_mode: "native_chrome",
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(simpleSendResult.campaign_id);
@@ -911,6 +913,7 @@ export default function PlatformWorkspace({ platformId }) {
         dry_run: false,
         limit: Number(bulkRealRunForm.limit) || 1,
         account_id: bulkRealRunForm.account_id || null,
+        provider_mode: "native_chrome",
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(campaignId);

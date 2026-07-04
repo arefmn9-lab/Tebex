@@ -235,6 +235,7 @@ class BaleQueueRunRequest(BaseModel):
     dry_run: bool = True
     limit: int = 1
     account_id: str | None = None
+    provider_mode: str = "native_chrome"
 
 
 class BaleProfileGroupRequest(BaseModel):

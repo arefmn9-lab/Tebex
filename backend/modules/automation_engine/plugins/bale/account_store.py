@@ -122,7 +122,7 @@ class BaleAccountStore:
         username = str(payload.get("username_or_number") or "").strip()
         if not phone and not username:
             raise ValueError("phone or username_or_number is required")
-        browser_provider = str(payload.get("browser_provider") or "adspower")
+        browser_provider = str(payload.get("browser_provider") or "native_chrome")
         if browser_provider == "adspower" and not str(payload.get("adspower_profile_id") or "").strip():
             raise ValueError("adspower_profile_id is required when browser_provider is adspower")
 
@@ -160,11 +160,11 @@ class BaleAccountStore:
         phone = str(account.get("phone") or "")
         username_or_number = str(account.get("username_or_number") or phone)
         account_id = str(account.get("account_id") or f"bale_{phone}")
-        browser_provider = str(account.get("browser_provider") or "adspower")
+        browser_provider = str(account.get("browser_provider") or "native_chrome")
         if browser_provider == "adspower_placeholder":
             browser_provider = "adspower"
         if browser_provider not in BROWSER_PROVIDERS:
-            browser_provider = "adspower"
+            browser_provider = "native_chrome"
         profile_id = str(account.get("profile_id") or f"profile_{account_id}")
         adspower_profile_id = str(account.get("adspower_profile_id") or "")
         profile_group_id = str(account.get("profile_group_id") or "default")

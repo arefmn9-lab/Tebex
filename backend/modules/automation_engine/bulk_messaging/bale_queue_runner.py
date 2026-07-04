@@ -36,6 +36,7 @@ class BaleQueueRunner:
         requested_limit = _positive_int(payload.get("limit"), 1)
         limit = min(requested_limit, REAL_RUN_LIMIT_CAP)
         account_id = str(payload.get("account_id") or "").strip()
+        provider_mode = _provider_mode(payload.get("provider_mode"))
         jobs = self.queue_store.list_jobs()
         selected_indexes = self._select_job_indexes(jobs, campaign_id, limit, account_id)
         if not selected_indexes:
@@ -48,6 +49,7 @@ class BaleQueueRunner:
                 "processed_jobs": 0,
                 "completed_jobs": 0,
                 "failed_jobs": 0,
+                "provider_mode": provider_mode,
                 "status_summary": self.queue_store.status_summary(campaign_id),
                 "sample_results": [],
             }
@@ -64,7 +66,7 @@ class BaleQueueRunner:
         failed = 0
         for index in selected_indexes:
             job = jobs[index]
-            result = self._run_job(job)
+            result = self._run_job(job, provider_mode)
             if result["success"]:
                 completed += 1
                 job["status"] = "completed"
@@ -90,6 +92,7 @@ class BaleQueueRunner:
             "processed_jobs": len(selected_indexes),
             "completed_jobs": completed,
             "failed_jobs": failed,
+            "provider_mode": provider_mode,
             "status_summary": self.queue_store.status_summary(campaign_id),
             "sample_results": sample_results,
         }
@@ -116,7 +119,7 @@ class BaleQueueRunner:
             selected.append(index)
         return selected
 
-    def _run_job(self, job: dict[str, Any]) -> dict[str, Any]:
+    def _run_job(self, job: dict[str, Any], provider_mode: str = "native_chrome") -> dict[str, Any]:
         executed_at = utc_now()
         action = "send_test_message"
         try:
@@ -125,12 +128,14 @@ class BaleQueueRunner:
                 account_id=str(job.get("account_id") or ""),
                 target=str(job.get("normalized_phone") or ""),
                 message=message,
+                provider_mode=provider_mode,
             )
             success = bool(plugin_result.get("ok"))
             result = {
                 "executed_at": executed_at,
                 "runner": "bale_queue_runner",
                 "action": action,
+                "provider_mode": provider_mode,
                 "success": success,
                 "plugin_result": plugin_result,
             }
@@ -143,6 +148,7 @@ class BaleQueueRunner:
                 "executed_at": utc_now(),
                 "runner": "bale_queue_runner",
                 "action": action,
+                "provider_mode": provider_mode,
                 "success": False,
                 "error_code": "unknown_error",
                 "error_message": str(exc),
@@ -167,6 +173,11 @@ def _positive_int(value: Any, default: int) -> int:
     except Exception:
         return default
     return parsed if parsed > 0 else default
+
+
+def _provider_mode(value: Any) -> str:
+    provider = str(value or "native_chrome").strip()
+    return provider if provider in {"native_chrome", "adspower"} else "native_chrome"
 
 
 def _sample_result(job: dict[str, Any]) -> dict[str, Any]:
