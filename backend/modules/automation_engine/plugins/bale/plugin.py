@@ -461,7 +461,11 @@ class BalePlugin:
             failed_step = "save_or_resolve_contact"
 
         detailed_error_code = str(result.get("error_code") or result.get("reason") or "contact_save_failed")
-        public_error_code = detailed_error_code if detailed_error_code == "contact_save_not_confirmed" else "contact_save_failed"
+        public_error_code = (
+            detailed_error_code
+            if detailed_error_code in {"contact_save_not_confirmed", "add_contact_button_disabled"}
+            else "contact_save_failed"
+        )
         user_message = str(result.get("user_message") or "مخاطب در بله ذخیره نشد")
         result.update(
             {
@@ -989,7 +993,7 @@ class BalePlugin:
             return result
 
         step_started = time.perf_counter()
-        phone_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_MODE_SELECTORS, timeout_ms=750)
+        phone_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_MODE_SELECTORS, timeout_ms=100)
         if phone_mode:
             self._click_if_possible(page, phone_mode)
             result["phone_mode_selector"] = phone_mode
@@ -1073,34 +1077,30 @@ class BalePlugin:
             self._fill_or_type(page, last_name_selector, last_name)
 
         step_started = time.perf_counter()
-        save_button = self._first_visible_selector(
-            page,
-            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS
-            + [
-                'text=افزودن',
-                'button:has-text("افزودن")',
-                '[role="button"]:has-text("افزودن")',
-            ],
-            timeout_ms=2000,
-        )
-        if not save_button:
+        button_result = self._click_enabled_add_contact_button(page)
+        if button_result["status"] != "success":
+            button_details = {key: value for key, value in button_result.items() if key != "status"}
             result.update(
                 {
                     "contact_save_status": "failed",
                     "status": "failed",
-                    "error_code": "contact_save_button_not_found",
-                    "reason": "add_contact_save_button_not_found",
-                    "message": "Bale Add Contact confirm button was not found",
+                    "error_code": "add_contact_button_disabled",
+                    "reason": "add_contact_button_disabled",
+                    "failed_step": "click_add_contact",
+                    "user_message": "دکمه افزودن مخاطب فعال نشد",
+                    "message": "Bale Add Contact button was not enabled",
                     "name_input_selector": name_selector,
                     "phone_input_selector": phone_selector,
                 }
             )
+            add_contact_step("click_add_contact", "failed", step_started, **button_details)
             return result
 
-        self._click_if_possible(page, save_button)
-        add_contact_step("click_add_contact", "success", step_started, selector=save_button)
+        save_button = str(button_result.get("selector") or "")
+        button_details = {key: value for key, value in button_result.items() if key != "status"}
+        add_contact_step("click_add_contact", "success", step_started, **button_details)
         step_started = time.perf_counter()
-        confirmation = self._confirm_contact_saved(page, modal, contact_name, normalized_phone, phone_value, timeout_ms=4500)
+        confirmation = self._confirm_contact_saved(page, modal, contact_name, normalized_phone, phone_value, timeout_ms=5000)
         confirmation_details = {key: value for key, value in confirmation.items() if key != "status"}
         add_contact_step("confirm_contact_saved", confirmation["status"], step_started, **confirmation_details)
         if confirmation["status"] == "failed":
@@ -1188,6 +1188,106 @@ class BalePlugin:
         if len(remaining) >= 2:
             return remaining[1]
         return remaining[0] if remaining else ""
+
+    def _click_enabled_add_contact_button(self, page: Any) -> dict[str, Any]:
+        button_selectors = [
+            '.ReactModal__Overlay button:has-text("افزودن")',
+            '.ReactModal__Overlay button:has-text("Add")',
+            '.ReactModal__Overlay [role="button"]:has-text("افزودن")',
+            '.ReactModal__Overlay [role="button"]:has-text("Add")',
+            '.ReactModal__Content button:has-text("افزودن")',
+            '.ReactModal__Content button:has-text("Add")',
+            '.ReactModal__Content [role="button"]:has-text("افزودن")',
+            '.ReactModal__Content [role="button"]:has-text("Add")',
+            '[role="dialog"] button:has-text("افزودن")',
+            '[role="dialog"] button:has-text("Add")',
+            '[role="dialog"] [role="button"]:has-text("افزودن")',
+            '[role="dialog"] [role="button"]:has-text("Add")',
+        ]
+        button_count = 0
+        disabled_seen = False
+        last_selector = ""
+        last_text = ""
+        for selector in button_selectors:
+            locator = page.locator(selector).first
+            try:
+                locator.wait_for(state="visible", timeout=250)
+            except Exception:
+                continue
+            button_count += 1
+            last_selector = selector
+            last_text = self._locator_text(locator)
+            button_disabled = self._locator_disabled(locator)
+            if button_disabled:
+                disabled_seen = True
+                continue
+            try:
+                locator.click(timeout=2000)
+                return {
+                    "status": "success",
+                    "selector": selector,
+                    "button_text": last_text,
+                    "button_disabled": False,
+                    "button_count": button_count,
+                    "click_method": "playwright_click",
+                }
+            except Exception as click_error:
+                try:
+                    locator.evaluate("(el) => el.click()")
+                    return {
+                        "status": "success",
+                        "selector": selector,
+                        "button_text": last_text,
+                        "button_disabled": False,
+                        "button_count": button_count,
+                        "click_method": "dom_click",
+                        "playwright_click_error": str(click_error),
+                    }
+                except Exception as dom_error:
+                    return {
+                        "status": "failed",
+                        "selector": selector,
+                        "button_text": last_text,
+                        "button_disabled": False,
+                        "button_count": button_count,
+                        "click_error": str(click_error),
+                        "dom_click_error": str(dom_error),
+                    }
+
+        return {
+            "status": "failed",
+            "selector": last_selector,
+            "button_text": last_text,
+            "button_disabled": disabled_seen,
+            "button_count": button_count,
+            "error_code": "add_contact_button_disabled",
+        }
+
+    def _locator_disabled(self, locator: Any) -> bool:
+        try:
+            if hasattr(locator, "is_enabled") and not locator.is_enabled(timeout=250):
+                return True
+        except Exception:
+            pass
+        try:
+            disabled_attr = locator.get_attribute("disabled", timeout=250)
+            if disabled_attr is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            aria_disabled = str(locator.get_attribute("aria-disabled", timeout=250) or "").lower()
+            if aria_disabled == "true":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _locator_text(self, locator: Any) -> str:
+        try:
+            return str(locator.inner_text(timeout=250) or "")
+        except Exception:
+            return ""
 
     def _confirm_contact_saved(
         self,

@@ -51,8 +51,22 @@ class MockLocator:
     def click(self, timeout: int) -> None:
         self.page.click(self.selector, timeout)
 
+    def evaluate(self, script: str) -> None:
+        self.page.dom_clicked.append((self.selector, script))
+        self.page.click(self.selector, timeout=0)
+
     def fill(self, text: str, timeout: int) -> None:
         self.page.fill(self.selector, text, timeout)
+
+    def get_attribute(self, name: str, timeout: int) -> str | None:
+        if name == "disabled" and self.selector in self.page.disabled_selectors:
+            return ""
+        if name == "aria-disabled" and self.selector in self.page.aria_disabled_selectors:
+            return "true"
+        return self.page.selector_attributes.get(self.selector, {}).get(name)
+
+    def is_enabled(self, timeout: int) -> bool:
+        return self.selector not in self.page.disabled_selectors and self.selector not in self.page.aria_disabled_selectors
 
     def type(self, text: str, timeout: int) -> None:
         self.page.typed.append((self.selector, text))
@@ -79,13 +93,20 @@ class MockPage:
         url: str = "https://web.bale.ai/",
         selector_text: dict[str, str] | None = None,
         auto_close_contact_modal: bool = True,
+        disabled_selectors: set[str] | None = None,
+        aria_disabled_selectors: set[str] | None = None,
+        selector_attributes: dict[str, dict[str, str]] | None = None,
     ) -> None:
         self.visible_selectors = visible_selectors
         self.selector_text = selector_text or {}
         self.auto_close_contact_modal = auto_close_contact_modal
+        self.disabled_selectors = disabled_selectors or set()
+        self.aria_disabled_selectors = aria_disabled_selectors or set()
+        self.selector_attributes = selector_attributes or {}
         self.filled: list[tuple[str, str]] = []
         self.typed: list[tuple[str, str]] = []
         self.clicked: list[str] = []
+        self.dom_clicked: list[tuple[str, str]] = []
         self.urls: list[str] = []
         self.url = url
         self.keyboard = MockKeyboard(self)
@@ -105,8 +126,10 @@ class MockPage:
     def click(self, selector: str, timeout: int) -> None:
         if selector not in self.visible_selectors:
             raise TimeoutError(f"Cannot click missing selector: {selector}")
+        if selector in self.disabled_selectors or selector in self.aria_disabled_selectors:
+            raise TimeoutError(f"Cannot click disabled selector: {selector}")
         self.clicked.append(selector)
-        if selector in selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS and self.auto_close_contact_modal:
+        if ("button:has-text(\"Add\")" in selector or "button:has-text(\"افزودن\")" in selector) and self.auto_close_contact_modal:
             self.close_contact_modal()
 
     def close_contact_modal(self) -> None:
@@ -399,6 +422,65 @@ def test_save_contact_by_phone_returns_saved_for_captured_modal_flow() -> None:
     assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
     assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9304073331") in page.filled
     assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+    click_step = next(step for step in result["contact_steps"] if step["step"] == "click_add_contact")
+    assert click_step["click_method"] == "playwright_click"
+    assert click_step["button_disabled"] is False
+    assert click_step["button_count"] == 1
+
+
+def test_save_contact_by_phone_does_not_use_broad_page_level_add_text_for_submit() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            "text=افزودن",
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "success"
+    assert "text=افزودن" not in page.clicked
+    assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+
+
+def test_save_contact_by_phone_disabled_submit_returns_fast_failure() -> None:
+    submit_selector = selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0]
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            submit_selector,
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+        disabled_selectors={submit_selector},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "add_contact_button_disabled"
+    assert result["failed_step"] == "click_add_contact"
+    assert result["user_message"] == "دکمه افزودن مخاطب فعال نشد"
+    click_step = next(step for step in result["contact_steps"] if step["step"] == "click_add_contact")
+    assert click_step["status"] == "failed"
+    assert click_step["button_disabled"] is True
+    assert click_step["button_count"] == 1
+    assert submit_selector not in page.clicked
 
 
 def test_save_contact_by_phone_requires_confirmation_after_add_click() -> None:
@@ -2119,6 +2201,8 @@ if __name__ == "__main__":
     test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
     test_send_text_message_saves_contact_with_captured_add_contact_modal_flow()
     test_save_contact_by_phone_returns_saved_for_captured_modal_flow()
+    test_save_contact_by_phone_does_not_use_broad_page_level_add_text_for_submit()
+    test_save_contact_by_phone_disabled_submit_returns_fast_failure()
     test_save_contact_by_phone_requires_confirmation_after_add_click()
     test_save_contact_by_phone_returns_structured_failure_when_entrypoint_missing()
     test_save_contact_by_phone_returns_structured_failure_when_add_contact_menu_item_missing()
