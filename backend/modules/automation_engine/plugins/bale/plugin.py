@@ -379,7 +379,7 @@ class BalePlugin:
                     diagnostics = {**self._page_debug_info(page, account_id), "contact_save_result": contact_save_result}
                     return finish(
                         False,
-                        "contact_save_failed",
+                        str(contact_save_result.get("error_code") or "contact_save_failed"),
                         str(contact_save_result.get("user_message") or "مخاطب در بله ذخیره نشد"),
                         "save_or_resolve_contact",
                         diagnostics,
@@ -461,13 +461,15 @@ class BalePlugin:
             failed_step = "save_or_resolve_contact"
 
         detailed_error_code = str(result.get("error_code") or result.get("reason") or "contact_save_failed")
+        public_error_code = detailed_error_code if detailed_error_code == "contact_save_not_confirmed" else "contact_save_failed"
+        user_message = str(result.get("user_message") or "مخاطب در بله ذخیره نشد")
         result.update(
             {
                 "status": "failed",
                 "contact_save_status": "failed",
-                "error_code": "contact_save_failed",
+                "error_code": public_error_code,
                 "detail_error_code": detailed_error_code,
-                "user_message": "مخاطب در بله ذخیره نشد",
+                "user_message": user_message,
                 "failed_step": failed_step,
                 "step_results": contact_steps,
             }
@@ -823,15 +825,25 @@ class BalePlugin:
 
     def _open_target_chat(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
         search_attempts: list[dict[str, Any]] = []
-        search_icon = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS, timeout_ms=5000)
+        self._close_contact_modal_if_open(page)
+        try:
+            page.goto(self.web_url, wait_until="load")
+        except Exception:
+            pass
+        chat_ready = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS + selectors.CHAT_ITEM_SELECTORS, timeout_ms=1500)
+        search_icon = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS, timeout_ms=1500)
         if search_icon:
             self._click_if_possible(page, search_icon)
-        search_input = self._first_visible_selector(page, selectors.TEXT_SEARCH_INPUT_SELECTORS, timeout_ms=5000)
+        search_input = self._first_visible_selector(page, selectors.TEXT_SEARCH_INPUT_SELECTORS, timeout_ms=2500)
         if not search_input:
             return {
                 "step": "open_target_chat",
                 "status": "failed",
                 "error_code": "target_not_found",
+                "current_url": _safe_page_url(page),
+                "overlay_present": self._is_contact_modal_visible(page),
+                "active_element": self._active_element_info(page),
+                "chat_ready_selector": chat_ready or "",
                 "search_attempts": [{"query": contact_naming_value or normalized_phone, "reason": "search_input_not_found"}],
             }
 
@@ -842,7 +854,7 @@ class BalePlugin:
             attempt = {"query": query, "matched": False}
             search_attempts.append(attempt)
             self._fill_or_type(page, search_input, query)
-            chat_item = self._first_visible_selector(page, selectors.CHAT_ITEM_SELECTORS, timeout_ms=5000)
+            chat_item = self._first_visible_selector(page, selectors.CHAT_ITEM_SELECTORS, timeout_ms=2500)
             if chat_item and self._selector_text_matches(page, chat_item, query):
                 self._click_if_possible(page, chat_item)
                 attempt["matched"] = True
@@ -897,11 +909,15 @@ class BalePlugin:
             result["job_id"] = job_id
 
         contact_steps = result["contact_steps"]
+        def add_contact_step(step: str, status: str, started: float, **details: Any) -> None:
+            contact_steps.append({"step": step, "status": status, "duration_ms": int((time.perf_counter() - started) * 1000), **details})
+
         contacts_url = f"{self.web_url}/contacts"
         current_url = _safe_page_url(page).lower()
         contacts_entrypoint = ""
+        step_started = time.perf_counter()
         if "/contacts" in current_url:
-            contact_steps.append({"step": "open_contacts", "status": "success", "mode": "already_open", "current_url": _safe_page_url(page)})
+            add_contact_step("open_contacts", "success", step_started, mode="already_open", current_url=_safe_page_url(page))
         else:
             try:
                 page.goto(contacts_url, wait_until="load")
@@ -909,95 +925,95 @@ class BalePlugin:
             except Exception as exc:
                 result["open_contacts_navigation_error"] = str(exc)
             if "/contacts" in current_url:
-                contact_steps.append({"step": "open_contacts", "status": "success", "mode": "navigate", "url": contacts_url, "current_url": _safe_page_url(page)})
+                add_contact_step("open_contacts", "success", step_started, mode="navigate", url=contacts_url, current_url=_safe_page_url(page))
             else:
-                contacts_entrypoint = self._first_visible_selector(page, selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS, timeout_ms=2000) or ""
+                contacts_entrypoint = self._first_visible_selector(page, selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS, timeout_ms=1000) or ""
                 if contacts_entrypoint:
                     self._click_if_possible(page, contacts_entrypoint)
                     result["contacts_entrypoint_selector"] = contacts_entrypoint
-                    contact_steps.append({"step": "open_contacts", "status": "success", "mode": "click_icon", "selector": contacts_entrypoint})
+                    add_contact_step("open_contacts", "success", step_started, mode="click_icon", selector=contacts_entrypoint)
 
         if not contact_steps or contact_steps[-1]["status"] != "success":
             result["error_code"] = "contacts_page_not_opened"
             result["reason"] = "contacts_entrypoint_not_found"
             result["message"] = "Bale contacts page entrypoint was not found"
-            contact_steps.append({"step": "open_contacts", "status": "failed", "error_code": "contacts_page_not_opened"})
+            add_contact_step("open_contacts", "failed", step_started, error_code="contacts_page_not_opened")
             return result
 
-        contacts_ready = self._first_visible_selector(page, selectors.CONTACTS_UI_READY_SELECTORS, timeout_ms=5000)
+        step_started = time.perf_counter()
+        contacts_ready = self._first_visible_selector(page, selectors.CONTACTS_UI_READY_SELECTORS, timeout_ms=1500)
         if not contacts_ready:
             result["error_code"] = "contacts_ui_not_ready"
             result["reason"] = "contacts_ui_not_ready"
             result["message"] = "Bale contacts UI was not ready"
-            contact_steps.append({"step": "wait_contacts_ui", "status": "failed", "error_code": "contacts_ui_not_ready"})
+            add_contact_step("wait_contacts_ui", "failed", step_started, error_code="contacts_ui_not_ready")
             return result
-        contact_steps.append({"step": "wait_contacts_ui", "status": "success", "selector": contacts_ready})
+        add_contact_step("wait_contacts_ui", "success", step_started, selector=contacts_ready)
 
-        entrypoint = self._first_visible_selector(page, selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS, timeout_ms=2000)
+        step_started = time.perf_counter()
+        entrypoint = self._first_visible_selector(page, selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS, timeout_ms=1000)
         if not entrypoint:
             result["error_code"] = "add_contact_entrypoint_not_found"
             result["reason"] = "add_contact_entrypoint_not_found"
             result["message"] = "Bale Add Contact entrypoint was not found"
-            contact_steps.append({"step": "open_add_contact_menu", "status": "failed", "error_code": "add_contact_entrypoint_not_found"})
+            add_contact_step("open_add_contact_menu", "failed", step_started, error_code="add_contact_entrypoint_not_found")
             return result
         self._click_if_possible(page, entrypoint)
         result["entrypoint_selector"] = entrypoint
-        contact_steps.append({"step": "open_add_contact_menu", "status": "success", "selector": entrypoint})
+        add_contact_step("open_add_contact_menu", "success", step_started, selector=entrypoint)
 
-        menu_item = self._first_visible_selector(page, selectors.ADD_CONTACT_MENU_ITEM_SELECTORS, timeout_ms=2000)
+        step_started = time.perf_counter()
+        menu_item = self._first_visible_selector(page, selectors.ADD_CONTACT_MENU_ITEM_SELECTORS, timeout_ms=1000)
         if not menu_item:
             result["error_code"] = "add_contact_menu_item_not_found"
             result["reason"] = "add_contact_menu_item_not_found"
             result["message"] = "Bale Add Contact menu item was not found"
-            contact_steps.append({"step": "wait_add_contact_menu_item", "status": "failed", "error_code": "add_contact_menu_item_not_found"})
+            add_contact_step("wait_add_contact_menu_item", "failed", step_started, error_code="add_contact_menu_item_not_found")
             return result
-        contact_steps.append({"step": "wait_add_contact_menu_item", "status": "success", "selector": menu_item})
+        add_contact_step("wait_add_contact_menu_item", "success", step_started, selector=menu_item)
+        step_started = time.perf_counter()
         self._click_if_possible(page, menu_item)
         result["menu_item_selector"] = menu_item
-        contact_steps.append({"step": "open_add_contact_modal", "status": "success", "selector": menu_item})
+        add_contact_step("open_add_contact_modal", "success", step_started, selector=menu_item)
 
-        modal = self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=3000)
+        step_started = time.perf_counter()
+        modal = self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=2500)
         if modal:
             result["modal_selector"] = modal
-            contact_steps.append({"step": "wait_add_contact_modal", "status": "success", "selector": modal})
+            add_contact_step("wait_add_contact_modal", "success", step_started, selector=modal)
         else:
             result["error_code"] = "add_contact_modal_not_found"
             result["reason"] = "add_contact_modal_not_found"
             result["message"] = "Bale Add Contact modal was not found"
-            contact_steps.append({"step": "wait_add_contact_modal", "status": "failed", "error_code": "add_contact_modal_not_found"})
+            add_contact_step("wait_add_contact_modal", "failed", step_started, error_code="add_contact_modal_not_found")
             return result
 
-        phone_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_MODE_SELECTORS, timeout_ms=2000)
+        step_started = time.perf_counter()
+        phone_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_MODE_SELECTORS, timeout_ms=750)
         if phone_mode:
             self._click_if_possible(page, phone_mode)
             result["phone_mode_selector"] = phone_mode
-            contact_steps.append({"step": "select_mobile_number_tab", "status": "success", "selector": phone_mode})
+            add_contact_step("select_mobile_number_tab", "success", step_started, selector=phone_mode)
         else:
-            contact_steps.append(
-                {
-                    "step": "select_mobile_number_tab",
-                    "status": "skipped",
-                    "reason": "already_default_or_not_required",
-                }
-            )
-        username_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_USERNAME_MODE_SELECTORS, timeout_ms=500)
+            add_contact_step("select_mobile_number_tab", "skipped", step_started, reason="already_default_or_not_required")
+        username_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_USERNAME_MODE_SELECTORS, timeout_ms=300)
         if username_mode:
             result["username_mode_selector"] = username_mode
 
         modal_inputs = self._visible_modal_inputs(page, modal)
-        name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_SELECTORS, timeout_ms=3000)
+        name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_SELECTORS, timeout_ms=1500)
         name_input_fallback_used = False
         if not name_selector:
-            name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_FALLBACK_SELECTORS, timeout_ms=2000)
+            name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_FALLBACK_SELECTORS, timeout_ms=750)
             name_input_fallback_used = bool(name_selector)
-        phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS, timeout_ms=3000)
+        phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS, timeout_ms=1500)
         country_selector = ""
         phone_input_fallback_used = False
         if not phone_selector:
-            country_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_COUNTRY_SELECTOR_SELECTORS, timeout_ms=1000) or ""
+            country_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_COUNTRY_SELECTOR_SELECTORS, timeout_ms=500) or ""
             if country_selector:
                 result["country_selector"] = country_selector
-                phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_FALLBACK_SELECTORS, timeout_ms=2000)
+                phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_FALLBACK_SELECTORS, timeout_ms=750)
                 phone_input_fallback_used = bool(phone_selector)
         if not phone_selector:
             phone_selector = self._modal_phone_input_selector(modal_inputs)
@@ -1019,6 +1035,7 @@ class BalePlugin:
             return result
 
         first_name, last_name = _split_contact_name(contact_name)
+        step_started = time.perf_counter()
         try:
             self._fill_or_type(page, phone_selector, phone_value)
         except Exception as exc:
@@ -1031,10 +1048,11 @@ class BalePlugin:
                     "error": str(exc),
                 }
             )
-            contact_steps.append({"step": "fill_phone", "status": "failed", "error_code": "fill_phone_failed", "selector": phone_selector})
+            add_contact_step("fill_phone", "failed", step_started, error_code="fill_phone_failed", selector=phone_selector)
             return result
-        contact_steps.append({"step": "fill_phone", "status": "success", "selector": phone_selector, "value": phone_value})
+        add_contact_step("fill_phone", "success", step_started, selector=phone_selector, value=phone_value)
 
+        step_started = time.perf_counter()
         try:
             self._fill_or_type(page, name_selector, first_name)
         except Exception as exc:
@@ -1047,13 +1065,14 @@ class BalePlugin:
                     "error": str(exc),
                 }
             )
-            contact_steps.append({"step": "fill_name", "status": "failed", "error_code": "fill_name_failed", "selector": name_selector})
+            add_contact_step("fill_name", "failed", step_started, error_code="fill_name_failed", selector=name_selector)
             return result
-        contact_steps.append({"step": "fill_name", "status": "success", "selector": name_selector, "value": first_name})
-        last_name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_LAST_NAME_INPUT_SELECTORS, timeout_ms=1000)
+        add_contact_step("fill_name", "success", step_started, selector=name_selector, value=first_name)
+        last_name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_LAST_NAME_INPUT_SELECTORS, timeout_ms=300)
         if last_name_selector and last_name:
             self._fill_or_type(page, last_name_selector, last_name)
 
+        step_started = time.perf_counter()
         save_button = self._first_visible_selector(
             page,
             selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS
@@ -1062,7 +1081,7 @@ class BalePlugin:
                 'button:has-text("افزودن")',
                 '[role="button"]:has-text("افزودن")',
             ],
-            timeout_ms=3000,
+            timeout_ms=2000,
         )
         if not save_button:
             result.update(
@@ -1079,10 +1098,37 @@ class BalePlugin:
             return result
 
         self._click_if_possible(page, save_button)
+        add_contact_step("click_add_contact", "success", step_started, selector=save_button)
+        step_started = time.perf_counter()
+        confirmation = self._confirm_contact_saved(page, modal, contact_name, normalized_phone, phone_value, timeout_ms=4500)
+        confirmation_details = {key: value for key, value in confirmation.items() if key != "status"}
+        add_contact_step("confirm_contact_saved", confirmation["status"], step_started, **confirmation_details)
+        if confirmation["status"] == "failed":
+            result.update(
+                {
+                    "status": "failed",
+                    "contact_save_status": "failed",
+                    "error_code": "contact_save_not_confirmed",
+                    "reason": "contact_save_not_confirmed",
+                    "failed_step": "confirm_contact_saved",
+                    "user_message": "ذخیره مخاطب در بله تایید نشد",
+                    "message": "Bale contact save was not confirmed",
+                    "name_input_selector": name_selector,
+                    "phone_input_selector": phone_selector,
+                    "save_button_selector": save_button,
+                }
+            )
+            if account_id:
+                screenshot_path = _save_login_debug_screenshot(page, account_id)
+                if screenshot_path:
+                    result["screenshot_path"] = screenshot_path
+            return result
+
+        self._close_contact_modal_if_open(page)
         result.update(
             {
                 "status": "success",
-                "contact_save_status": "saved",
+                "contact_save_status": confirmation["contact_save_status"],
                 "message": "Bale contact saved",
                 "name_input_selector": name_selector,
                 "name_input_fallback_used": name_input_fallback_used,
@@ -1142,6 +1188,123 @@ class BalePlugin:
         if len(remaining) >= 2:
             return remaining[1]
         return remaining[0] if remaining else ""
+
+    def _confirm_contact_saved(
+        self,
+        page: Any,
+        modal_selector: str,
+        contact_name: str,
+        normalized_phone: str,
+        phone_value: str,
+        timeout_ms: int = 4500,
+    ) -> dict[str, Any]:
+        duplicate_selectors = [
+            'text=/.*already.*exists.*/i',
+            'text=/.*duplicate.*/i',
+            'text=/.*قبلا.*/',
+            'text=/.*موجود.*/',
+            'text=/.*تکراری.*/',
+        ]
+        contact_selectors = [
+            f"text={contact_name}",
+            f"text={normalized_phone}",
+            f"text={phone_value}",
+        ]
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if not self._is_selector_visible(page, modal_selector, timeout_ms=150):
+                return {
+                    "status": "success",
+                    "contact_save_status": "saved",
+                    "confirmation": "modal_closed",
+                }
+
+            duplicate = self._first_visible_selector(page, duplicate_selectors, timeout_ms=100)
+            if duplicate:
+                return {
+                    "status": "success",
+                    "contact_save_status": "already_exists",
+                    "confirmation": "duplicate_detected",
+                    "selector": duplicate,
+                }
+
+            contact_match = self._first_visible_selector(page, contact_selectors, timeout_ms=100)
+            if contact_match:
+                return {
+                    "status": "success",
+                    "contact_save_status": "saved",
+                    "confirmation": "contact_list_updated",
+                    "selector": contact_match,
+                }
+            time.sleep(0.2)
+
+        return {
+            "status": "failed",
+            "contact_save_status": "failed",
+            "error_code": "contact_save_not_confirmed",
+            "modal_still_open": self._is_selector_visible(page, modal_selector, timeout_ms=250),
+            "overlay_present": self._is_contact_modal_visible(page),
+        }
+
+    def _close_contact_modal_if_open(self, page: Any) -> None:
+        if not self._is_contact_modal_visible(page):
+            return
+        try:
+            self._press_key(page, "Escape")
+        except Exception:
+            pass
+        if not self._is_contact_modal_visible(page):
+            return
+        close_selector = self._first_visible_selector(
+            page,
+            [
+                ".ReactModal__Content button[aria-label*='Close']",
+                ".ReactModal__Content button:has-text('×')",
+                ".ReactModal__Content button:has-text('Cancel')",
+                ".ReactModal__Content button:has-text('لغو')",
+                "[role='dialog'] button[aria-label*='Close']",
+            ],
+            timeout_ms=500,
+        )
+        if close_selector:
+            self._click_if_possible(page, close_selector)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if not self._is_contact_modal_visible(page):
+                return
+            time.sleep(0.1)
+
+    def _is_contact_modal_visible(self, page: Any) -> bool:
+        return bool(self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=100))
+
+    def _is_selector_visible(self, page: Any, selector: str, timeout_ms: int = 250) -> bool:
+        if not selector:
+            return False
+        try:
+            page.locator(selector).first.wait_for(state="visible", timeout=timeout_ms)
+            return True
+        except Exception:
+            return False
+
+    def _active_element_info(self, page: Any) -> dict[str, str]:
+        try:
+            return dict(
+                page.evaluate(
+                    """() => {
+                        const el = document.activeElement;
+                        if (!el) return {};
+                        return {
+                            tag: el.tagName || "",
+                            id: el.id || "",
+                            role: el.getAttribute("role") || "",
+                            ariaLabel: el.getAttribute("aria-label") || "",
+                            placeholder: el.getAttribute("placeholder") || ""
+                        };
+                    }"""
+                )
+            )
+        except Exception:
+            return {}
 
     def _add_step(self, step_results: list[dict[str, Any]], step: str, status: str, **details: Any) -> None:
         step_results.append({"step": step, "status": status, **details})

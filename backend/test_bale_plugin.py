@@ -62,11 +62,14 @@ class MockLocator:
 
 
 class MockKeyboard:
-    def __init__(self) -> None:
+    def __init__(self, page: "MockPage | None" = None) -> None:
+        self.page = page
         self.pressed: list[str] = []
 
     def press(self, key: str) -> None:
         self.pressed.append(key)
+        if key == "Escape" and self.page is not None and self.page.auto_close_contact_modal:
+            self.page.close_contact_modal()
 
 
 class MockPage:
@@ -75,15 +78,17 @@ class MockPage:
         visible_selectors: set[str],
         url: str = "https://web.bale.ai/",
         selector_text: dict[str, str] | None = None,
+        auto_close_contact_modal: bool = True,
     ) -> None:
         self.visible_selectors = visible_selectors
         self.selector_text = selector_text or {}
+        self.auto_close_contact_modal = auto_close_contact_modal
         self.filled: list[tuple[str, str]] = []
         self.typed: list[tuple[str, str]] = []
         self.clicked: list[str] = []
         self.urls: list[str] = []
         self.url = url
-        self.keyboard = MockKeyboard()
+        self.keyboard = MockKeyboard(self)
 
     def goto(self, url: str, wait_until: str = "load") -> None:
         self.urls.append(url)
@@ -101,6 +106,12 @@ class MockPage:
         if selector not in self.visible_selectors:
             raise TimeoutError(f"Cannot click missing selector: {selector}")
         self.clicked.append(selector)
+        if selector in selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS and self.auto_close_contact_modal:
+            self.close_contact_modal()
+
+    def close_contact_modal(self) -> None:
+        for selector in selectors.ADD_CONTACT_MODAL_SELECTORS:
+            self.visible_selectors.discard(selector)
 
     def title(self) -> str:
         return "Bale Web"
@@ -345,7 +356,8 @@ def test_send_text_message_saves_contact_with_captured_add_contact_modal_flow() 
     assert contact_step["contact_steps"][8]["step"] == "fill_name"
     assert contact_step["contact_steps"][8]["status"] == "success"
     assert contact_step["contact_steps"][8]["value"] == "Bale-000001"
-    assert page.urls[-1] == "https://web.bale.ai/contacts"
+    assert "https://web.bale.ai/contacts" in page.urls
+    assert page.urls[-1] == plugin.web_url
     assert selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0] in page.clicked
     assert selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0] in page.clicked
     assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
@@ -387,6 +399,41 @@ def test_save_contact_by_phone_returns_saved_for_captured_modal_flow() -> None:
     assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
     assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9304073331") in page.filled
     assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+
+
+def test_save_contact_by_phone_requires_confirmation_after_add_click() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+        auto_close_contact_modal=False,
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(
+        page,
+        normalized_phone="989304073331",
+        contact_naming_value="Bale-000001",
+    )
+
+    assert result["status"] == "failed"
+    assert result["contact_save_status"] == "failed"
+    assert result["error_code"] == "contact_save_not_confirmed"
+    assert result["failed_step"] == "confirm_contact_saved"
+    assert result["user_message"] == "ذخیره مخاطب در بله تایید نشد"
+    assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+    assert result["contact_steps"][9]["step"] == "click_add_contact"
+    assert result["contact_steps"][9]["status"] == "success"
+    assert result["contact_steps"][10]["step"] == "confirm_contact_saved"
+    assert result["contact_steps"][10]["status"] == "failed"
 
 
 def test_save_contact_by_phone_returns_structured_failure_when_entrypoint_missing() -> None:
@@ -2072,6 +2119,7 @@ if __name__ == "__main__":
     test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
     test_send_text_message_saves_contact_with_captured_add_contact_modal_flow()
     test_save_contact_by_phone_returns_saved_for_captured_modal_flow()
+    test_save_contact_by_phone_requires_confirmation_after_add_click()
     test_save_contact_by_phone_returns_structured_failure_when_entrypoint_missing()
     test_save_contact_by_phone_returns_structured_failure_when_add_contact_menu_item_missing()
     test_save_contact_by_phone_returns_structured_failure_when_modal_missing()
