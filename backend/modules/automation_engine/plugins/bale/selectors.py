@@ -32,6 +32,7 @@ TEXT_SEARCH_INPUT_SELECTORS = [
     '[data-testid="chat-search-input"]',
     '[role="textbox"]',
     '[contenteditable="true"]',
+    '[role="searchbox"][aria-label="جستجوی کانال، گروه و پیام"]',
 ]
 
 SEARCH_INPUT_SELECTORS = [
@@ -111,6 +112,10 @@ CONTACTS_UI_READY_SELECTORS = [
 ]
 
 CONTACTS_SEARCH_INPUT_SELECTORS = [
+    '[role="searchbox"][aria-label="جستجوی مخاطب"]',
+    '[role="searchbox"][name="جستجوی مخاطب"]',
+    'input[type="search"][placeholder="جستجوی مخاطب"]',
+    'input[placeholder="جستجوی مخاطب"]',
     'input[type="search"][placeholder="Search Contact..."]',
     'input[placeholder="Search Contact..."]',
     'input[type="search"]',
@@ -118,6 +123,12 @@ CONTACTS_SEARCH_INPUT_SELECTORS = [
     'input[placeholder*="Search"]',
     '[role="textbox"]',
     '[contenteditable="true"]',
+]
+
+CONTACTS_SEARCH_ICON_SELECTORS = [
+    ".ZGzps0",
+    *SEARCH_ICON_CLICK_TARGET_SELECTORS,
+    *SEARCH_ICON_SVG_SELECTORS,
 ]
 
 CONTACTS_RESULT_CANDIDATE_SELECTORS = [

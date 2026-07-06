@@ -165,7 +165,9 @@ class BalePlugin:
                 error_code = "bale_install_prompt"
                 message = "Bale install/help prompt is visible. Dismiss it, then log in."
             elif not login_check["logged_in"]:
-                error_code = "not_logged_in"
+                error_code = str(login_check.get("error_code") or "not_logged_in")
+                if error_code == "login_state_unknown":
+                    message = "Bale login state could not be determined"
             return {
                 "ok": bool(login_check["logged_in"]),
                 "logged_in": bool(login_check["logged_in"]),
@@ -206,7 +208,7 @@ class BalePlugin:
                 "platform": self.platform_id,
                 "account_id": account_id,
                 "message": message,
-                "error_code": "bale_install_prompt" if login_check["install_prompt_detected"] else (None if logged_in else "not_logged_in"),
+                "error_code": "bale_install_prompt" if login_check["install_prompt_detected"] else (None if logged_in else str(login_check.get("error_code") or "not_logged_in")),
                 "login_check": login_check,
             }
         except Exception as exc:
@@ -266,7 +268,7 @@ class BalePlugin:
             )
             return {
                 "ok": False,
-                "logged_in": error_code not in {"not_logged_in", "bale_install_prompt"},
+                "logged_in": error_code not in {"not_logged_in", "bale_install_prompt", "login_state_unknown"},
                 "platform": self.platform_id,
                 "account_id": account_id,
                 "target": target,
@@ -357,11 +359,12 @@ class BalePlugin:
                     )
                 if not login_check["logged_in"]:
                     diagnostics = {"login_check": login_check, **self._page_debug_info(page, account_id)}
-                    self._add_step(step_results, "verify_login", "failed", error_code="not_logged_in", **diagnostics)
+                    error_code = str(login_check.get("error_code") or "not_logged_in")
+                    self._add_step(step_results, "verify_login", "failed", error_code=error_code, **diagnostics)
                     return finish(
                         False,
-                        "not_logged_in",
-                        "Manual Bale login is required before sending a text message",
+                        error_code,
+                        "Bale login state could not be determined" if error_code == "login_state_unknown" else "Manual Bale login is required before sending a text message",
                         "verify_login",
                         diagnostics,
                     )
@@ -583,11 +586,12 @@ class BalePlugin:
                 "check_login",
                 "failed",
                 "Manual Bale login is required before sending a test message",
-                error_code="not_logged_in",
+                error_code=str(login_check.get("error_code") or "not_logged_in"),
             )
+            error_code = str(login_check.get("error_code") or "not_logged_in")
             raise BalePluginError(
-                "not_logged_in",
-                "Manual Bale login is required before sending a test message",
+                error_code,
+                "Bale login state could not be determined" if error_code == "login_state_unknown" else "Manual Bale login is required before sending a test message",
                 {"login_check": login_check, **self._page_debug_info(page, account_id)},
             )
         self._record_step(execution_logs, account_id, "check_login", "success", f"Logged-in UI detected: {login_check.get('matched_selector')}")
@@ -802,38 +806,77 @@ class BalePlugin:
         }
 
     def _detect_login_state(self, page: Any, timeout_ms: int = 5000) -> dict[str, Any]:
+        _safe_wait_for_timeout(page, min(750, max(0, timeout_ms // 10)))
         current_url = _safe_page_url(page)
-        login_page_detected = "/login" in current_url.lower()
-        install_prompt = self._first_visible_selector(page, _INSTALL_PROMPT_SELECTORS, timeout_ms=1000)
-        login_form = self._first_visible_selector(page, _LOGIN_FORM_SELECTORS, timeout_ms=1000)
+        normalized_url = current_url.lower()
+        visible_text_sample = _visible_text_sample(page)
+        install_prompt = self._first_visible_selector(page, _INSTALL_PROMPT_SELECTORS, timeout_ms=750)
+        login_form = self._first_visible_selector(page, _CLEAR_LOGIN_FORM_SELECTORS, timeout_ms=750)
 
-        dialog_selector = self._first_visible_selector(page, selectors.CHAT_ITEM_SELECTORS, timeout_ms=1000)
-        message_selector = self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=1000)
-        search_icon_selector = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS, timeout_ms=1000)
+        dialog_selector = self._first_visible_selector(page, selectors.CHAT_ITEM_SELECTORS, timeout_ms=750)
+        message_selector = self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=750)
+        search_icon_selector = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS, timeout_ms=750)
+        chat_list_selector = self._first_visible_selector(page, _CHAT_LIST_SELECTORS, timeout_ms=750)
+        tabs_selector = self._first_visible_selector(page, _BALE_CHAT_TAB_SELECTORS, timeout_ms=750)
+        side_menu_selector = self._first_visible_selector(page, _BALE_SIDE_MENU_SELECTORS, timeout_ms=750)
         matched_selector = self._first_visible_selector(
             page,
             _CHAT_UI_SELECTORS,
-            timeout_ms=timeout_ms,
+            timeout_ms=min(timeout_ms, 1500),
         )
-        search_selector = self._first_visible_selector(page, selectors.SEARCH_INPUT_SELECTORS, timeout_ms=1000)
-        url_chat_detected = "/chat" in current_url.lower()
-        chat_ui_detected = any([matched_selector, search_selector, message_selector, dialog_selector, search_icon_selector, url_chat_detected])
-        blocking_login_ui = bool(login_form or install_prompt)
-        logged_in = bool(chat_ui_detected and not blocking_login_ui)
+        search_selector = self._first_visible_selector(page, selectors.SEARCH_INPUT_SELECTORS, timeout_ms=750)
+        url_chat_detected = "/chat" in normalized_url
+        login_form_visible = bool(login_form)
+        chat_list_visible = bool(chat_list_selector or dialog_selector)
+        search_icon_visible = bool(search_icon_selector)
+        tabs_visible = bool(tabs_selector)
+        side_menu_visible = bool(side_menu_selector)
+        logged_in_ui_detected = any(
+            [
+                chat_list_visible,
+                search_icon_visible,
+                tabs_visible,
+                side_menu_visible,
+                bool(message_selector),
+            ]
+        )
+        logged_in = bool(logged_in_ui_detected and not install_prompt)
+        login_page_detected = bool(("/login" in normalized_url or login_form_visible) and not logged_in_ui_detected)
+        if install_prompt:
+            error_code = "bale_install_prompt"
+            detector_reason = "install_prompt_visible"
+        elif logged_in:
+            error_code = None
+            detector_reason = "authenticated_app_shell_visible"
+        elif login_page_detected:
+            error_code = "not_logged_in"
+            detector_reason = "clear_login_ui_visible"
+        else:
+            error_code = "login_state_unknown"
+            detector_reason = "no_clear_login_or_app_shell_signal"
 
         return {
             "logged_in": logged_in,
             "current_url": current_url,
-            "matched_selector": matched_selector or dialog_selector or message_selector or search_icon_selector or search_selector or ("url:/chat" if url_chat_detected else ""),
-            "login_page_detected": bool(login_page_detected or login_form),
+            "matched_selector": matched_selector or chat_list_selector or dialog_selector or message_selector or search_icon_selector or tabs_selector or side_menu_selector or search_selector or ("url:/chat" if url_chat_detected else ""),
+            "error_code": error_code,
+            "login_page_detected": login_page_detected,
             "install_prompt_detected": bool(install_prompt),
-            "chat_ui_detected": bool(chat_ui_detected),
+            "logged_in_ui_detected": bool(logged_in_ui_detected),
+            "chat_ui_detected": bool(logged_in_ui_detected),
             "dialog_items_detected": bool(dialog_selector),
+            "chat_list_visible": chat_list_visible,
             "search_input_detected": bool(search_selector),
-            "search_icon_detected": bool(search_icon_selector),
+            "search_icon_detected": search_icon_visible,
+            "search_icon_visible": search_icon_visible,
             "message_input_detected": bool(message_selector),
+            "tabs_visible": tabs_visible,
+            "side_menu_visible": side_menu_visible,
+            "login_form_visible": login_form_visible,
             "login_form_selector": login_form or "",
             "install_prompt_selector": install_prompt or "",
+            "visible_text_sample": visible_text_sample,
+            "login_detector_reason": detector_reason,
         }
 
     def _page_debug_info(self, page: Any, account_id: str) -> dict[str, Any]:
@@ -915,14 +958,30 @@ class BalePlugin:
     def _open_target_chat(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
         started = time.perf_counter()
         search_attempts: list[dict[str, Any]] = []
+        contact_name = str(contact_naming_value or "").strip()
         search_open = self._open_chat_search_from_main_ui(page, contact_naming_value, normalized_phone)
         search_input = str(search_open.get("search_input_selector") or "")
         if not search_input:
+            contacts_fallback = self._open_chat_from_contacts_fallback(page, contact_naming_value, normalized_phone)
+            if contacts_fallback.get("status") == "success":
+                return {
+                    "step": "open_target_chat",
+                    "status": "success",
+                    "search_attempts": search_attempts,
+                    "chat_search_no_result": True,
+                    "contacts_fallback_attempted": True,
+                    "contacts_fallback": contacts_fallback,
+                    "contacts_query_attempts": contacts_fallback.get("contacts_query_attempts", []),
+                    "matched_selector": contacts_fallback.get("matched_selector", ""),
+                    "matched_candidate_text": contacts_fallback.get("matched_contact_text", ""),
+                    "chat_open_confirmed": True,
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
             diagnostics = self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=contact_naming_value or normalized_phone)
             return {
                 "step": "open_target_chat",
                 "status": "failed",
-                "error_code": "search_input_not_found",
+                "error_code": contacts_fallback.get("error_code") or "search_input_not_found",
                 "page_url": _safe_page_url(page),
                 "active_element": search_open.get("active_element") or self._active_element_info(page),
                 "search_icon_visible": search_open.get("search_icon_visible", False),
@@ -930,6 +989,9 @@ class BalePlugin:
                 "activation_attempts": search_open.get("activation_attempts", []),
                 "dom_diagnostics": self._compact_chat_search_dom_diagnostics(page),
                 "search_attempts": [{"query": contact_naming_value or normalized_phone, "reason": "search_input_not_found"}],
+                "contacts_fallback_attempted": True,
+                "contacts_fallback": contacts_fallback,
+                "contacts_query_attempts": contacts_fallback.get("contacts_query_attempts", []),
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 **diagnostics,
             }
@@ -938,37 +1000,208 @@ class BalePlugin:
             query = str(query or "").strip()
             if not query:
                 continue
-            attempt = {"query": query, "matched": False}
+            is_name_query = bool(contact_name and query.lower() == contact_name.lower())
+            attempt = {
+                "query": query,
+                "input_value": query,
+                "matched": False,
+                "search_phase": "chat_search_name" if is_name_query else "chat_search_phone",
+                "name_result_visible": False,
+                "matched_contact_text": "",
+                "matched_result_selector": "",
+                "matched_result_tag": "",
+                "matched_result_role": "",
+                "matched_result_class": "",
+                "matched_result_box": {},
+                "clickable_ancestor_selector": "",
+                "clickable_ancestor_text": "",
+                "clickable_ancestor_box": {},
+                "rejected_broad_candidates": [],
+                "clicked_result": False,
+                "click_method": "",
+                "click_attempts": [],
+                "page_url_before_click": "",
+                "page_url_after_click": "",
+                "chat_open_confirmed": False,
+                "chat_open_confirmed_by": "",
+                "message_input_visible": False,
+                "right_chat_header_text": "",
+                "scoped_header_text": "",
+                "right_header_text_source": "",
+                "false_positive_confirmation_prevented": False,
+                "phone_fallback_skipped_reason": "",
+            }
             search_attempts.append(attempt)
             if len(search_attempts) > 1:
                 self._clear_search_input(page, search_input)
             self._fill_or_type(page, search_input, query)
             candidates = self._collect_search_result_candidates(page, timeout_ms=1500)
-            match = self._match_search_result_candidate(candidates, query, contact_naming_value, normalized_phone)
+            rejected_broad_candidates = [item for item in candidates if self._is_broad_chat_search_candidate(item)]
+            matchable_candidates = [item for item in candidates if not self._is_broad_chat_search_candidate(item)]
+            name_visible_in_candidates = bool(
+                is_name_query
+                and contact_name
+                and any(contact_name.lower() in str(item.get("text") or "").lower() for item in candidates)
+            )
+            match = self._match_search_result_candidate(matchable_candidates, query, contact_naming_value, normalized_phone)
             attempt["result_candidate_count"] = len(candidates)
             attempt["result_candidates_text"] = [item.get("text", "") for item in candidates[:15]]
             attempt["normalized_candidates"] = [item.get("normalized_text", "") for item in candidates[:15]]
+            attempt["rejected_broad_candidates"] = [
+                {
+                    "selector": item.get("selector", ""),
+                    "text": item.get("text", ""),
+                    "box": item.get("box", {}),
+                    "reason": "broad_search_panel_text",
+                }
+                for item in rejected_broad_candidates[:10]
+            ]
             if match:
-                click_result = self._click_search_result_candidate(page, match)
+                attempt["name_result_visible"] = bool(is_name_query)
+                attempt["matched_contact_text"] = str(match.get("text", ""))
+                attempt["matched_result_selector"] = str(match.get("selector") or "")
+                attempt["matched_result_tag"] = str(match.get("tag") or "")
+                attempt["matched_result_role"] = str(match.get("role") or "")
+                attempt["matched_result_class"] = str(match.get("className") or "")
+                attempt["matched_result_box"] = match.get("box") or {}
+                attempt["clickable_ancestor_selector"] = str(match.get("click_selector") or match.get("selector") or "")
+                attempt["clickable_ancestor_text"] = str(match.get("clickText") or match.get("text") or "")
+                attempt["clickable_ancestor_box"] = match.get("clickBox") or match.get("box") or {}
+                attempt["page_url_before_click"] = _safe_page_url(page)
+                click_result = self._click_and_confirm_search_result(page, match, contact_naming_value)
                 attempt["matched"] = click_result["status"] == "success"
+                attempt["clicked_result"] = bool(click_result.get("clicked_result") or click_result.get("status") == "success")
                 attempt["matched_selector"] = match.get("click_selector") or match.get("selector")
                 attempt["matched_candidate_text"] = match.get("text", "")
                 attempt["match_mode"] = match.get("match_mode", "normalized_text_match")
                 attempt["click_method"] = click_result.get("click_method", "")
-                chat_opened = self._confirm_chat_opened(page)
+                attempt["click_attempts"] = click_result.get("click_attempts", [])
+                attempt["page_url_after_click"] = _safe_page_url(page)
+                confirmation_state = self._chat_open_confirmation_state(page, contact_naming_value, str(match.get("text") or ""))
+                confirmation_reason = str(click_result.get("chat_open_confirmed_by") or confirmation_state.get("reason") or "")
+                chat_opened = bool(confirmation_reason)
                 attempt["chat_open_confirmed"] = chat_opened
+                attempt["chat_open_confirmed_by"] = confirmation_reason
+                attempt["message_input_visible"] = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
+                attempt["right_chat_header_text"] = self._right_chat_header_text(page)
+                attempt["scoped_header_text"] = str(confirmation_state.get("scoped_header_text") or "")
+                attempt["right_header_text_source"] = str(confirmation_state.get("right_header_text_source") or "")
+                attempt["false_positive_confirmation_prevented"] = bool(confirmation_state.get("false_positive_confirmation_prevented"))
                 if chat_opened:
                     return {
                         "step": "open_target_chat",
                         "status": "success",
+                        "searched_value": query,
+                        "search_phase": attempt["search_phase"],
+                        "name_result_visible": attempt["name_result_visible"],
                         "matched_selector": attempt["matched_selector"],
+                        "matched_result_selector": attempt["matched_result_selector"],
+                        "matched_result_tag": attempt["matched_result_tag"],
+                        "matched_result_role": attempt["matched_result_role"],
+                        "matched_result_class": attempt["matched_result_class"],
+                        "matched_result_box": attempt["matched_result_box"],
+                        "clickable_ancestor_selector": attempt["clickable_ancestor_selector"],
+                        "clickable_ancestor_text": attempt["clickable_ancestor_text"],
+                        "clickable_ancestor_box": attempt["clickable_ancestor_box"],
+                        "rejected_broad_candidates": attempt["rejected_broad_candidates"],
                         "matched_candidate_text": attempt["matched_candidate_text"],
+                        "matched_contact_text": attempt["matched_contact_text"],
+                        "clicked_result": attempt["clicked_result"],
+                        "click_method": attempt["click_method"],
+                        "click_attempts": attempt["click_attempts"],
+                        "page_url_before_click": attempt["page_url_before_click"],
+                        "page_url_after_click": attempt["page_url_after_click"],
                         "search_attempts": search_attempts,
+                        "chat_query_attempts": search_attempts,
                         "chat_open_confirmed": True,
+                        "chat_open_confirmed_by": confirmation_reason,
+                        "message_input_visible": attempt["message_input_visible"],
+                        "right_chat_header_text": attempt["right_chat_header_text"],
+                        "scoped_header_text": attempt["scoped_header_text"],
+                        "right_header_text_source": attempt["right_header_text_source"],
+                        "false_positive_confirmation_prevented": attempt["false_positive_confirmation_prevented"],
+                        "phone_fallback_skipped_reason": "name_result_opened" if is_name_query else "",
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    }
+                if is_name_query:
+                    error_code = "chat_open_not_confirmed" if click_result.get("clicked_result") else "name_result_click_failed"
+                    attempt["reason"] = error_code
+                    attempt["phone_fallback_skipped_reason"] = "visible_name_result_not_confirmed"
+                    return {
+                        "step": "open_target_chat",
+                        "status": "failed",
+                        "error_code": error_code,
+                        "searched_value": query,
+                        "search_phase": attempt["search_phase"],
+                        "name_result_visible": True,
+                        "matched_selector": attempt["matched_selector"],
+                        "matched_result_selector": attempt["matched_result_selector"],
+                        "matched_result_tag": attempt["matched_result_tag"],
+                        "matched_result_role": attempt["matched_result_role"],
+                        "matched_result_class": attempt["matched_result_class"],
+                        "matched_result_box": attempt["matched_result_box"],
+                        "clickable_ancestor_selector": attempt["clickable_ancestor_selector"],
+                        "clickable_ancestor_text": attempt["clickable_ancestor_text"],
+                        "clickable_ancestor_box": attempt["clickable_ancestor_box"],
+                        "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                        "matched_candidate_text": attempt["matched_candidate_text"],
+                        "matched_contact_text": attempt["matched_contact_text"],
+                        "clicked_result": attempt["clicked_result"],
+                        "click_method": attempt["click_method"],
+                        "click_attempts": attempt["click_attempts"],
+                        "click_error": click_result.get("click_error", ""),
+                        "dom_click_error": click_result.get("dom_click_error", ""),
+                        "page_url_before_click": attempt["page_url_before_click"],
+                        "page_url_after_click": attempt["page_url_after_click"],
+                        "search_attempts": search_attempts,
+                        "chat_query_attempts": search_attempts,
+                        "chat_open_confirmed": False,
+                        "chat_open_confirmed_by": "",
+                        "message_input_visible": attempt["message_input_visible"],
+                        "right_chat_header_text": attempt["right_chat_header_text"],
+                        "scoped_header_text": attempt["scoped_header_text"],
+                        "right_header_text_source": attempt["right_header_text_source"],
+                        "false_positive_confirmation_prevented": attempt["false_positive_confirmation_prevented"],
+                        "phone_fallback_skipped_reason": "visible_name_result_not_confirmed",
                         "duration_ms": int((time.perf_counter() - started) * 1000),
                     }
                 attempt["reason"] = "chat_open_not_confirmed"
             else:
+                if is_name_query and name_visible_in_candidates:
+                    attempt["name_result_visible"] = True
+                    attempt["reason"] = "visible_name_result_rejected_as_broad"
+                    attempt["phone_fallback_skipped_reason"] = "visible_name_result_not_confirmed"
+                    return {
+                        "step": "open_target_chat",
+                        "status": "failed",
+                        "error_code": "chat_open_not_confirmed",
+                        "searched_value": query,
+                        "search_phase": attempt["search_phase"],
+                        "name_result_visible": True,
+                        "matched_contact_text": "",
+                        "matched_result_selector": "",
+                        "matched_result_box": {},
+                        "clickable_ancestor_selector": "",
+                        "clickable_ancestor_text": "",
+                        "clickable_ancestor_box": {},
+                        "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                        "click_attempts": [],
+                        "clicked_result": False,
+                        "click_method": "",
+                        "page_url_before_click": _safe_page_url(page),
+                        "page_url_after_click": _safe_page_url(page),
+                        "search_attempts": search_attempts,
+                        "chat_query_attempts": search_attempts,
+                        "chat_open_confirmed": False,
+                        "chat_open_confirmed_by": "",
+                        "message_input_visible": bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100)),
+                        "right_chat_header_text": self._right_chat_header_text(page),
+                        "scoped_header_text": "",
+                        "right_header_text_source": "broad_search_panel_rejected",
+                        "false_positive_confirmation_prevented": True,
+                        "phone_fallback_skipped_reason": "visible_name_result_not_confirmed",
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    }
                 attempt["reason"] = "dialog_item_not_found"
         searched_value = search_attempts[-1]["query"] if search_attempts else ""
         last_attempt = search_attempts[-1] if search_attempts else {}
@@ -1778,11 +2011,15 @@ class BalePlugin:
                             click_selector: clickSelector,
                             text,
                             tag: el.tagName || "",
+                            className: el.className || "",
                             role: el.getAttribute("role") || "",
                             ariaLabel: el.getAttribute("aria-label") || "",
                             clickTag: click ? click.tagName || "" : "",
+                            clickClass: click ? click.className || "" : "",
                             clickRole: click ? click.getAttribute("role") || "" : "",
-                            clickText: click ? (click.innerText || click.textContent || "").trim().slice(0, 200) : ""
+                            clickText: click ? (click.innerText || click.textContent || "").trim().slice(0, 200) : "",
+                            box: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)},
+                            clickBox: click ? (() => { const b = click.getBoundingClientRect(); return {x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height)}; })() : {}
                         });
                         if (rows.length >= 30) break;
                     }
@@ -1818,6 +2055,34 @@ class BalePlugin:
         item["normalized_text"] = _normalize_bale_match_text(text)
         item["normalized_phone_text"] = _normalize_bale_phone_text(text)
         return item
+
+    def _is_broad_chat_search_candidate(self, candidate: dict[str, Any]) -> bool:
+        text = str(candidate.get("text") or "")
+        normalized = _normalize_bale_match_text(text)
+        if not normalized:
+            return False
+        broad_markers = [
+            "برای شروع یکی از گفتگوها را انتخاب کنید",
+            "همه پیام‌ها",
+            "گفتگوها",
+            "مخاطبین",
+            "خدمات",
+            "مجله",
+        ]
+        if _is_broad_chat_text(text):
+            return True
+        marker_count = sum(1 for marker in broad_markers if marker and marker in text)
+        line_count = len([line for line in text.splitlines() if line.strip()])
+        box = candidate.get("box") or {}
+        width = float(box.get("w", box.get("width", 0)) or 0)
+        height = float(box.get("h", box.get("height", 0)) or 0)
+        if len(text) > 220 and marker_count >= 2:
+            return True
+        if line_count >= 8 and marker_count >= 2:
+            return True
+        if width > 650 or height > 260:
+            return True
+        return False
 
     def _match_search_result_candidate(
         self,
@@ -1863,11 +2128,138 @@ class BalePlugin:
             except Exception as dom_error:
                 return {"status": "failed", "click_error": str(click_error), "dom_click_error": str(dom_error)}
 
+    def _click_and_confirm_search_result(self, page: Any, candidate: dict[str, Any], contact_naming_value: str) -> dict[str, Any]:
+        click_attempts: list[dict[str, Any]] = []
+        clicked_any = False
+        selectors_to_try: list[str] = []
+        for selector in [
+            str(candidate.get("click_selector") or ""),
+            str(candidate.get("selector") or ""),
+            "div:nth-child(2) > div > .qHFpb6 > .ZGzps0",
+        ]:
+            if selector and selector not in selectors_to_try:
+                selectors_to_try.append(selector)
+
+        if not selectors_to_try:
+            return {"status": "failed", "error": "candidate_selector_missing", "click_attempts": click_attempts}
+
+        def record_attempt(method: str, selector: str, success: bool, before_url: str, error: str = "") -> str:
+            _safe_wait_for_timeout(page, 200)
+            after_url = _safe_page_url(page)
+            confirmation_state = self._chat_open_confirmation_state(page, contact_naming_value, str(candidate.get("text") or ""))
+            confirmation = str(confirmation_state.get("reason") or "")
+            click_attempts.append(
+                {
+                    "method": method,
+                    "selector": selector,
+                    "before_url": before_url,
+                    "after_url": after_url,
+                    "success": bool(success and confirmation),
+                    "error": error,
+                    "chat_open_confirmed_by": confirmation,
+                    "message_input_visible": bool(confirmation_state.get("message_input_visible")),
+                    "scoped_header_text": confirmation_state.get("scoped_header_text", ""),
+                    "right_header_text_source": confirmation_state.get("right_header_text_source", ""),
+                    "false_positive_confirmation_prevented": bool(confirmation_state.get("false_positive_confirmation_prevented")),
+                }
+            )
+            return confirmation
+
+        for selector in selectors_to_try:
+            locator = page.locator(selector).first
+            for method, kwargs in [
+                ("normal_click", {"timeout": 500}),
+                ("force_click", {"timeout": 500, "force": True}),
+            ]:
+                before_url = _safe_page_url(page)
+                try:
+                    locator.click(**kwargs)
+                    clicked_any = True
+                    confirmation = record_attempt(method, selector, True, before_url)
+                    if confirmation:
+                        return {"status": "success", "clicked_result": True, "click_method": method, "selector": selector, "click_attempts": click_attempts, "chat_open_confirmed_by": confirmation}
+                except Exception as exc:
+                    record_attempt(method, selector, False, before_url, str(exc))
+
+            for method, script in [
+                ("js_click", "(el) => el.click()"),
+                ("mouse_event_click", '(el) => el.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, view: window}))'),
+            ]:
+                before_url = _safe_page_url(page)
+                try:
+                    locator.evaluate(script)
+                    clicked_any = True
+                    confirmation = record_attempt(method, selector, True, before_url)
+                    if confirmation:
+                        return {"status": "success", "clicked_result": True, "click_method": method, "selector": selector, "click_attempts": click_attempts, "chat_open_confirmed_by": confirmation}
+                except Exception as exc:
+                    record_attempt(method, selector, False, before_url, str(exc))
+
+            before_url = _safe_page_url(page)
+            try:
+                box = candidate.get("box") or locator.bounding_box(timeout=200)
+                if box:
+                    x = float(box.get("x", 0)) + float(box.get("w", box.get("width", 0))) / 2
+                    y = float(box.get("y", 0)) + float(box.get("h", box.get("height", 0))) / 2
+                    page.mouse.click(x, y)
+                    clicked_any = True
+                    confirmation = record_attempt("coordinate_click", selector, True, before_url)
+                    if confirmation:
+                        return {"status": "success", "clicked_result": True, "click_method": "coordinate_click", "selector": selector, "click_attempts": click_attempts, "chat_open_confirmed_by": confirmation}
+                else:
+                    record_attempt("coordinate_click", selector, False, before_url, "candidate_box_missing")
+            except Exception as exc:
+                record_attempt("coordinate_click", selector, False, before_url, str(exc))
+
+        return {"status": "failed", "clicked_result": clicked_any, "click_method": "", "selector": selectors_to_try[0], "click_attempts": click_attempts}
+
     def _confirm_chat_opened(self, page: Any) -> bool:
         if self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=1200):
             return True
         current_url = _safe_page_url(page).lower()
         return "/chat/" in current_url or "uid=" in current_url
+
+    def _chat_open_confirmation_reason(self, page: Any, contact_naming_value: str, matched_contact_text: str = "") -> str:
+        return str(self._chat_open_confirmation_state(page, contact_naming_value, matched_contact_text).get("reason") or "")
+
+    def _chat_open_confirmation_state(self, page: Any, contact_naming_value: str, matched_contact_text: str = "") -> dict[str, Any]:
+        current_url = _safe_page_url(page).lower()
+        message_input_visible = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=400))
+        state: dict[str, Any] = {
+            "reason": "",
+            "current_url": _safe_page_url(page),
+            "message_input_visible": message_input_visible,
+            "scoped_header_text": "",
+            "right_header_text_source": "",
+            "false_positive_confirmation_prevented": False,
+        }
+        if "/chat?uid=" in current_url or ("chat" in current_url and "uid=" in current_url):
+            state["reason"] = "chat_uid_url"
+            return state
+        if message_input_visible:
+            state["reason"] = "message_input_visible"
+            return state
+        name = str(contact_naming_value or "").strip().lower()
+        if "/chat/search" in current_url:
+            broad_text = self._right_chat_header_text(page)
+            if name and name in broad_text.lower():
+                state["scoped_header_text"] = broad_text
+                state["right_header_text_source"] = "search_panel_rejected"
+                state["false_positive_confirmation_prevented"] = True
+            return state
+        header_text = self._scoped_opened_chat_header_text(page)
+        state["scoped_header_text"] = header_text
+        state["right_header_text_source"] = "opened_chat_header"
+        if name and name in header_text.lower() and not _is_broad_chat_text(header_text):
+            state["reason"] = "scoped_header_match"
+            return state
+        if name and self._opened_chat_panel_contains_contact(page, name):
+            state["reason"] = "opened_chat_panel_match"
+            return state
+        if name and matched_contact_text and name in matched_contact_text.lower() and "uid=" in current_url:
+            state["reason"] = "matched_result_with_uid"
+            return state
+        return state
 
     def _confirm_chat_opened_for_contact(
         self,
@@ -1883,6 +2275,21 @@ class BalePlugin:
         if name and name in header_text.lower():
             return True
         return bool(message_input_visible and matched_contact_text and name and name in matched_contact_text.lower())
+
+    def _contact_open_confirmation_reason(self, page: Any, contact_naming_value: str, matched_contact_text: str = "") -> str:
+        current_url = _safe_page_url(page).lower()
+        if "/contacts?uid=" in current_url or ("contacts" in current_url and "uid=" in current_url):
+            return "contacts_uid_url"
+        if "uid=" in current_url:
+            return "uid_url"
+        header_text = self._right_chat_header_text(page)
+        name = str(contact_naming_value or "").strip().lower()
+        if name and name in header_text.lower():
+            return "right_header_match"
+        message_input_visible = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
+        if message_input_visible and matched_contact_text and name and name in matched_contact_text.lower():
+            return "message_input_visible"
+        return ""
 
     def _right_chat_header_text(self, page: Any) -> str:
         try:
@@ -1903,6 +2310,55 @@ class BalePlugin:
             return str(text or "")
         except Exception:
             return ""
+
+    def _scoped_opened_chat_header_text(self, page: Any) -> str:
+        try:
+            text = page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                    };
+                    const nodes = Array.from(document.querySelectorAll("body *")).filter(visible).filter((el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.x < 500 || rect.y > 180 || rect.height > 140 || rect.width > 520) return false;
+                        const text = (el.innerText || el.textContent || "").trim();
+                        if (!text || text.length > 180) return false;
+                        if (text.includes("برای شروع یکی از گفتگوها را انتخاب کنید")) return false;
+                        if (text.includes("همه پیام‌ها") || text.includes("گفتگوها")) return false;
+                        return true;
+                    });
+                    return nodes.map((el) => (el.innerText || el.textContent || "").trim()).filter(Boolean).slice(0, 10).join("\\n").slice(0, 500);
+                }"""
+            )
+            return str(text or "")
+        except Exception:
+            return ""
+
+    def _opened_chat_panel_contains_contact(self, page: Any, contact_name_lower: str) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """(name) => {
+                        const visible = (el) => {
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                        };
+                        return Array.from(document.querySelectorAll("body *")).some((el) => {
+                            if (!visible(el)) return false;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.x < 450 || rect.width < 100) return false;
+                            const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+                            return text.includes(name);
+                        });
+                    }""",
+                    contact_name_lower,
+                )
+            )
+        except Exception:
+            return False
 
     def _open_chat_from_contacts_fallback(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
         started = time.perf_counter()
@@ -1984,6 +2440,11 @@ class BalePlugin:
                 "result_count": len(candidates),
                 "result_text": result["contacts_result_text"],
                 "matched_text": str(match.get("text") or "") if match else "",
+                "stopped_after_match": False,
+                "clicked_selector": "",
+                "page_url_before_click": "",
+                "page_url_after_click": "",
+                "contact_open_confirmed_by": "",
             }
             result["contacts_query_attempts"].append(attempt)
             if not match:
@@ -1991,6 +2452,9 @@ class BalePlugin:
             result["matched_contact_text"] = str(match.get("text") or "")
             result["matched_contact_role"] = str(match.get("role") or "")
             result["matched_contact_box"] = match.get("box") or {}
+            clicked_selector = str(match.get("click_selector") or match.get("selector") or "")
+            attempt["clicked_selector"] = clicked_selector
+            attempt["page_url_before_click"] = _safe_page_url(page)
             click_result = self._click_search_result_candidate(page, match)
             if click_result.get("status") != "success":
                 result["contact_click_error"] = click_result
@@ -1998,17 +2462,22 @@ class BalePlugin:
                 result["chat_open_confirmed"] = False
                 result["duration_ms"] = int((time.perf_counter() - started) * 1000)
                 return result
+            attempt["page_url_after_click"] = _safe_page_url(page)
 
             chat_opened = self._confirm_chat_opened_for_contact(page, contact_naming_value, result["matched_contact_text"])
+            confirmation_reason = self._contact_open_confirmation_reason(page, contact_naming_value, result["matched_contact_text"])
+            attempt["contact_open_confirmed_by"] = confirmation_reason
             result["message_input_visible"] = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
             result["chat_url_has_uid"] = "uid=" in _safe_page_url(page).lower()
             result["right_chat_header_text"] = self._right_chat_header_text(page)
-            if chat_opened:
+            if chat_opened or confirmation_reason:
+                attempt["stopped_after_match"] = True
                 result.update({
                     "status": "success",
                     "matched_selector": match.get("click_selector") or match.get("selector"),
                     "page_url": _safe_page_url(page),
                     "chat_open_confirmed": True,
+                    "contact_open_confirmed_by": confirmation_reason or "chat_opened",
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                 })
                 return result
@@ -2020,10 +2489,14 @@ class BalePlugin:
             if message_button:
                 self._click_selector_short(page, message_button, timeout_ms=500)
                 chat_opened = self._confirm_chat_opened_for_contact(page, contact_naming_value, result["matched_contact_text"])
+                confirmation_reason = self._contact_open_confirmation_reason(page, contact_naming_value, result["matched_contact_text"])
+                attempt["contact_open_confirmed_by"] = confirmation_reason
                 result["message_input_visible"] = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
                 result["chat_url_has_uid"] = "uid=" in _safe_page_url(page).lower()
                 result["right_chat_header_text"] = self._right_chat_header_text(page)
-                if chat_opened:
+                if chat_opened or confirmation_reason:
+                    attempt["stopped_after_match"] = True
+                    attempt["page_url_after_click"] = _safe_page_url(page)
                     result.update(
                         {
                             "status": "success",
@@ -2031,10 +2504,24 @@ class BalePlugin:
                             "message_button_selector": message_button,
                             "page_url": _safe_page_url(page),
                             "chat_open_confirmed": True,
+                            "contact_open_confirmed_by": confirmation_reason or "chat_opened",
                             "duration_ms": int((time.perf_counter() - started) * 1000),
                         }
                     )
                     return result
+            if query == name_query:
+                attempt["stopped_after_match"] = True
+                attempt["page_url_after_click"] = _safe_page_url(page)
+                result.update(
+                    {
+                        "error_code": "chat_open_not_confirmed",
+                        "reason": "name_match_click_not_confirmed",
+                        "page_url": _safe_page_url(page),
+                        "chat_open_confirmed": False,
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    }
+                )
+                return result
 
         result["page_url"] = _safe_page_url(page)
         result["chat_open_confirmed"] = False
@@ -2081,7 +2568,7 @@ class BalePlugin:
         if selector:
             return result
 
-        search_icon = self._first_visible_selector(page, selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS + selectors.SEARCH_ICON_SVG_SELECTORS, timeout_ms=250)
+        search_icon = self._first_visible_selector(page, selectors.CONTACTS_SEARCH_ICON_SELECTORS, timeout_ms=250)
         result["contacts_search_icon_visible"] = bool(search_icon)
         if search_icon:
             click_result = self._click_chat_search_icon_target(page, search_icon)
@@ -2542,7 +3029,7 @@ class BalePlugin:
         self._log_step(account_id, action, "failed", error, error, error_code)
         return {
             "ok": False,
-            "logged_in": error_code != "not_logged_in",
+            "logged_in": error_code not in {"not_logged_in", "login_state_unknown"},
             "platform": self.platform_id,
             "account_id": account_id,
             "message": error,
@@ -2675,6 +3162,50 @@ _CHAT_UI_SELECTORS = [
     "main",
 ]
 
+_CHAT_LIST_SELECTORS = [
+    '[aria-label="dialog-item"]',
+    "[data-testid='chat-list']",
+    "[data-testid='conversation-list']",
+    "[role='list']",
+    "div[role='list']",
+    "[class*='chat-list']",
+    "[class*='ChatList']",
+    "[class*='conversation']",
+]
+
+_BALE_CHAT_TAB_SELECTORS = [
+    "text=\u0647\u0645\u0647",
+    "text=\u0634\u062e\u0635\u06cc",
+    "text=\u06af\u0631\u0648\u0647",
+    "text=\u062a\u0645\u0627\u0633",
+]
+
+_BALE_SIDE_MENU_SELECTORS = [
+    "text=\u06af\u0641\u062a\u06af\u0648",
+    "text=\u0645\u062e\u0627\u0637\u0628\u06cc\u0646",
+    "text=\u062e\u062f\u0645\u0627\u062a",
+    '[aria-label="Contacts-icon"]',
+    '[aria-label="Chat-icon"]',
+    '[aria-label="BoldContacts-icon"]',
+    '[aria-label="BoldChat-icon"]',
+]
+
+_CLEAR_LOGIN_FORM_SELECTORS = [
+    "input[type='tel']",
+    "input[name*='phone']",
+    "input[autocomplete='tel']",
+    "[data-testid='login-form']",
+    "[data-testid='phone-login']",
+    "[data-testid='phone-input']",
+    "[data-testid*='qr']",
+    "[aria-label*='phone']",
+    "[aria-label*='\u0634\u0645\u0627\u0631\u0647']",
+    "text=\u0634\u0645\u0627\u0631\u0647 \u0645\u0648\u0628\u0627\u06cc\u0644",
+    "text=\u0634\u0645\u0627\u0631\u0647 \u062a\u0644\u0641\u0646",
+    "text=Login with phone",
+    "text=Enter phone",
+]
+
 _LOGIN_FORM_SELECTORS = [
     "input[type='tel']",
     "input[name*='phone']",
@@ -2709,6 +3240,43 @@ def _safe_page_url(page: Any) -> str:
     except Exception:
         pass
     return ""
+
+
+def _safe_wait_for_timeout(page: Any, timeout_ms: int) -> None:
+    if timeout_ms <= 0:
+        return
+    try:
+        wait_for_timeout = getattr(page, "wait_for_timeout", None)
+        if callable(wait_for_timeout):
+            wait_for_timeout(timeout_ms)
+    except Exception:
+        return
+
+
+def _visible_text_sample(page: Any, limit: int = 500) -> str:
+    try:
+        body_text = page.locator("body").inner_text(timeout=500)
+        if body_text:
+            return " ".join(str(body_text).split())[:limit]
+    except Exception:
+        pass
+    try:
+        selector_text = getattr(page, "selector_text", {})
+        if isinstance(selector_text, dict):
+            combined = " ".join(str(value) for value in selector_text.values() if value)
+            return " ".join(combined.split())[:limit]
+    except Exception:
+        pass
+    return ""
+
+
+def _is_broad_chat_text(text: str) -> bool:
+    if "برای شروع یکی از گفتگوها را انتخاب کنید" in text:
+        return True
+    markers = ["همه پیام‌ها", "گفتگوها", "مخاطبین", "خدمات", "مجله"]
+    marker_count = sum(1 for marker in markers if marker in text)
+    line_count = len([line for line in text.splitlines() if line.strip()])
+    return bool((len(text) > 220 or line_count >= 8) and marker_count >= 2)
 
 
 def _safe_page_title(page: Any) -> str:
