@@ -38,6 +38,22 @@ from modules.automation_engine.scheduling import AccountGroupStore, CompliancePo
 from modules.automation_engine.scheduling.scheduler_history import SchedulerHistoryStore
 
 
+def _app_route_paths() -> set[str]:
+    paths = set()
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if path:
+            paths.add(path)
+        original_router = getattr(route, "original_router", None)
+        if original_router is not None:
+            paths.update(
+                nested_path
+                for nested_route in original_router.routes
+                if (nested_path := getattr(nested_route, "path", ""))
+            )
+    return paths
+
+
 class MockLocator:
     def __init__(self, selector: str, page: "MockPage") -> None:
         self.selector = selector
@@ -45,20 +61,39 @@ class MockLocator:
         self.first = self
 
     def wait_for(self, state: str, timeout: int) -> None:
+        self.page.timeouts.append(timeout)
         if state != "visible" or self.selector not in self.page.visible_selectors:
             raise TimeoutError(f"Selector not visible: {self.selector}")
 
-    def click(self, timeout: int) -> None:
+    def click(self, timeout: int, force: bool = False) -> None:
+        self.page.timeouts.append(timeout)
         self.page.click(self.selector, timeout)
 
-    def evaluate(self, script: str) -> None:
+    def evaluate(self, script: str) -> object:
+        if "rect.x > 500 && rect.y < 180" in script and self.page.right_header_text:
+            return self.page.right_header_text
+        if "tagName" in script or "className" in script:
+            return self.page.selector_eval.get(self.selector, {})
         self.page.dom_clicked.append((self.selector, script))
         self.page.click(self.selector, timeout=0)
+        return None
+
+    def bounding_box(self, timeout: int) -> dict[str, float] | None:
+        return self.page.bounding_boxes.get(self.selector, {"x": 10, "y": 10, "width": 20, "height": 20})
 
     def fill(self, text: str, timeout: int) -> None:
+        self.page.timeouts.append(timeout)
         self.page.fill(self.selector, text, timeout)
 
+    def input_value(self, timeout: int) -> str:
+        self.page.timeouts.append(timeout)
+        for selector, value in reversed(self.page.filled):
+            if selector == self.selector:
+                return value
+        return self.page.selector_attributes.get(self.selector, {}).get("value", "")
+
     def get_attribute(self, name: str, timeout: int) -> str | None:
+        self.page.timeouts.append(timeout)
         if name == "disabled" and self.selector in self.page.disabled_selectors:
             return ""
         if name == "aria-disabled" and self.selector in self.page.aria_disabled_selectors:
@@ -66,12 +101,15 @@ class MockLocator:
         return self.page.selector_attributes.get(self.selector, {}).get(name)
 
     def is_enabled(self, timeout: int) -> bool:
+        self.page.timeouts.append(timeout)
         return self.selector not in self.page.disabled_selectors and self.selector not in self.page.aria_disabled_selectors
 
     def type(self, text: str, timeout: int) -> None:
+        self.page.timeouts.append(timeout)
         self.page.typed.append((self.selector, text))
 
     def inner_text(self, timeout: int) -> str:
+        self.page.timeouts.append(timeout)
         return self.page.selector_text.get(self.selector, "")
 
 
@@ -96,6 +134,9 @@ class MockPage:
         disabled_selectors: set[str] | None = None,
         aria_disabled_selectors: set[str] | None = None,
         selector_attributes: dict[str, dict[str, str]] | None = None,
+        selector_eval: dict[str, dict[str, str]] | None = None,
+        bounding_boxes: dict[str, dict[str, float] | None] | None = None,
+        right_header_text: str = "",
     ) -> None:
         self.visible_selectors = visible_selectors
         self.selector_text = selector_text or {}
@@ -103,10 +144,14 @@ class MockPage:
         self.disabled_selectors = disabled_selectors or set()
         self.aria_disabled_selectors = aria_disabled_selectors or set()
         self.selector_attributes = selector_attributes or {}
+        self.selector_eval = selector_eval or {}
+        self.bounding_boxes = bounding_boxes or {}
+        self.right_header_text = right_header_text
         self.filled: list[tuple[str, str]] = []
         self.typed: list[tuple[str, str]] = []
         self.clicked: list[str] = []
         self.dom_clicked: list[tuple[str, str]] = []
+        self.timeouts: list[int] = []
         self.urls: list[str] = []
         self.url = url
         self.keyboard = MockKeyboard(self)
@@ -117,6 +162,11 @@ class MockPage:
 
     def locator(self, selector: str) -> MockLocator:
         return MockLocator(selector, self)
+
+    def evaluate(self, script: str) -> object:
+        if "rect.x > 500 && rect.y < 180" in script and self.right_header_text:
+            return self.right_header_text
+        return None
 
     def fill(self, selector: str, text: str, timeout: int) -> None:
         if selector not in self.visible_selectors:
@@ -131,6 +181,15 @@ class MockPage:
         self.clicked.append(selector)
         if ("button:has-text(\"Add\")" in selector or "button:has-text(\"افزودن\")" in selector) and self.auto_close_contact_modal:
             self.close_contact_modal()
+        if selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS and selectors.MESSAGE_INPUT_SELECTORS[0] in self.visible_selectors:
+            self.url = "https://web.bale.ai/chat?uid=mock"
+        if selector in selectors.CHAT_ITEM_SELECTORS:
+            self.url = "https://web.bale.ai/chat?uid=mock"
+        if selector in selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS and selectors.MESSAGE_INPUT_SELECTORS[0] in self.visible_selectors:
+            self.url = "https://web.bale.ai/chat?uid=mock"
+        if selector in selectors.CONTACT_MESSAGE_BUTTON_SELECTORS:
+            self.visible_selectors.add(selectors.MESSAGE_INPUT_SELECTORS[0])
+            self.url = "https://web.bale.ai/chat?uid=mock"
 
     def close_contact_modal(self) -> None:
         for selector in selectors.ADD_CONTACT_MODAL_SELECTORS:
@@ -169,6 +228,57 @@ class MockBrowserManager:
 
     def save_session(self, account_id: str) -> None:
         self.saved_accounts.append(account_id)
+
+
+class SearchOpensOnClickPage(MockPage):
+    def click(self, selector: str, timeout: int) -> None:
+        super().click(selector, timeout)
+        if selector in {selectors.SEARCH_ICON_SELECTORS[0], selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS[0]}:
+            self.visible_selectors.add(selectors.TEXT_SEARCH_INPUT_SELECTORS[2])
+        if selector in selectors.CHAT_ITEM_SELECTORS or selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS:
+            self.visible_selectors.add(selectors.MESSAGE_INPUT_SELECTORS[0])
+
+
+class SearchSvgInterceptedParentOpensPage(MockPage):
+    def click(self, selector: str, timeout: int) -> None:
+        if selector in selectors.SEARCH_ICON_SVG_SELECTORS:
+            raise TimeoutError('<div class="ZGzps0"></div> intercepts pointer events')
+        super().click(selector, timeout)
+        if selector == selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS[0]:
+            self.visible_selectors.add(selectors.TEXT_SEARCH_INPUT_SELECTORS[2])
+        if selector in selectors.CHAT_ITEM_SELECTORS or selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS:
+            self.visible_selectors.add(selectors.MESSAGE_INPUT_SELECTORS[0])
+
+
+class ContactsSearchAppearsAfterReloadPage(MockPage):
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        super().goto(url, wait_until)
+        if url.endswith("/contacts"):
+            self.visible_selectors.add('input[type="search"][placeholder="Search Contact..."]')
+
+
+class ContactsQueryResultPage(MockPage):
+    def __init__(
+        self,
+        visible_selectors: set[str],
+        query_results: dict[str, str],
+        row_selector: str = 'div[role="list"]',
+        **kwargs: object,
+    ) -> None:
+        super().__init__(visible_selectors, **kwargs)
+        self.query_results = query_results
+        self.row_selector = row_selector
+
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        super().fill(selector, text, timeout)
+        if selector in selectors.CONTACTS_SEARCH_INPUT_SELECTORS:
+            result_text = self.query_results.get(text, "")
+            if result_text:
+                self.visible_selectors.add(self.row_selector)
+                self.selector_text[self.row_selector] = result_text
+            else:
+                self.visible_selectors.discard(self.row_selector)
+                self.selector_text.pop(self.row_selector, None)
 
 
 class ThreadErrorBrowserManager(MockBrowserManager):
@@ -303,7 +413,7 @@ def test_send_text_message_uses_captured_message_input_and_enter_without_fake_su
             selectors.MESSAGE_INPUT_SELECTORS[0],
         },
         url="https://web.bale.ai/chat?uid=123",
-        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-GHAB-000001"},
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
     )
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
     result = plugin.send_text_message(
@@ -344,7 +454,7 @@ def test_send_text_message_saves_contact_with_captured_add_contact_modal_flow() 
             selectors.MESSAGE_SENT_INDICATOR_SELECTORS[0],
         },
         url="https://web.bale.ai/chat?uid=123",
-        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-GHAB-000001"},
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
     )
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
 
@@ -725,6 +835,402 @@ def test_send_text_message_target_not_found_returns_open_target_chat_failure() -
     assert result["search_attempts"]
 
 
+def test_open_target_chat_activates_search_from_icon_before_typing() -> None:
+    page = SearchOpensOnClickPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.CHAT_ITEM_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "ClinicOS_Bale_Test_Existing_001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(
+        page,
+        contact_naming_value="ClinicOS_Bale_Test_Existing_001",
+        normalized_phone="989304073331",
+    )
+
+    assert result["status"] == "success"
+    assert selectors.SEARCH_ICON_SELECTORS[0] in page.clicked
+    assert (selectors.TEXT_SEARCH_INPUT_SELECTORS[2], "ClinicOS_Bale_Test_Existing_001") in page.filled
+    assert result["search_attempts"][0]["match_mode"] == "contact_name"
+
+
+def test_open_target_chat_clicks_search_icon_parent_when_svg_is_intercepted() -> None:
+    parent_selector = selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS[0]
+    page = SearchSvgInterceptedParentOpensPage(
+        {
+            selectors.SEARCH_ICON_SVG_SELECTORS[0],
+            parent_selector,
+            selectors.CHAT_ITEM_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "ClinicOS_Bale_Test_Existing_001"},
+        selector_eval={
+            parent_selector: {
+                "tag": "BUTTON",
+                "className": "ZGzps0",
+                "role": "button",
+                "ariaLabel": "Search",
+                "text": "",
+            }
+        },
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(
+        page,
+        contact_naming_value="ClinicOS_Bale_Test_Existing_001",
+        normalized_phone="989304073331",
+    )
+
+    assert result["status"] == "success"
+    assert parent_selector in page.clicked
+    assert selectors.SEARCH_ICON_SVG_SELECTORS[0] not in page.clicked
+    assert (selectors.TEXT_SEARCH_INPUT_SELECTORS[2], "ClinicOS_Bale_Test_Existing_001") in page.filled
+
+
+def test_open_target_chat_matches_plus98_phone_result() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0]: "+989304073331"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "ClinicOS_Bale_Test_Existing_001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["search_attempts"][1]["match_mode"] == "phone"
+    assert selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0] in page.clicked
+
+
+def test_open_target_chat_matches_09_phone_result() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0]: "09304073331"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "ClinicOS_Bale_Test_Existing_001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["search_attempts"][1]["match_mode"] == "phone"
+
+
+def test_open_target_chat_clicks_nested_result_parent_after_text_match() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0]: "ClinicOS_Bale_Test_Existing_001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "ClinicOS_Bale_Test_Existing_001", "989304073331")
+
+    assert result["status"] == "success"
+    assert selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0] in page.clicked
+    assert result["matched_candidate_text"] == "ClinicOS_Bale_Test_Existing_001"
+
+
+def test_open_target_chat_does_not_succeed_without_matching_result() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0]: "Someone Else"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "ClinicOS_Bale_Test_Existing_001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "target_not_found"
+    assert selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0] not in page.clicked
+
+
+def test_open_target_chat_contacts_fallback_opens_chat_after_chat_search_no_result() -> None:
+    row_selector = 'div[role="list"]'
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            row_selector,
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={row_selector: "Bale-000001 last seen recently"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["chat_search_no_result"] is True
+    assert result["contacts_fallback_attempted"] is True
+    assert result["matched_candidate_text"] == "Bale-000001 last seen recently"
+    assert result["contacts_fallback"]["matched_contact_role"] == "list"
+    assert ('input[type="search"][placeholder="Search Contact..."]', "Bale-000001") in page.filled
+    assert row_selector in page.clicked
+
+
+def test_contacts_fallback_name_query_matches_row_without_phone_retry() -> None:
+    row_selector = 'div[role="list"]'
+    page = ContactsQueryResultPage(
+        {
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        query_results={"Bale-000001": "Bale-000001 last seen recently"},
+        row_selector=row_selector,
+        url="https://web.bale.ai/chat/search",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_chat_from_contacts_fallback(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_query_attempts"] == [
+        {
+            "query": "Bale-000001",
+            "input_value": "Bale-000001",
+            "result_count": 1,
+            "result_text": ["Bale-000001 last seen recently"],
+            "matched_text": "Bale-000001 last seen recently",
+        }
+    ]
+    assert (row_selector in page.clicked)
+    assert not any(value in {"989304073331", "09304073331", "9304073331"} for _, value in page.filled)
+
+
+def test_contacts_fallback_failed_name_query_then_tries_phone_variants() -> None:
+    row_selector = 'div[role="list"]'
+    page = ContactsQueryResultPage(
+        {
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        query_results={
+            "989304073331": "+989304073331 last seen recently",
+            "09304073331": "+989304073331 last seen recently",
+            "9304073331": "+989304073331 last seen recently",
+        },
+        row_selector=row_selector,
+        url="https://web.bale.ai/chat/search",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_chat_from_contacts_fallback(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_query_attempts"][0]["query"] == "Bale-000001"
+    assert result["contacts_query_attempts"][0]["result_count"] == 0
+    assert result["contacts_query_attempts"][0]["matched_text"] == ""
+    assert len(result["contacts_query_attempts"]) == 2
+    assert result["contacts_query_attempts"][1]["matched_text"] == "+989304073331 last seen recently"
+
+
+def test_contacts_fallback_failed_diagnostics_preserve_all_query_attempts_and_short_timeouts() -> None:
+    row_selector = 'div[role="list"]'
+    page = ContactsQueryResultPage(
+        {
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+        },
+        query_results={},
+        row_selector=row_selector,
+        url="https://web.bale.ai/chat/search",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_chat_from_contacts_fallback(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert [attempt["query"] for attempt in result["contacts_query_attempts"]][0] == "Bale-000001"
+    assert {"989304073331", "09304073331", "9304073331"}.issubset(
+        {attempt["query"] for attempt in result["contacts_query_attempts"]}
+    )
+    assert all(attempt["result_text"] == [] for attempt in result["contacts_query_attempts"])
+    assert all(timeout < 30000 for timeout in page.timeouts)
+
+
+def test_open_target_chat_contacts_fallback_nested_row_opens_clickable_parent() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0]: "+989304073331"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_fallback"]["matched_contact_text"] == "+989304073331"
+    assert selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0] in page.clicked
+
+
+def test_contacts_fallback_ignores_full_page_body_candidate() -> None:
+    body_selector = selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[1]
+    row_selector = selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0]
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            body_selector,
+            row_selector,
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={
+            body_selector: "گفتگو\n\nمجله\n\nخدمات\n\nمخاطبین\n\nساخت گروه\nساخت کانال\nافزودن مخاطب",
+            row_selector: "Bale-000001",
+        },
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_fallback"]["matched_contact_text"] == "Bale-000001"
+    assert body_selector not in page.clicked
+    assert row_selector in page.clicked
+
+
+def test_contacts_fallback_existing_message_input_and_header_confirms_chat() -> None:
+    row_selector = 'div[role="list"]'
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            row_selector,
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=1672056687",
+        selector_text={row_selector: "Bale-000001 last seen recently"},
+        right_header_text="Bale-000001",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_fallback"]["right_chat_header_text"] == "Bale-000001"
+    assert result["contacts_fallback"]["message_input_visible"] is True
+
+
+def test_open_target_chat_contacts_fallback_profile_message_button_opens_chat() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.CONTACT_PROFILE_SELECTORS[0],
+            selectors.CONTACT_MESSAGE_BUTTON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_fallback"]["message_button_visible"] is True
+    assert selectors.CONTACT_MESSAGE_BUTTON_SELECTORS[0] in page.clicked
+
+
+def test_open_target_chat_contacts_fallback_no_match_does_not_fake_success() -> None:
+    page = MockPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            'input[type="search"][placeholder="Search Contact..."]',
+            selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0]: "Someone Else"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["contacts_fallback_attempted"] is True
+    assert result["contacts_result_count"] >= 1
+    assert selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0] not in page.clicked
+
+
+def test_contacts_fallback_delayed_search_input_eventually_works() -> None:
+    page = ContactsSearchAppearsAfterReloadPage(
+        {
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["contacts_fallback"]["contacts_search_input_visible"] is True
+    assert ('input[type="search"][placeholder="Search Contact..."]', "Bale-000001") in page.filled
+
+
+def test_contacts_fallback_missing_search_input_returns_specific_error_without_scanning() -> None:
+    page = MockPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat/search",
+        selector_text={selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_chat_from_contacts_fallback(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "contacts_search_input_not_found"
+    assert result["contacts_result_count"] == 0
+    assert selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS[0] not in page.clicked
+
+
 def test_send_text_message_message_input_missing_returns_structured_error() -> None:
     page = MockPage(
         {
@@ -791,7 +1297,7 @@ def test_send_test_message_maps_greenlet_thread_error() -> None:
 
 
 def test_api_routes_import() -> None:
-    paths = {getattr(route, "path", "") for route in app.routes}
+    paths = _app_route_paths()
     assert "/automation/platforms/bale/open-account" in paths
     assert "/automation/platforms/bale/accounts/{account_id}/open-login" in paths
     assert "/automation/platforms/bale/accounts/{account_id}/check-login" in paths
@@ -2156,7 +2662,7 @@ def test_bale_plugin_explicit_adspower_unavailable_returns_friendly_error() -> N
 
 
 def test_bulk_plan_api_route_exists_and_does_not_open_browser() -> None:
-    paths = {getattr(route, "path", "") for route in app.routes}
+    paths = _app_route_paths()
     assert "/automation/bulk/campaigns/{campaign_id}/plan" in paths
     assert "/automation/bulk/contact-lists/import" in paths
     assert "/automation/bulk/contact-lists/manual" in paths
@@ -2212,6 +2718,23 @@ if __name__ == "__main__":
     test_send_text_message_uses_second_modal_input_name_fallback()
     test_bale_contact_phone_strips_iran_country_code_for_contact_modal()
     test_send_text_message_target_not_found_returns_open_target_chat_failure()
+    test_open_target_chat_activates_search_from_icon_before_typing()
+    test_open_target_chat_clicks_search_icon_parent_when_svg_is_intercepted()
+    test_open_target_chat_matches_plus98_phone_result()
+    test_open_target_chat_matches_09_phone_result()
+    test_open_target_chat_clicks_nested_result_parent_after_text_match()
+    test_open_target_chat_does_not_succeed_without_matching_result()
+    test_open_target_chat_contacts_fallback_opens_chat_after_chat_search_no_result()
+    test_contacts_fallback_name_query_matches_row_without_phone_retry()
+    test_contacts_fallback_failed_name_query_then_tries_phone_variants()
+    test_contacts_fallback_failed_diagnostics_preserve_all_query_attempts_and_short_timeouts()
+    test_open_target_chat_contacts_fallback_nested_row_opens_clickable_parent()
+    test_contacts_fallback_ignores_full_page_body_candidate()
+    test_contacts_fallback_existing_message_input_and_header_confirms_chat()
+    test_open_target_chat_contacts_fallback_profile_message_button_opens_chat()
+    test_open_target_chat_contacts_fallback_no_match_does_not_fake_success()
+    test_contacts_fallback_delayed_search_input_eventually_works()
+    test_contacts_fallback_missing_search_input_returns_specific_error_without_scanning()
     test_send_text_message_message_input_missing_returns_structured_error()
     test_send_test_message_message_input_missing_path()
     test_send_test_message_send_timeout_path()

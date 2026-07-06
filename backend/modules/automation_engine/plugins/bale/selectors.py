@@ -4,14 +4,32 @@ Selectors are isolated from automation logic because Bale Web DOM details can
 change independently of queue and campaign behavior.
 """
 
-SEARCH_ICON_SELECTORS = [
+SEARCH_ICON_SVG_SELECTORS = [
     '[aria-label="Search-icon"]',
     'svg[aria-label="Search-icon"]',
+]
+
+SEARCH_ICON_CLICK_TARGET_SELECTORS = [
+    'button:has([aria-label="Search-icon"])',
+    '[role="button"]:has([aria-label="Search-icon"])',
+    'div:has(> [aria-label="Search-icon"])',
+    'div:has(> svg[aria-label="Search-icon"])',
+    '[aria-label*="Search"]',
+    '[title*="Search"]',
+]
+
+SEARCH_ICON_SELECTORS = [
+    *SEARCH_ICON_CLICK_TARGET_SELECTORS,
+    *SEARCH_ICON_SVG_SELECTORS,
 ]
 
 TEXT_SEARCH_INPUT_SELECTORS = [
     'input[placeholder*="جستجو"]',
     'input[placeholder*="Search"]',
+    'input[type="search"]',
+    'input[aria-label*="Search"]',
+    'input[aria-label*="جستجو"]',
+    '[data-testid="chat-search-input"]',
     '[role="textbox"]',
     '[contenteditable="true"]',
 ]
@@ -31,6 +49,16 @@ CHAT_ITEM_SELECTORS = [
     "[data-testid='chat-list-item']",
     "[role='listitem']",
     "[data-testid*='chat']",
+]
+
+SEARCH_RESULT_CANDIDATE_SELECTORS = [
+    '[aria-label="dialog-item"]',
+    "[data-testid='chat-list-item']",
+    "[role='listitem']",
+    "[data-testid*='chat']",
+    '[role="button"]',
+    "a",
+    "div",
 ]
 
 MESSAGE_INPUT_SELECTORS = [
@@ -63,12 +91,62 @@ CONTACTS_PAGE_ENTRYPOINT_SELECTORS = [
     'svg[aria-label="BoldContacts-icon"]',
 ]
 
+CHAT_PAGE_ENTRYPOINT_SELECTORS = [
+    '[aria-label="Chat-icon"]',
+    'svg[aria-label="Chat-icon"]',
+    '[aria-label="Chats-icon"]',
+    'svg[aria-label="Chats-icon"]',
+    '[aria-label="BoldChat-icon"]',
+    'svg[aria-label="BoldChat-icon"]',
+    '[aria-label="Message-icon"]',
+    'svg[aria-label="Message-icon"]',
+]
+
 CONTACTS_UI_READY_SELECTORS = [
     '[aria-label="AddUser-icon"]',
     'svg[aria-label="AddUser-icon"]',
     ".ReactModal__Overlay",
     ".ReactModal__Content",
     'text=Add Contact',
+]
+
+CONTACTS_SEARCH_INPUT_SELECTORS = [
+    'input[type="search"][placeholder="Search Contact..."]',
+    'input[placeholder="Search Contact..."]',
+    'input[type="search"]',
+    'input[placeholder*="جستجو"]',
+    'input[placeholder*="Search"]',
+    '[role="textbox"]',
+    '[contenteditable="true"]',
+]
+
+CONTACTS_RESULT_CANDIDATE_SELECTORS = [
+    'div[role="list"]',
+    '[role="listitem"]',
+    '[role="button"]',
+    '[aria-label*="contact"]',
+    '[aria-label*="Contact"]',
+    '[data-testid*="contact"]',
+    'div[class*="contact"]',
+    "a",
+]
+
+CONTACT_PROFILE_SELECTORS = [
+    '[role="dialog"]',
+    ".ReactModal__Content",
+    '[data-testid*="profile"]',
+    '[class*="profile"]',
+]
+
+CONTACT_MESSAGE_BUTTON_SELECTORS = [
+    '[aria-label*="Message"]',
+    '[aria-label*="Chat"]',
+    '[aria-label*="پیام"]',
+    'button:has-text("Message")',
+    'button:has-text("Chat")',
+    '[role="button"]:has-text("Message")',
+    '[role="button"]:has-text("Chat")',
+    '[role="button"]:has-text("پیام")',
 ]
 
 ADD_CONTACT_ENTRYPOINT_SELECTORS = [

@@ -320,6 +320,7 @@ class BalePlugin:
                 "user_message": user_message,
                 "error_code": error_code,
                 "failed_step": failed_step,
+                "last_successful_step": _last_successful_step(step_results) if not ok else None,
                 "step_results": step_results,
                 "started_at": started_at,
                 "finished_at": finished_at,
@@ -385,10 +386,22 @@ class BalePlugin:
                         diagnostics,
                     )
 
+                return_result = self._return_to_chat_after_contact_save(page, contact_naming_value, normalized_phone)
+                step_results.append(return_result)
+                if return_result["status"] != "success":
+                    diagnostics = {**self._page_debug_info(page, account_id), **return_result}
+                    return finish(
+                        False,
+                        str(return_result.get("error_code") or "return_to_chat_failed"),
+                        "Bale chat/search UI was not ready after saving contact.",
+                        "return_to_chat_after_contact_save",
+                        diagnostics,
+                    )
+
                 search_result = self._open_target_chat(page, contact_naming_value, normalized_phone)
                 step_results.append(search_result)
                 if search_result["status"] != "success":
-                    diagnostics = {**self._page_debug_info(page, account_id), "search_attempts": search_result.get("search_attempts", [])}
+                    diagnostics = {**self._page_debug_info(page, account_id), **search_result}
                     return finish(
                         False,
                         "target_not_found",
@@ -397,9 +410,12 @@ class BalePlugin:
                         diagnostics,
                     )
 
-                message_input = self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=5000)
+                message_input = self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=2500)
                 if not message_input:
-                    diagnostics = self._page_debug_info(page, account_id)
+                    diagnostics = {
+                        **self._page_debug_info(page, account_id),
+                        **self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=contact_naming_value or normalized_phone),
+                    }
                     self._add_step(step_results, "type_message", "failed", error_code="message_input_not_found", **diagnostics)
                     return finish(False, "message_input_not_found", "Bale message input was not found", "type_message", diagnostics)
                 self._add_step(step_results, "type_message", "started", selector=message_input)
@@ -417,7 +433,10 @@ class BalePlugin:
                     self._add_step(step_results, "confirm_sent", "success", matched_selector=sent_selector)
                     return finish(True, None, "Bale text message sent", None, {"current_url": _safe_page_url(page)})
 
-                diagnostics = self._page_debug_info(page, account_id)
+                diagnostics = {
+                    **self._page_debug_info(page, account_id),
+                    **self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=contact_naming_value or normalized_phone),
+                }
                 self._add_step(step_results, "confirm_sent", "failed", error_code="send_confirmation_not_implemented", **diagnostics)
                 return finish(
                     False,
@@ -827,28 +846,92 @@ class BalePlugin:
             info["screenshot_path"] = screenshot_path
         return info
 
+    def _return_to_chat_after_contact_save(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        result: dict[str, Any] = {
+            "step": "return_to_chat_after_contact_save",
+            "status": "failed",
+            "contact_naming_value": contact_naming_value,
+            "normalized_phone": normalized_phone,
+        }
+
+        modal_was_visible = self._is_contact_modal_visible(page)
+        if modal_was_visible:
+            self._close_contact_modal_if_open(page)
+
+        main_ready = self._first_visible_selector(
+            page,
+            selectors.SEARCH_ICON_SELECTORS + selectors.TEXT_SEARCH_INPUT_SELECTORS + selectors.CHAT_ITEM_SELECTORS,
+            timeout_ms=250,
+        )
+        contacts_visible = self._contacts_ui_visible(page)
+        if main_ready and not contacts_visible:
+            result.update(
+                {
+                    "status": "success",
+                    "mode": "already_ready",
+                    "main_chat_ui_visible": True,
+                    "contacts_ui_visible": False,
+                    "ready_selector": main_ready,
+                    "page_url": _safe_page_url(page),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
+            )
+            return result
+
+        if "/contacts" in _safe_page_url(page).lower() or contacts_visible:
+            try:
+                page.goto(self.web_url, wait_until="load")
+                result["navigation"] = "goto_home"
+            except Exception as exc:
+                result["navigation_error"] = str(exc)
+
+        main_ready = self._first_visible_selector(
+            page,
+            selectors.SEARCH_ICON_SELECTORS + selectors.TEXT_SEARCH_INPUT_SELECTORS + selectors.CHAT_ITEM_SELECTORS,
+            timeout_ms=800,
+        )
+        if not main_ready:
+            chat_entrypoint = self._first_visible_selector(page, selectors.CHAT_PAGE_ENTRYPOINT_SELECTORS, timeout_ms=300)
+            if chat_entrypoint:
+                self._click_if_possible(page, chat_entrypoint)
+                result["chat_entrypoint_selector"] = chat_entrypoint
+                main_ready = self._first_visible_selector(
+                    page,
+                    selectors.SEARCH_ICON_SELECTORS + selectors.TEXT_SEARCH_INPUT_SELECTORS + selectors.CHAT_ITEM_SELECTORS,
+                    timeout_ms=700,
+                )
+
+        diagnostics = self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value="")
+        result.update(diagnostics)
+        result["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        if main_ready:
+            result.update({"status": "success", "ready_selector": main_ready, "main_chat_ui_visible": True})
+            return result
+
+        result.update({"error_code": "main_chat_ui_not_ready", "failed_step": "return_to_chat_after_contact_save"})
+        return result
+
     def _open_target_chat(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
+        started = time.perf_counter()
         search_attempts: list[dict[str, Any]] = []
-        self._close_contact_modal_if_open(page)
-        try:
-            page.goto(self.web_url, wait_until="load")
-        except Exception:
-            pass
-        chat_ready = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS + selectors.CHAT_ITEM_SELECTORS, timeout_ms=1500)
-        search_icon = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS, timeout_ms=1500)
-        if search_icon:
-            self._click_if_possible(page, search_icon)
-        search_input = self._first_visible_selector(page, selectors.TEXT_SEARCH_INPUT_SELECTORS, timeout_ms=2500)
+        search_open = self._open_chat_search_from_main_ui(page, contact_naming_value, normalized_phone)
+        search_input = str(search_open.get("search_input_selector") or "")
         if not search_input:
+            diagnostics = self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=contact_naming_value or normalized_phone)
             return {
                 "step": "open_target_chat",
                 "status": "failed",
-                "error_code": "target_not_found",
-                "current_url": _safe_page_url(page),
-                "overlay_present": self._is_contact_modal_visible(page),
-                "active_element": self._active_element_info(page),
-                "chat_ready_selector": chat_ready or "",
+                "error_code": "search_input_not_found",
+                "page_url": _safe_page_url(page),
+                "active_element": search_open.get("active_element") or self._active_element_info(page),
+                "search_icon_visible": search_open.get("search_icon_visible", False),
+                "search_icon_clicked": search_open.get("search_icon_clicked", ""),
+                "activation_attempts": search_open.get("activation_attempts", []),
+                "dom_diagnostics": self._compact_chat_search_dom_diagnostics(page),
                 "search_attempts": [{"query": contact_naming_value or normalized_phone, "reason": "search_input_not_found"}],
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                **diagnostics,
             }
 
         for query in [contact_naming_value, normalized_phone]:
@@ -857,35 +940,97 @@ class BalePlugin:
                 continue
             attempt = {"query": query, "matched": False}
             search_attempts.append(attempt)
+            if len(search_attempts) > 1:
+                self._clear_search_input(page, search_input)
             self._fill_or_type(page, search_input, query)
-            chat_item = self._first_visible_selector(page, selectors.CHAT_ITEM_SELECTORS, timeout_ms=2500)
-            if chat_item and self._selector_text_matches(page, chat_item, query):
-                self._click_if_possible(page, chat_item)
-                attempt["matched"] = True
-                attempt["matched_selector"] = chat_item
-                return {
-                    "step": "open_target_chat",
-                    "status": "success",
-                    "matched_selector": chat_item,
-                    "search_attempts": search_attempts,
-                }
-            if chat_item:
-                self._click_if_possible(page, chat_item)
-                attempt["matched"] = True
-                attempt["matched_selector"] = chat_item
-                attempt["match_mode"] = "first_visible_dialog_item"
-                return {
-                    "step": "open_target_chat",
-                    "status": "success",
-                    "matched_selector": chat_item,
-                    "search_attempts": search_attempts,
-                }
-            attempt["reason"] = "dialog_item_not_found"
+            candidates = self._collect_search_result_candidates(page, timeout_ms=1500)
+            match = self._match_search_result_candidate(candidates, query, contact_naming_value, normalized_phone)
+            attempt["result_candidate_count"] = len(candidates)
+            attempt["result_candidates_text"] = [item.get("text", "") for item in candidates[:15]]
+            attempt["normalized_candidates"] = [item.get("normalized_text", "") for item in candidates[:15]]
+            if match:
+                click_result = self._click_search_result_candidate(page, match)
+                attempt["matched"] = click_result["status"] == "success"
+                attempt["matched_selector"] = match.get("click_selector") or match.get("selector")
+                attempt["matched_candidate_text"] = match.get("text", "")
+                attempt["match_mode"] = match.get("match_mode", "normalized_text_match")
+                attempt["click_method"] = click_result.get("click_method", "")
+                chat_opened = self._confirm_chat_opened(page)
+                attempt["chat_open_confirmed"] = chat_opened
+                if chat_opened:
+                    return {
+                        "step": "open_target_chat",
+                        "status": "success",
+                        "matched_selector": attempt["matched_selector"],
+                        "matched_candidate_text": attempt["matched_candidate_text"],
+                        "search_attempts": search_attempts,
+                        "chat_open_confirmed": True,
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    }
+                attempt["reason"] = "chat_open_not_confirmed"
+            else:
+                attempt["reason"] = "dialog_item_not_found"
+        searched_value = search_attempts[-1]["query"] if search_attempts else ""
+        last_attempt = search_attempts[-1] if search_attempts else {}
+        contacts_fallback = self._open_chat_from_contacts_fallback(page, contact_naming_value, normalized_phone)
+        if contacts_fallback.get("status") == "success":
+            return {
+                "step": "open_target_chat",
+                "status": "success",
+                "search_attempts": search_attempts,
+                "chat_search_no_result": True,
+                "contacts_fallback_attempted": True,
+                "contacts_fallback": contacts_fallback,
+                "contacts_query_attempts": contacts_fallback.get("contacts_query_attempts", []),
+                "matched_selector": contacts_fallback.get("matched_selector", ""),
+                "matched_candidate_text": contacts_fallback.get("matched_contact_text", ""),
+                "chat_open_confirmed": True,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
         return {
             "step": "open_target_chat",
             "status": "failed",
             "error_code": "target_not_found",
             "search_attempts": search_attempts,
+            "chat_search_no_result": True,
+            "contacts_fallback_attempted": True,
+            "contacts_fallback": contacts_fallback,
+            "contacts_query_attempts": contacts_fallback.get("contacts_query_attempts", []),
+            "contacts_search_value": contacts_fallback.get("contacts_search_value", ""),
+            "contacts_result_count": contacts_fallback.get("contacts_result_count", 0),
+            "contacts_result_text": contacts_fallback.get("contacts_result_text", []),
+            "matched_contact_text": contacts_fallback.get("matched_contact_text", ""),
+            "matched_contact_role": contacts_fallback.get("matched_contact_role", ""),
+            "matched_contact_box": contacts_fallback.get("matched_contact_box", {}),
+            "right_chat_header_text": contacts_fallback.get("right_chat_header_text", ""),
+            "contact_profile_visible": contacts_fallback.get("contact_profile_visible", False),
+            "message_button_visible": contacts_fallback.get("message_button_visible", False),
+            "contacts_search_input_selector": contacts_fallback.get("contacts_search_input_selector", ""),
+            "contacts_search_input_value": contacts_fallback.get("contacts_search_input_value", ""),
+            "contacts_search_input_visible": contacts_fallback.get("contacts_search_input_visible", False),
+            "contacts_list_scoped": contacts_fallback.get("contacts_list_scoped", False),
+            "chat_url_has_uid": contacts_fallback.get("chat_url_has_uid", False),
+            "message_input_visible": contacts_fallback.get("message_input_visible", False),
+            "contacts_search_ready_attempts": contacts_fallback.get("contacts_search_ready_attempts", []),
+            "contacts_search_icon_visible": contacts_fallback.get("contacts_search_icon_visible", False),
+            "contacts_search_icon_clicked": contacts_fallback.get("contacts_search_icon_clicked", ""),
+            "contacts_page_url_before": contacts_fallback.get("contacts_page_url_before", ""),
+            "contacts_page_url_after": contacts_fallback.get("contacts_page_url_after", ""),
+            "contacts_header_text": contacts_fallback.get("contacts_header_text", ""),
+            "visible_inputs": contacts_fallback.get("visible_inputs", []),
+            "visible_top_svgs": contacts_fallback.get("visible_top_svgs", []),
+            "contacts_panel_box": contacts_fallback.get("contacts_panel_box", {}),
+            "search_input_value": self._search_input_value(page, search_input),
+            "result_candidate_count": last_attempt.get("result_candidate_count", 0),
+            "result_candidates_text": last_attempt.get("result_candidates_text", []),
+            "matched_candidate_text": last_attempt.get("matched_candidate_text", ""),
+            "normalized_candidates": last_attempt.get("normalized_candidates", []),
+            "visible_no_result_text": self._visible_no_result_text(page),
+            "search_url": _safe_page_url(page),
+            "active_element": self._active_element_info(page),
+            "search_input_placeholder": self._locator_attribute(page, search_input, "placeholder"),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            **self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=searched_value),
         }
 
     def _save_contact_from_modal(
@@ -1377,6 +1522,920 @@ class BalePlugin:
     def _is_contact_modal_visible(self, page: Any) -> bool:
         return bool(self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=100))
 
+    def _contacts_ui_visible(self, page: Any) -> bool:
+        if "/contacts" in _safe_page_url(page).lower():
+            return True
+        return bool(self._first_visible_selector(page, selectors.CONTACTS_UI_READY_SELECTORS, timeout_ms=100))
+
+    def _main_chat_ui_visible(self, page: Any) -> bool:
+        return bool(
+            self._first_visible_selector(
+                page,
+                selectors.SEARCH_ICON_SELECTORS + selectors.TEXT_SEARCH_INPUT_SELECTORS + selectors.CHAT_ITEM_SELECTORS,
+                timeout_ms=100,
+            )
+        )
+
+    def _open_chat_search_from_main_ui(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        attempts: list[dict[str, Any]] = []
+        result: dict[str, Any] = {
+            "status": "failed",
+            "search_input_selector": "",
+            "search_icon_visible": False,
+            "search_icon_clicked": "",
+            "activation_attempts": attempts,
+            "contact_naming_value": contact_naming_value,
+            "normalized_phone": normalized_phone,
+        }
+
+        def check_input(mode: str, timeout_ms: int = 200) -> str:
+            selector = self._first_visible_selector(page, selectors.TEXT_SEARCH_INPUT_SELECTORS, timeout_ms=timeout_ms)
+            if selector:
+                attempts.append({"mode": mode, "status": "success", "selector": selector})
+                return selector
+            focused = self._focused_editable_selector(page)
+            if focused:
+                attempts.append({"mode": mode, "status": "success", "selector": focused, "focused": True})
+                return focused
+            attempts.append({"mode": mode, "status": "failed"})
+            return ""
+
+        search_input = check_input("existing_input", timeout_ms=200)
+        if search_input:
+            result.update({"status": "success", "search_input_selector": search_input, "duration_ms": int((time.perf_counter() - started) * 1000)})
+            return result
+
+        search_icon = self._first_visible_selector(page, selectors.SEARCH_ICON_SELECTORS, timeout_ms=300)
+        result["search_icon_visible"] = bool(search_icon)
+        if search_icon:
+            click_result = self._click_chat_search_icon_target(page, search_icon)
+            result.update({key: value for key, value in click_result.items() if key != "status"})
+            if click_result.get("status") == "success":
+                result["search_icon_clicked"] = str(click_result.get("selector") or "")
+            attempts.append({"mode": "click_search_icon", **click_result})
+            search_input = check_input("after_search_icon", timeout_ms=350)
+            if search_input:
+                result.update({"status": "success", "search_input_selector": search_input, "duration_ms": int((time.perf_counter() - started) * 1000)})
+                return result
+
+        for shortcut in ["Control+K", "Control+F"]:
+            if int((time.perf_counter() - started) * 1000) >= 1500:
+                break
+            try:
+                self._press_key(page, shortcut)
+                attempts.append({"mode": "keyboard_shortcut", "status": "success", "shortcut": shortcut})
+            except Exception as exc:
+                attempts.append({"mode": "keyboard_shortcut", "status": "failed", "shortcut": shortcut, "error": str(exc)})
+            search_input = check_input(f"after_{shortcut}", timeout_ms=300)
+            if search_input:
+                result.update({"status": "success", "search_input_selector": search_input, "duration_ms": int((time.perf_counter() - started) * 1000)})
+                return result
+
+        result.update(
+            {
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "active_element": self._active_element_info(page),
+            }
+        )
+        return result
+
+    def _click_chat_search_icon_target(self, page: Any, search_icon_selector: str) -> dict[str, Any]:
+        target = self._resolve_search_icon_click_target(page, search_icon_selector)
+        selector = str(target.get("selector") or search_icon_selector)
+        locator = page.locator(selector).first
+        base = {
+            "selector": selector,
+            "search_icon_svg_selector": target.get("search_icon_svg_selector") or search_icon_selector,
+            "clickable_parent_tag": target.get("tag", ""),
+            "clickable_parent_class": target.get("className", ""),
+            "clickable_parent_role": target.get("role", ""),
+            "clickable_parent_aria_label": target.get("ariaLabel", ""),
+            "clickable_parent_text": target.get("text", ""),
+        }
+        for method, kwargs in [
+            ("playwright_click", {"timeout": 400}),
+            ("force_click", {"timeout": 400, "force": True}),
+        ]:
+            try:
+                locator.click(**kwargs)
+                return {"status": "success", "click_method": method, **base}
+            except Exception as exc:
+                base["pointer_intercepted_by"] = _pointer_interceptor_from_error(str(exc)) or base.get("pointer_intercepted_by", "")
+                base[f"{method}_error"] = str(exc)
+
+        for method, script in [
+            ("dom_click", "(el) => el.click()"),
+            ("mouse_event_click", '(el) => el.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, view: window}))'),
+        ]:
+            try:
+                locator.evaluate(script)
+                return {"status": "success", "click_method": method, **base}
+            except Exception as exc:
+                base[f"{method}_error"] = str(exc)
+
+        try:
+            box = locator.bounding_box(timeout=200)
+            if box:
+                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                return {"status": "success", "click_method": "coordinate_click", **base}
+        except Exception as exc:
+            base["coordinate_click_error"] = str(exc)
+
+        return {"status": "failed", "click_method": "", **base}
+
+    def _resolve_search_icon_click_target(self, page: Any, search_icon_selector: str) -> dict[str, Any]:
+        direct_target = self._first_visible_selector(page, selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS, timeout_ms=150)
+        if direct_target and direct_target not in selectors.SEARCH_ICON_SVG_SELECTORS:
+            return self._click_target_info(page, direct_target, search_icon_selector)
+        try:
+            info = page.locator(search_icon_selector).first.evaluate(
+                """(el) => {
+                    let node = el;
+                    for (let depth = 0; node && depth <= 5; depth += 1, node = node.parentElement) {
+                        if (!(node instanceof HTMLElement)) continue;
+                        const style = window.getComputedStyle(node);
+                        const role = node.getAttribute("role") || "";
+                        const clickable = node.tagName === "BUTTON" ||
+                            role === "button" ||
+                            style.cursor === "pointer" ||
+                            typeof node.onclick === "function";
+                        if (clickable && node !== el) {
+                            return {
+                                selector: node.id ? `#${node.id}` : "",
+                                tag: node.tagName || "",
+                                className: node.className || "",
+                                role,
+                                ariaLabel: node.getAttribute("aria-label") || "",
+                                text: (node.innerText || node.textContent || "").trim().slice(0, 120)
+                            };
+                        }
+                    }
+                    return {};
+                }"""
+            )
+            if isinstance(info, dict) and info:
+                if not info.get("selector"):
+                    info["selector"] = search_icon_selector + " >> xpath=ancestor::*[self::button or @role='button' or contains(@style,'cursor')][1]"
+                info["search_icon_svg_selector"] = search_icon_selector
+                return info
+        except Exception:
+            pass
+        return self._click_target_info(page, search_icon_selector, search_icon_selector)
+
+    def _click_target_info(self, page: Any, selector: str, svg_selector: str) -> dict[str, Any]:
+        info = {
+            "selector": selector,
+            "search_icon_svg_selector": svg_selector,
+            "tag": "",
+            "className": "",
+            "role": "",
+            "ariaLabel": "",
+            "text": "",
+        }
+        try:
+            details = page.locator(selector).first.evaluate(
+                """(el) => ({
+                    tag: el.tagName || "",
+                    className: el.className || "",
+                    role: el.getAttribute("role") || "",
+                    ariaLabel: el.getAttribute("aria-label") || "",
+                    text: (el.innerText || el.textContent || "").trim().slice(0, 120)
+                })"""
+            )
+            if isinstance(details, dict):
+                info.update(details)
+        except Exception:
+            pass
+        return info
+
+    def _collect_search_result_candidates(self, page: Any, timeout_ms: int = 1500) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        while time.monotonic() < deadline:
+            candidates = self._visible_search_result_candidates(page)
+            filtered = []
+            for item in candidates:
+                key = str(item.get("selector") or item.get("text") or "")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                filtered.append(item)
+            if filtered:
+                return filtered[:30]
+            time.sleep(0.15)
+        return candidates[:30]
+
+    def _visible_search_result_candidates(self, page: Any) -> list[dict[str, Any]]:
+        try:
+            data = page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                    };
+                    const clickableParent = (el) => {
+                        let node = el;
+                        for (let depth = 0; node && depth <= 5; depth += 1, node = node.parentElement) {
+                            if (!(node instanceof HTMLElement)) continue;
+                            const style = window.getComputedStyle(node);
+                            const role = node.getAttribute("role") || "";
+                            if (node.tagName === "BUTTON" || node.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer" || typeof node.onclick === "function") {
+                                return node;
+                            }
+                        }
+                        return el;
+                    };
+                    const selectorFor = (el) => {
+                        if (!el) return "";
+                        const tag = el.tagName ? el.tagName.toLowerCase() : "*";
+                        if (el.id) return `${tag}#${CSS.escape(el.id)}`;
+                        const aria = el.getAttribute("aria-label");
+                        if (aria) return `${tag}[aria-label="${aria.replaceAll('"', '\\"')}"]`;
+                        const role = el.getAttribute("role");
+                        if (role) return `${tag}[role="${role}"]`;
+                        const testid = el.getAttribute("data-testid");
+                        if (testid) return `${tag}[data-testid="${testid.replaceAll('"', '\\"')}"]`;
+                        return "";
+                    };
+                    const nodes = Array.from(document.querySelectorAll('[aria-label="dialog-item"], [data-testid="chat-list-item"], [role="listitem"], [data-testid*="chat"], [role="button"], a, div'));
+                    const rows = [];
+                    const seen = new Set();
+                    for (const el of nodes) {
+                        if (!visible(el)) continue;
+                        const text = (el.innerText || el.textContent || "").trim();
+                        if (!text || text.length > 500) continue;
+                        const click = clickableParent(el);
+                        const selector = selectorFor(el);
+                        const clickSelector = selectorFor(click) || selector;
+                        const key = `${selector}|${text}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        rows.push({
+                            selector,
+                            click_selector: clickSelector,
+                            text,
+                            tag: el.tagName || "",
+                            role: el.getAttribute("role") || "",
+                            ariaLabel: el.getAttribute("aria-label") || "",
+                            clickTag: click ? click.tagName || "" : "",
+                            clickRole: click ? click.getAttribute("role") || "" : "",
+                            clickText: click ? (click.innerText || click.textContent || "").trim().slice(0, 200) : ""
+                        });
+                        if (rows.length >= 30) break;
+                    }
+                    return rows;
+                }"""
+            )
+            if isinstance(data, list):
+                return [self._candidate_with_normalized_text(item) for item in data if isinstance(item, dict)]
+        except Exception:
+            pass
+        return self._selector_search_result_candidates(page)
+
+    def _selector_search_result_candidates(self, page: Any) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=150)
+                text = str(locator.inner_text(timeout=150) or "").strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            candidates.append(
+                self._candidate_with_normalized_text(
+                    {"selector": selector, "click_selector": selector, "text": text}
+                )
+            )
+        return candidates[:30]
+
+    def _candidate_with_normalized_text(self, item: dict[str, Any]) -> dict[str, Any]:
+        text = str(item.get("text") or "")
+        item["normalized_text"] = _normalize_bale_match_text(text)
+        item["normalized_phone_text"] = _normalize_bale_phone_text(text)
+        return item
+
+    def _match_search_result_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        query: str,
+        contact_naming_value: str,
+        normalized_phone: str,
+    ) -> dict[str, Any] | None:
+        name = str(contact_naming_value or "").strip().lower()
+        phone_values = _bale_phone_match_values(normalized_phone)
+        query_phone_values = _bale_phone_match_values(query)
+        query_is_phone = len(_normalize_bale_phone_text(query)) >= 10
+        all_phone_values = (phone_values | query_phone_values) if query_is_phone else set()
+        for candidate in candidates:
+            text = str(candidate.get("text") or "")
+            normalized_text = str(candidate.get("normalized_text") or "")
+            normalized_phone_text = str(candidate.get("normalized_phone_text") or "")
+            if name and name in text.lower():
+                candidate["match_mode"] = "contact_name"
+                return candidate
+            for phone_value in all_phone_values:
+                if phone_value and phone_value in normalized_phone_text:
+                    candidate["match_mode"] = "phone"
+                    return candidate
+            query_text = _normalize_bale_match_text(query)
+            if query_text and query_text in normalized_text:
+                candidate["match_mode"] = "query_text"
+                return candidate
+        return None
+
+    def _click_search_result_candidate(self, page: Any, candidate: dict[str, Any]) -> dict[str, Any]:
+        selector = str(candidate.get("click_selector") or candidate.get("selector") or "")
+        if not selector:
+            return {"status": "failed", "error": "candidate_selector_missing"}
+        locator = page.locator(selector).first
+        try:
+            locator.click(timeout=800)
+            return {"status": "success", "click_method": "playwright_click"}
+        except Exception as click_error:
+            try:
+                locator.evaluate("(el) => el.click()")
+                return {"status": "success", "click_method": "dom_click", "playwright_click_error": str(click_error)}
+            except Exception as dom_error:
+                return {"status": "failed", "click_error": str(click_error), "dom_click_error": str(dom_error)}
+
+    def _confirm_chat_opened(self, page: Any) -> bool:
+        if self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=1200):
+            return True
+        current_url = _safe_page_url(page).lower()
+        return "/chat/" in current_url or "uid=" in current_url
+
+    def _confirm_chat_opened_for_contact(
+        self,
+        page: Any,
+        contact_naming_value: str,
+        matched_contact_text: str = "",
+    ) -> bool:
+        message_input_visible = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=400))
+        if "uid=" in _safe_page_url(page).lower():
+            return True
+        header_text = self._right_chat_header_text(page)
+        name = str(contact_naming_value or "").strip().lower()
+        if name and name in header_text.lower():
+            return True
+        return bool(message_input_visible and matched_contact_text and name and name in matched_contact_text.lower())
+
+    def _right_chat_header_text(self, page: Any) -> str:
+        try:
+            text = page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                    };
+                    const nodes = Array.from(document.querySelectorAll("body *")).filter(visible).filter((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.x > 500 && rect.y < 180;
+                    });
+                    return nodes.map((el) => (el.innerText || el.textContent || "").trim()).filter(Boolean).slice(0, 20).join("\\n").slice(0, 1000);
+                }"""
+            )
+            return str(text or "")
+        except Exception:
+            return ""
+
+    def _open_chat_from_contacts_fallback(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        result: dict[str, Any] = {
+            "status": "failed",
+            "error_code": "target_not_found",
+            "contacts_search_value": "",
+            "contacts_query_attempts": [],
+            "contacts_result_count": 0,
+            "contacts_result_text": [],
+            "matched_contact_text": "",
+            "matched_contact_role": "",
+            "matched_contact_box": {},
+            "right_chat_header_text": "",
+            "contact_profile_visible": False,
+            "message_button_visible": False,
+            "contacts_search_input_selector": "",
+            "contacts_search_input_value": "",
+            "contacts_search_input_visible": False,
+            "contacts_list_scoped": True,
+            "chat_url_has_uid": False,
+            "message_input_visible": False,
+            "contacts_search_ready_attempts": [],
+            "contacts_search_icon_visible": False,
+            "contacts_search_icon_clicked": "",
+            "contacts_page_url_before": "",
+            "contacts_page_url_after": "",
+            "contacts_header_text": "",
+            "visible_inputs": [],
+            "visible_top_svgs": [],
+            "contacts_panel_box": {},
+            "page_url": _safe_page_url(page),
+        }
+
+        contacts_url = f"{self.web_url}/contacts"
+        try:
+            self._goto_with_timeout(page, contacts_url, timeout_ms=3000)
+        except Exception as exc:
+            result["contacts_open_error"] = str(exc)
+
+        contacts_ready = self._first_visible_selector(page, selectors.CONTACTS_UI_READY_SELECTORS + selectors.CONTACTS_SEARCH_INPUT_SELECTORS, timeout_ms=1500)
+        if not contacts_ready:
+            result["reason"] = "contacts_ui_not_ready"
+            result["page_url"] = _safe_page_url(page)
+            result["duration_ms"] = int((time.perf_counter() - started) * 1000)
+            return result
+
+        search_ready = self._ensure_contacts_search_ready(page)
+        result.update(search_ready)
+        contacts_input = str(search_ready.get("contacts_search_input_selector") or "")
+        result["contacts_search_input_selector"] = contacts_input or ""
+        result["contacts_search_input_visible"] = bool(contacts_input)
+        if not contacts_input:
+            result.update(
+                {
+                    "error_code": "contacts_search_input_not_found",
+                    "reason": "contacts_search_input_not_found",
+                    "page_url": _safe_page_url(page),
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
+            )
+            return result
+        name_query = str(contact_naming_value or "").strip()
+        phone_queries = sorted(_bale_phone_match_values(normalized_phone), key=len, reverse=True)
+        queries = [name_query, *phone_queries]
+        for query in [item for item in queries if item]:
+            result["contacts_search_value"] = query
+            if contacts_input:
+                self._clear_contacts_search_input(page, contacts_input)
+                self._fill_contacts_search_input(page, contacts_input, query)
+                result["contacts_search_input_value"] = self._search_input_value(page, contacts_input)
+            candidates = self._collect_contacts_result_candidates(page, timeout_ms=1500)
+            result["contacts_result_count"] = len(candidates)
+            result["contacts_result_text"] = [item.get("text", "") for item in candidates[:20]]
+            match = self._match_search_result_candidate(candidates, query, contact_naming_value, normalized_phone)
+            attempt = {
+                "query": query,
+                "input_value": result["contacts_search_input_value"],
+                "result_count": len(candidates),
+                "result_text": result["contacts_result_text"],
+                "matched_text": str(match.get("text") or "") if match else "",
+            }
+            result["contacts_query_attempts"].append(attempt)
+            if not match:
+                continue
+            result["matched_contact_text"] = str(match.get("text") or "")
+            result["matched_contact_role"] = str(match.get("role") or "")
+            result["matched_contact_box"] = match.get("box") or {}
+            click_result = self._click_search_result_candidate(page, match)
+            if click_result.get("status") != "success":
+                result["contact_click_error"] = click_result
+                result["page_url"] = _safe_page_url(page)
+                result["chat_open_confirmed"] = False
+                result["duration_ms"] = int((time.perf_counter() - started) * 1000)
+                return result
+
+            chat_opened = self._confirm_chat_opened_for_contact(page, contact_naming_value, result["matched_contact_text"])
+            result["message_input_visible"] = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
+            result["chat_url_has_uid"] = "uid=" in _safe_page_url(page).lower()
+            result["right_chat_header_text"] = self._right_chat_header_text(page)
+            if chat_opened:
+                result.update({
+                    "status": "success",
+                    "matched_selector": match.get("click_selector") or match.get("selector"),
+                    "page_url": _safe_page_url(page),
+                    "chat_open_confirmed": True,
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                })
+                return result
+
+            profile_visible = bool(self._first_visible_selector(page, selectors.CONTACT_PROFILE_SELECTORS, timeout_ms=800))
+            result["contact_profile_visible"] = profile_visible
+            message_button = self._first_visible_selector(page, selectors.CONTACT_MESSAGE_BUTTON_SELECTORS, timeout_ms=1000)
+            result["message_button_visible"] = bool(message_button)
+            if message_button:
+                self._click_selector_short(page, message_button, timeout_ms=500)
+                chat_opened = self._confirm_chat_opened_for_contact(page, contact_naming_value, result["matched_contact_text"])
+                result["message_input_visible"] = bool(self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
+                result["chat_url_has_uid"] = "uid=" in _safe_page_url(page).lower()
+                result["right_chat_header_text"] = self._right_chat_header_text(page)
+                if chat_opened:
+                    result.update(
+                        {
+                            "status": "success",
+                            "matched_selector": match.get("click_selector") or match.get("selector"),
+                            "message_button_selector": message_button,
+                            "page_url": _safe_page_url(page),
+                            "chat_open_confirmed": True,
+                            "duration_ms": int((time.perf_counter() - started) * 1000),
+                        }
+                    )
+                    return result
+
+        result["page_url"] = _safe_page_url(page)
+        result["chat_open_confirmed"] = False
+        result["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        return result
+
+    def _collect_contacts_result_candidates(self, page: Any, timeout_ms: int = 1500) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            candidates = self._visible_contacts_result_candidates(page)
+            if candidates:
+                return candidates[:30]
+            time.sleep(0.15)
+        return []
+
+    def _ensure_contacts_search_ready(self, page: Any) -> dict[str, Any]:
+        started = time.perf_counter()
+        attempts: list[dict[str, Any]] = []
+        result: dict[str, Any] = {
+            "contacts_search_input_selector": "",
+            "contacts_search_input_visible": False,
+            "contacts_search_ready_attempts": attempts,
+            "contacts_search_icon_visible": False,
+            "contacts_search_icon_clicked": "",
+            "contacts_page_url_before": _safe_page_url(page),
+        }
+
+        def capture_diagnostics() -> None:
+            result.update(self._contacts_search_dom_diagnostics(page))
+            result["contacts_page_url_after"] = _safe_page_url(page)
+
+        def probe(label: str, timeout_ms: int = 300) -> str:
+            selector = self._first_visible_selector(page, selectors.CONTACTS_SEARCH_INPUT_SELECTORS, timeout_ms=timeout_ms)
+            attempts.append({"step": label, "status": "success" if selector else "failed", "selector": selector or ""})
+            if selector and self._is_contacts_search_editable(page, selector):
+                result["contacts_search_input_selector"] = selector
+                result["contacts_search_input_visible"] = True
+                result["duration_ms"] = int((time.perf_counter() - started) * 1000)
+                capture_diagnostics()
+                return selector
+            return ""
+
+        selector = probe("direct_selector", timeout_ms=300)
+        if selector:
+            return result
+
+        search_icon = self._first_visible_selector(page, selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS + selectors.SEARCH_ICON_SVG_SELECTORS, timeout_ms=250)
+        result["contacts_search_icon_visible"] = bool(search_icon)
+        if search_icon:
+            click_result = self._click_chat_search_icon_target(page, search_icon)
+            attempts.append({"step": "click_contacts_search_icon", **click_result})
+            if click_result.get("status") == "success":
+                result["contacts_search_icon_clicked"] = str(click_result.get("selector") or "")
+            selector = probe("after_search_icon", timeout_ms=300)
+            if selector:
+                return result
+
+        panel_click = self._click_contacts_header_or_panel(page)
+        attempts.append({"step": "click_contacts_header_or_panel", **panel_click})
+        selector = probe("after_panel_click", timeout_ms=300)
+        if selector:
+            return result
+
+        if int((time.perf_counter() - started) * 1000) < 2000:
+            try:
+                self._goto_with_timeout(page, f"{self.web_url}/contacts", timeout_ms=3000)
+                attempts.append({"step": "reload_contacts_route", "status": "success"})
+            except Exception as exc:
+                attempts.append({"step": "reload_contacts_route", "status": "failed", "error": str(exc)})
+            selector = probe("after_reload", timeout_ms=300)
+            if selector:
+                return result
+
+        result["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        capture_diagnostics()
+        return result
+
+    def _goto_with_timeout(self, page: Any, url: str, timeout_ms: int) -> None:
+        try:
+            page.goto(url, wait_until="load", timeout=timeout_ms)
+        except TypeError:
+            page.goto(url, wait_until="load")
+
+    def _is_contacts_search_editable(self, page: Any, selector: str) -> bool:
+        try:
+            locator = page.locator(selector).first
+            locator.click(timeout=300)
+            return True
+        except Exception:
+            return False
+
+    def _click_contacts_header_or_panel(self, page: Any) -> dict[str, Any]:
+        selectors_to_try = [
+            'text=مخاطبین',
+            '[aria-label="Contacts-icon"]',
+            'svg[aria-label="Contacts-icon"]',
+            'input[type="search"]',
+        ]
+        for selector in selectors_to_try:
+            found = self._first_visible_selector(page, [selector], timeout_ms=150)
+            if not found:
+                continue
+            try:
+                page.locator(found).first.click(timeout=300)
+                return {"status": "success", "selector": found}
+            except Exception as exc:
+                return {"status": "failed", "selector": found, "error": str(exc)}
+        return {"status": "failed", "reason": "no_header_or_panel_target"}
+
+    def _contacts_search_dom_diagnostics(self, page: Any) -> dict[str, Any]:
+        try:
+            data = page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                    };
+                    const compact = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            tag: el.tagName || "",
+                            type: el.getAttribute("type") || "",
+                            placeholder: el.getAttribute("placeholder") || "",
+                            ariaLabel: el.getAttribute("aria-label") || "",
+                            title: el.getAttribute("title") || "",
+                            text: (el.innerText || el.textContent || "").trim().slice(0, 80),
+                            box: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)}
+                        };
+                    };
+                    const inputs = Array.from(document.querySelectorAll("input, textarea, [contenteditable='true']")).filter(visible).slice(0, 20).map(compact);
+                    const svgs = Array.from(document.querySelectorAll("svg")).filter(visible).filter((el) => el.getBoundingClientRect().y < 120).slice(0, 20).map(compact);
+                    const header = Array.from(document.querySelectorAll("body *")).filter(visible).filter((el) => el.getBoundingClientRect().y < 120).map((el) => (el.innerText || el.textContent || "").trim()).filter(Boolean).slice(0, 10).join("\\n");
+                    const panel = Array.from(document.querySelectorAll("body *")).filter(visible).find((el) => {
+                        const text = (el.innerText || el.textContent || "");
+                        const rect = el.getBoundingClientRect();
+                        return text.includes("مخاطبین") && rect.width > 200 && rect.height > 200;
+                    });
+                    const box = panel ? panel.getBoundingClientRect() : null;
+                    return {
+                        visible_inputs: inputs,
+                        visible_top_svgs: svgs,
+                        contacts_header_text: header.slice(0, 500),
+                        contacts_panel_box: box ? {x: Math.round(box.x), y: Math.round(box.y), w: Math.round(box.width), h: Math.round(box.height)} : {}
+                    };
+                }"""
+            )
+            return dict(data) if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _clear_contacts_search_input(self, page: Any, selector: str) -> None:
+        try:
+            locator = page.locator(selector).first
+            locator.click(timeout=500)
+            self._press_key(page, "Control+A")
+            self._press_key(page, "Backspace")
+            if not self._search_input_value(page, selector):
+                return
+            locator.fill("", timeout=500)
+        except Exception:
+            self._clear_search_input(page, selector)
+
+    def _fill_contacts_search_input(self, page: Any, selector: str, text: str) -> None:
+        try:
+            page.fill(selector, text, timeout=500)
+            return
+        except Exception:
+            pass
+        locator = page.locator(selector).first
+        try:
+            locator.fill(text, timeout=500)
+            return
+        except Exception:
+            pass
+        locator.type(text, timeout=500)
+
+    def _click_selector_short(self, page: Any, selector: str, timeout_ms: int = 500) -> dict[str, Any]:
+        try:
+            page.locator(selector).first.click(timeout=timeout_ms)
+            return {"status": "success", "click_method": "playwright_click", "selector": selector}
+        except Exception as click_error:
+            try:
+                page.locator(selector).first.evaluate("(el) => el.click()")
+                return {"status": "success", "click_method": "dom_click", "selector": selector, "playwright_click_error": str(click_error)}
+            except Exception as dom_error:
+                return {"status": "failed", "selector": selector, "click_error": str(click_error), "dom_click_error": str(dom_error)}
+
+    def _visible_contacts_result_candidates(self, page: Any) -> list[dict[str, Any]]:
+        try:
+            data = page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                    };
+                    const clickableParent = (el) => {
+                        let node = el;
+                        for (let depth = 0; node && depth <= 5; depth += 1, node = node.parentElement) {
+                            if (!(node instanceof HTMLElement)) continue;
+                            const style = window.getComputedStyle(node);
+                            const role = node.getAttribute("role") || "";
+                            if (node.tagName === "BUTTON" || node.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer" || typeof node.onclick === "function") return node;
+                        }
+                        return el;
+                    };
+                    const selectorFor = (el) => {
+                        if (!el) return "";
+                        const tag = el.tagName ? el.tagName.toLowerCase() : "*";
+                        if (el.id) return `${tag}#${CSS.escape(el.id)}`;
+                        const aria = el.getAttribute("aria-label");
+                        if (aria) return `${tag}[aria-label="${aria.replaceAll('"', '\\"')}"]`;
+                        const role = el.getAttribute("role");
+                        if (role) return `${tag}[role="${role}"]`;
+                        const testid = el.getAttribute("data-testid");
+                        if (testid) return `${tag}[data-testid="${testid.replaceAll('"', '\\"')}"]`;
+                        return "";
+                    };
+                    const nodes = Array.from(document.querySelectorAll('div[role="list"], [role="listitem"], [role="button"], [data-testid*="contact"], [aria-label*="contact"], [aria-label*="Contact"], a, div'));
+                    const rows = [];
+                    const seen = new Set();
+                    for (const el of nodes) {
+                        if (!visible(el)) continue;
+                        const text = (el.innerText || el.textContent || "").trim();
+                        if (!text || text.length > 500) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.x > 500 || rect.width > 500 || rect.height > 180) continue;
+                        if (/گفتگو\\s+مجله\\s+خدمات\\s+مخاطبین/.test(text)) continue;
+                        if (/ساخت گروه|ساخت کانال|افزودن مخاطب|مرتب‌شده/.test(text) && text.length > 120) continue;
+                        const click = clickableParent(el);
+                        const selector = selectorFor(el);
+                        const clickSelector = selectorFor(click) || selector;
+                        const key = `${selector}|${text}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        rows.push({
+                            selector,
+                            click_selector: clickSelector,
+                            text,
+                            role: el.getAttribute("role") || "",
+                            box: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)}
+                        });
+                        if (rows.length >= 30) break;
+                    }
+                    return rows;
+                }"""
+            )
+            if isinstance(data, list):
+                return [self._candidate_with_normalized_text(item) for item in data if isinstance(item, dict)]
+        except Exception:
+            pass
+        candidates: list[dict[str, Any]] = []
+        for selector in selectors.CONTACTS_RESULT_CANDIDATE_SELECTORS:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=150)
+                text = str(locator.inner_text(timeout=150) or "").strip()
+            except Exception:
+                continue
+            if text and self._is_scoped_contact_candidate_text(text):
+                candidates.append(
+                    self._candidate_with_normalized_text(
+                        {"selector": selector, "click_selector": selector, "text": text, "role": "list" if 'role="list"' in selector else "", "box": {}}
+                    )
+                )
+        return candidates[:30]
+
+    def _is_scoped_contact_candidate_text(self, text: str) -> bool:
+        value = str(text or "").strip()
+        if not value or len(value) > 500:
+            return False
+        if "گفتگو" in value and "مجله" in value and "مخاطبین" in value:
+            return False
+        if len(value) > 120 and any(token in value for token in ["ساخت گروه", "ساخت کانال", "افزودن مخاطب", "مرتب‌شده"]):
+            return False
+        return True
+
+    def _focused_editable_selector(self, page: Any) -> str:
+        try:
+            focused = page.evaluate(
+                """() => {
+                    const el = document.activeElement;
+                    if (!el) return "";
+                    const editable = el.matches('input, textarea, [contenteditable="true"], [role="textbox"]');
+                    if (!editable) return "";
+                    const tag = el.tagName ? el.tagName.toLowerCase() : "";
+                    if (el.id) return `${tag}#${el.id}`;
+                    const label = el.getAttribute("aria-label");
+                    if (label) return `${tag}[aria-label="${label}"]`;
+                    const placeholder = el.getAttribute("placeholder");
+                    if (placeholder) return `${tag}[placeholder="${placeholder}"]`;
+                    if (el.getAttribute("role")) return `[role="${el.getAttribute("role")}"]`;
+                    if (el.getAttribute("contenteditable") === "true") return '[contenteditable="true"]';
+                    return "";
+                }"""
+            )
+            return str(focused or "")
+        except Exception:
+            return ""
+
+    def _clear_search_input(self, page: Any, selector: str) -> None:
+        try:
+            page.locator(selector).first.fill("", timeout=500)
+            return
+        except Exception:
+            pass
+        try:
+            self._click_if_possible(page, selector)
+            self._press_key(page, "Control+A")
+            self._press_key(page, "Backspace")
+        except Exception:
+            pass
+
+    def _search_input_value(self, page: Any, selector: str) -> str:
+        try:
+            return str(page.locator(selector).first.input_value(timeout=200) or "")
+        except Exception:
+            try:
+                return str(page.locator(selector).first.get_attribute("value", timeout=200) or "")
+            except Exception:
+                return ""
+
+    def _locator_attribute(self, page: Any, selector: str, name: str) -> str:
+        try:
+            return str(page.locator(selector).first.get_attribute(name, timeout=200) or "")
+        except Exception:
+            return ""
+
+    def _visible_no_result_text(self, page: Any) -> str:
+        for selector in ['text=/.*not found.*/i', 'text=/.*no result.*/i', 'text=/.*یافت نشد.*/', 'text=/.*نتیجه.*/']:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=100)
+                return str(locator.inner_text(timeout=100) or "")
+            except Exception:
+                continue
+        return ""
+
+    def _post_save_ui_diagnostics(
+        self,
+        page: Any,
+        contact_naming_value: str,
+        normalized_phone: str,
+        searched_value: str,
+    ) -> dict[str, Any]:
+        search_input_selector = self._first_visible_selector(page, selectors.TEXT_SEARCH_INPUT_SELECTORS, timeout_ms=100)
+        return {
+            "page_url": _safe_page_url(page),
+            "visible_modal_text": self._visible_modal_or_dialog_text(page),
+            "search_input_visible": bool(search_input_selector),
+            "search_input_selector": search_input_selector or "",
+            "searched_value": searched_value,
+            "contact_naming_value": contact_naming_value,
+            "normalized_phone": normalized_phone,
+            "contacts_ui_visible": self._contacts_ui_visible(page),
+            "main_chat_ui_visible": self._main_chat_ui_visible(page),
+        }
+
+    def _visible_modal_or_dialog_text(self, page: Any) -> str:
+        for selector in [".ReactModal__Content", ".ReactModal__Overlay", '[role="dialog"]']:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=100)
+                return str(locator.inner_text(timeout=300) or "")[:1000]
+            except Exception:
+                continue
+        return ""
+
+    def _compact_chat_search_dom_diagnostics(self, page: Any) -> dict[str, Any]:
+        try:
+            return dict(
+                page.evaluate(
+                    """() => {
+                        const visible = (el) => {
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+                        };
+                        const compact = (items) => items.filter(visible).slice(0, 20).map((el) => ({
+                            tag: el.tagName || "",
+                            type: el.getAttribute("type") || "",
+                            placeholder: el.getAttribute("placeholder") || "",
+                            ariaLabel: el.getAttribute("aria-label") || "",
+                            title: el.getAttribute("title") || "",
+                            role: el.getAttribute("role") || "",
+                            text: (el.innerText || el.textContent || "").trim().slice(0, 80)
+                        }));
+                        return {
+                            inputs: compact(Array.from(document.querySelectorAll("input"))),
+                            textareas: compact(Array.from(document.querySelectorAll("textarea"))),
+                            contenteditables: compact(Array.from(document.querySelectorAll('[contenteditable="true"]'))),
+                            buttons: compact(Array.from(document.querySelectorAll("button"))),
+                            roleButtons: compact(Array.from(document.querySelectorAll('[role="button"]')))
+                        };
+                    }"""
+                )
+            )
+        except Exception:
+            return {}
+
     def _is_selector_visible(self, page: Any, selector: str, timeout_ms: int = 250) -> bool:
         if not selector:
             return False
@@ -1395,10 +2454,12 @@ class BalePlugin:
                         if (!el) return {};
                         return {
                             tag: el.tagName || "",
+                            type: el.getAttribute("type") || "",
                             id: el.id || "",
                             role: el.getAttribute("role") || "",
                             ariaLabel: el.getAttribute("aria-label") || "",
-                            placeholder: el.getAttribute("placeholder") || ""
+                            placeholder: el.getAttribute("placeholder") || "",
+                            text: (el.innerText || el.textContent || "").trim().slice(0, 120)
                         };
                     }"""
                 )
@@ -1682,6 +2743,57 @@ def _split_contact_name(value: str) -> tuple[str, str]:
     if len(parts) == 1:
         return parts[0], ""
     return parts[0], parts[1]
+
+
+def _last_successful_step(step_results: list[dict[str, Any]]) -> str:
+    for step in reversed(step_results):
+        if not isinstance(step, dict) or step.get("status") != "success":
+            continue
+        return str(step.get("step") or "")
+    return ""
+
+
+def _pointer_interceptor_from_error(message: str) -> str:
+    marker = "intercepts pointer events"
+    if marker not in message:
+        return ""
+    lines = [line.strip() for line in message.splitlines()]
+    for line in lines:
+        if marker in line:
+            return line.replace(marker, "").strip()
+    return ""
+
+
+def _normalize_bale_match_text(value: str) -> str:
+    return _english_digits(str(value or "")).lower().strip()
+
+
+def _normalize_bale_phone_text(value: str) -> str:
+    return "".join(ch for ch in _english_digits(str(value or "")) if ch.isdigit())
+
+
+def _bale_phone_match_values(value: str) -> set[str]:
+    digits = _normalize_bale_phone_text(value)
+    values = {digits} if digits else set()
+    if digits.startswith("98") and len(digits) >= 12:
+        local = digits[2:]
+        values.add(local)
+        values.add("0" + local)
+    elif digits.startswith("0") and len(digits) >= 11:
+        local = digits[1:]
+        values.add(local)
+        values.add("98" + local)
+    elif len(digits) == 10:
+        values.add("0" + digits)
+        values.add("98" + digits)
+    if len(digits) >= 10:
+        values.add(digits[-10:])
+    return {item for item in values if item}
+
+
+def _english_digits(value: str) -> str:
+    translation = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    return str(value or "").translate(translation)
 
 
 def phone_for_bale_contact_field(normalized_phone: str) -> str:
