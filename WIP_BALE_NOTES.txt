@@ -1,0 +1,29 @@
+﻿Bale current state - WIP
+
+Working:
+- ClinicOS UI reaches backend queue.
+- send_text_message runs.
+- verify_login false positive was fixed.
+- save contact works.
+- after save, it returns to chat.
+- it searches dynamic contact_naming_value like Bale-000001.
+- phone fallback after visible name result is now skipped.
+
+Still broken:
+- visible chat search result appears.
+- automation does not click/open the actual tight result row.
+- previous false success via broad right_header_match was fixed.
+- if chat does not open, it should fail at open_target_chat with chat_open_not_confirmed.
+
+Next task:
+- fix tight chat-search result row selection/click.
+- current bug is likely matching/clicking broad div instead of real result row.
+- need inspect click_attempts, matched_result_box, clickable_ancestor_box.
+- success must require /chat?uid= or message input visible.
+
+Important codegen:
+page.goto("https://web.bale.ai/chat")
+page.locator(".ZGzps0").first.click()
+page.get_by_role("searchbox", name="جستجوی کانال، گروه و پیام").fill("bale-000001")
+page.locator("div:nth-child(2) > div > .qHFpb6 > .ZGzps0").click()
+page.goto("https://web.bale.ai/chat?uid=1672056687")
