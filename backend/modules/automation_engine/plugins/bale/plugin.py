@@ -293,7 +293,7 @@ class BalePlugin:
         started_monotonic = time.perf_counter()
         effective_provider = str(provider_mode or "native_chrome")
         step_results: list[dict[str, Any]] = []
-        contact_save_status = "not_supported_yet"
+        contact_save_status = "not_attempted"
         browser_meta: dict[str, Any] = self._browser_failure_meta(account_id, effective_provider)
         current_url_value = ""
 
@@ -367,7 +367,23 @@ class BalePlugin:
                 self._add_step(step_results, "verify_login", "success", login_check=login_check)
 
                 self._add_step(step_results, "load_message_text", "success", message_length=len(message_text.strip()))
-                self._add_step(step_results, "save_or_resolve_contact", "success", contact_save_status=contact_save_status)
+                contact_save_result = self.save_contact_by_phone(
+                    page,
+                    normalized_phone=normalized_phone,
+                    contact_naming_value=contact_naming_value,
+                    account_id=account_id,
+                )
+                contact_save_status = str(contact_save_result.get("contact_save_status") or "unknown")
+                step_results.append(contact_save_result)
+                if contact_save_status not in {"saved", "already_exists"}:
+                    diagnostics = {**self._page_debug_info(page, account_id), "contact_save_result": contact_save_result}
+                    return finish(
+                        False,
+                        "contact_save_failed",
+                        str(contact_save_result.get("user_message") or "مخاطب در بله ذخیره نشد"),
+                        "save_or_resolve_contact",
+                        diagnostics,
+                    )
 
                 search_result = self._open_target_chat(page, contact_naming_value, normalized_phone)
                 step_results.append(search_result)
@@ -415,6 +431,52 @@ class BalePlugin:
             diagnostics = getattr(exc, "diagnostics", {}) or {}
             self._add_step(step_results, "unexpected_error", "failed", error_code=error_code, error=str(exc))
             return finish(False, error_code, str(exc), "unexpected_error", diagnostics)
+
+    def save_contact_by_phone(
+        self,
+        page: Any,
+        normalized_phone: str,
+        contact_naming_value: str,
+        account_id: str | None = None,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        result = self._save_contact_from_modal(
+            page,
+            normalized_phone=normalized_phone,
+            contact_naming_value=contact_naming_value,
+            account_id=account_id,
+            job_id=job_id,
+        )
+        if result.get("contact_save_status") in {"saved", "already_exists"}:
+            return result
+
+        contact_steps = result.get("contact_steps") if isinstance(result.get("contact_steps"), list) else []
+        failed_step = str(result.get("failed_step") or "")
+        if not failed_step:
+            for step in reversed(contact_steps):
+                if isinstance(step, dict) and step.get("status") == "failed":
+                    failed_step = str(step.get("step") or "")
+                    break
+        if not failed_step:
+            failed_step = "save_or_resolve_contact"
+
+        detailed_error_code = str(result.get("error_code") or result.get("reason") or "contact_save_failed")
+        result.update(
+            {
+                "status": "failed",
+                "contact_save_status": "failed",
+                "error_code": "contact_save_failed",
+                "detail_error_code": detailed_error_code,
+                "user_message": "مخاطب در بله ذخیره نشد",
+                "failed_step": failed_step,
+                "step_results": contact_steps,
+            }
+        )
+        if account_id and not result.get("screenshot_path"):
+            screenshot_path = _save_login_debug_screenshot(page, account_id)
+            if screenshot_path:
+                result["screenshot_path"] = screenshot_path
+        return result
 
     def list_logs(self) -> list[dict[str, Any]]:
         return list(self._logs)
@@ -810,6 +872,209 @@ class BalePlugin:
             "search_attempts": search_attempts,
         }
 
+    def _save_contact_from_modal(
+        self,
+        page: Any,
+        normalized_phone: str,
+        contact_naming_value: str,
+        account_id: str | None = None,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        contact_name = str(contact_naming_value or normalized_phone).strip()
+        phone_value = phone_for_bale_contact_field(normalized_phone)
+        result: dict[str, Any] = {
+            "step": "save_or_resolve_contact",
+            "status": "failed",
+            "contact_save_status": "failed",
+            "contact_name": contact_name,
+            "normalized_phone": normalized_phone,
+            "contact_phone_value": phone_value,
+            "contact_steps": [],
+        }
+        if account_id:
+            result["account_id"] = account_id
+        if job_id:
+            result["job_id"] = job_id
+
+        contact_steps = result["contact_steps"]
+        contacts_url = f"{self.web_url}/contacts"
+        current_url = _safe_page_url(page).lower()
+        contacts_entrypoint = ""
+        if "/contacts" in current_url:
+            contact_steps.append({"step": "open_contacts", "status": "success", "mode": "already_open", "current_url": _safe_page_url(page)})
+        else:
+            try:
+                page.goto(contacts_url, wait_until="load")
+                current_url = _safe_page_url(page).lower()
+            except Exception as exc:
+                result["open_contacts_navigation_error"] = str(exc)
+            if "/contacts" in current_url:
+                contact_steps.append({"step": "open_contacts", "status": "success", "mode": "navigate", "url": contacts_url, "current_url": _safe_page_url(page)})
+            else:
+                contacts_entrypoint = self._first_visible_selector(page, selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS, timeout_ms=2000) or ""
+                if contacts_entrypoint:
+                    self._click_if_possible(page, contacts_entrypoint)
+                    result["contacts_entrypoint_selector"] = contacts_entrypoint
+                    contact_steps.append({"step": "open_contacts", "status": "success", "mode": "click_icon", "selector": contacts_entrypoint})
+
+        if not contact_steps or contact_steps[-1]["status"] != "success":
+            result["error_code"] = "contacts_page_not_opened"
+            result["reason"] = "contacts_entrypoint_not_found"
+            result["message"] = "Bale contacts page entrypoint was not found"
+            contact_steps.append({"step": "open_contacts", "status": "failed", "error_code": "contacts_page_not_opened"})
+            return result
+
+        contacts_ready = self._first_visible_selector(page, selectors.CONTACTS_UI_READY_SELECTORS, timeout_ms=5000)
+        if not contacts_ready:
+            result["error_code"] = "contacts_ui_not_ready"
+            result["reason"] = "contacts_ui_not_ready"
+            result["message"] = "Bale contacts UI was not ready"
+            contact_steps.append({"step": "wait_contacts_ui", "status": "failed", "error_code": "contacts_ui_not_ready"})
+            return result
+        contact_steps.append({"step": "wait_contacts_ui", "status": "success", "selector": contacts_ready})
+
+        entrypoint = self._first_visible_selector(page, selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS, timeout_ms=2000)
+        if not entrypoint:
+            result["error_code"] = "add_contact_entrypoint_not_found"
+            result["reason"] = "add_contact_entrypoint_not_found"
+            result["message"] = "Bale Add Contact entrypoint was not found"
+            contact_steps.append({"step": "open_add_contact_menu", "status": "failed", "error_code": "add_contact_entrypoint_not_found"})
+            return result
+        self._click_if_possible(page, entrypoint)
+        result["entrypoint_selector"] = entrypoint
+        contact_steps.append({"step": "open_add_contact_menu", "status": "success", "selector": entrypoint})
+
+        menu_item = self._first_visible_selector(page, selectors.ADD_CONTACT_MENU_ITEM_SELECTORS, timeout_ms=2000)
+        if not menu_item:
+            result["error_code"] = "add_contact_menu_item_not_found"
+            result["reason"] = "add_contact_menu_item_not_found"
+            result["message"] = "Bale Add Contact menu item was not found"
+            contact_steps.append({"step": "wait_add_contact_menu_item", "status": "failed", "error_code": "add_contact_menu_item_not_found"})
+            return result
+        contact_steps.append({"step": "wait_add_contact_menu_item", "status": "success", "selector": menu_item})
+        self._click_if_possible(page, menu_item)
+        result["menu_item_selector"] = menu_item
+        contact_steps.append({"step": "open_add_contact_modal", "status": "success", "selector": menu_item})
+
+        modal = self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=3000)
+        if modal:
+            result["modal_selector"] = modal
+            contact_steps.append({"step": "wait_add_contact_modal", "status": "success", "selector": modal})
+        else:
+            result["error_code"] = "add_contact_modal_not_found"
+            result["reason"] = "add_contact_modal_not_found"
+            result["message"] = "Bale Add Contact modal was not found"
+            contact_steps.append({"step": "wait_add_contact_modal", "status": "failed", "error_code": "add_contact_modal_not_found"})
+            return result
+
+        phone_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_MODE_SELECTORS, timeout_ms=2000)
+        if not phone_mode:
+            result["error_code"] = "mobile_number_tab_not_found"
+            result["reason"] = "mobile_number_tab_not_found"
+            result["message"] = "Bale Add Contact mobile number tab was not found"
+            contact_steps.append({"step": "select_mobile_number_tab", "status": "failed", "error_code": "mobile_number_tab_not_found"})
+            return result
+        self._click_if_possible(page, phone_mode)
+        result["phone_mode_selector"] = phone_mode
+        contact_steps.append({"step": "select_mobile_number_tab", "status": "success", "selector": phone_mode})
+        username_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_USERNAME_MODE_SELECTORS, timeout_ms=500)
+        if username_mode:
+            result["username_mode_selector"] = username_mode
+
+        name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_SELECTORS, timeout_ms=3000)
+        name_input_fallback_used = False
+        if not name_selector:
+            name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_FALLBACK_SELECTORS, timeout_ms=2000)
+            name_input_fallback_used = bool(name_selector)
+        phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS, timeout_ms=3000)
+        country_selector = ""
+        phone_input_fallback_used = False
+        if not phone_selector:
+            country_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_COUNTRY_SELECTOR_SELECTORS, timeout_ms=1000) or ""
+            if country_selector:
+                result["country_selector"] = country_selector
+                phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_FALLBACK_SELECTORS, timeout_ms=2000)
+                phone_input_fallback_used = bool(phone_selector)
+        if not name_selector or not phone_selector:
+            result.update(
+                {
+                    "error_code": "add_contact_modal_fields_not_found",
+                    "reason": "add_contact_modal_fields_not_found",
+                    "message": "Bale Add Contact modal fields were not found",
+                    "name_input_found": bool(name_selector),
+                    "phone_input_found": bool(phone_selector),
+                    "country_selector_found": bool(country_selector),
+                }
+            )
+            return result
+
+        first_name, last_name = _split_contact_name(contact_name)
+        try:
+            self._fill_or_type(page, phone_selector, phone_value)
+        except Exception as exc:
+            result.update(
+                {
+                    "error_code": "fill_phone_failed",
+                    "reason": "fill_phone_failed",
+                    "message": "Bale Add Contact phone field could not be filled",
+                    "phone_input_selector": phone_selector,
+                    "error": str(exc),
+                }
+            )
+            contact_steps.append({"step": "fill_phone", "status": "failed", "error_code": "fill_phone_failed", "selector": phone_selector})
+            return result
+        contact_steps.append({"step": "fill_phone", "status": "success", "selector": phone_selector, "value": phone_value})
+
+        try:
+            self._fill_or_type(page, name_selector, first_name)
+        except Exception as exc:
+            result.update(
+                {
+                    "error_code": "fill_name_failed",
+                    "reason": "fill_name_failed",
+                    "message": "Bale Add Contact name field could not be filled",
+                    "name_input_selector": name_selector,
+                    "error": str(exc),
+                }
+            )
+            contact_steps.append({"step": "fill_name", "status": "failed", "error_code": "fill_name_failed", "selector": name_selector})
+            return result
+        contact_steps.append({"step": "fill_name", "status": "success", "selector": name_selector, "value": first_name})
+        last_name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_LAST_NAME_INPUT_SELECTORS, timeout_ms=1000)
+        if last_name_selector and last_name:
+            self._fill_or_type(page, last_name_selector, last_name)
+
+        save_button = self._first_visible_selector(page, selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS, timeout_ms=3000)
+        if not save_button:
+            result.update(
+                {
+                    "contact_save_status": "failed",
+                    "status": "failed",
+                    "error_code": "contact_save_button_not_found",
+                    "reason": "add_contact_save_button_not_found",
+                    "message": "Bale Add Contact confirm button was not found",
+                    "name_input_selector": name_selector,
+                    "phone_input_selector": phone_selector,
+                }
+            )
+            return result
+
+        self._click_if_possible(page, save_button)
+        result.update(
+            {
+                "status": "success",
+                "contact_save_status": "saved",
+                "message": "Bale contact saved",
+                "name_input_selector": name_selector,
+                "name_input_fallback_used": name_input_fallback_used,
+                "last_name_input_selector": last_name_selector or "",
+                "phone_input_selector": phone_selector,
+                "phone_input_fallback_used": phone_input_fallback_used,
+                "save_button_selector": save_button,
+            }
+        )
+        return result
+
     def _add_step(self, step_results: list[dict[str, Any]], step: str, status: str, **details: Any) -> None:
         step_results.append({"step": step, "status": status, **details})
 
@@ -1077,6 +1342,29 @@ def _save_login_debug_screenshot(page: Any, account_id: str) -> str:
         return str(screenshot_path)
     except Exception:
         return ""
+
+
+def _split_contact_name(value: str) -> tuple[str, str]:
+    parts = str(value or "").strip().split(maxsplit=1)
+    if not parts:
+        return "Bale Contact", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def phone_for_bale_contact_field(normalized_phone: str) -> str:
+    value = str(normalized_phone or "").strip()
+    if value.startswith("98"):
+        return value[2:]
+    if value.startswith("+98"):
+        return value[3:]
+    if value.startswith("0"):
+        return value[1:]
+    return value
+
+
+_bale_contact_phone = phone_for_bale_contact_field
 
 
 def _browser_error_code(exc: Exception) -> str:

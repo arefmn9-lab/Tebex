@@ -28,7 +28,7 @@ from modules.automation_engine.browser.providers.adspower_provider import AdsPow
 from modules.automation_engine.plugins.bale import selectors
 from modules.automation_engine.plugins.bale.account_store import BaleAccountStore
 from modules.automation_engine.plugins.bale.governance import can_account_run_scenario
-from modules.automation_engine.plugins.bale.plugin import BalePlugin
+from modules.automation_engine.plugins.bale.plugin import BalePlugin, phone_for_bale_contact_field
 from modules.automation_engine.scenario_library import (
     ScenarioExecutorStub,
     ScenarioLoader,
@@ -279,16 +279,304 @@ def test_send_text_message_uses_captured_message_input_and_enter_without_fake_su
         message_text="hello real text",
     )
     assert result["ok"] is False
-    assert result["error_code"] == "send_confirmation_not_implemented"
-    assert result["contact_save_status"] == "not_supported_yet"
+    assert result["error_code"] == "contact_save_failed"
+    assert result["user_message"] == "مخاطب در بله ذخیره نشد"
+    assert result["contact_save_status"] == "failed"
+    assert result["failed_step"] == "save_or_resolve_contact"
+    assert result["contact_save_result"]["reason"] == "contacts_ui_not_ready"
+    assert result["contact_save_result"]["detail_error_code"] == "contacts_ui_not_ready"
+    assert result["contact_save_result"]["contact_steps"][0]["step"] == "open_contacts"
+    assert result["contact_save_result"]["contact_steps"][0]["status"] == "success"
+    assert result["contact_save_result"]["contact_steps"][0]["mode"] == "navigate"
+    assert result["contact_save_result"]["contact_steps"][1]["step"] == "wait_contacts_ui"
+    assert result["contact_save_result"]["contact_steps"][1]["status"] == "failed"
+
+
+def test_send_text_message_saves_contact_with_captured_add_contact_modal_flow() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+            selectors.MESSAGE_SENT_INDICATOR_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-GHAB-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.send_text_message(
+        "bale_test",
+        normalized_phone="989120000001",
+        contact_naming_value="Bale-000001",
+        message_text="hello real text",
+    )
+
+    assert result["ok"] is True
+    assert result["contact_save_status"] == "saved"
+    contact_step = next(item for item in result["step_results"] if item["step"] == "save_or_resolve_contact")
+    assert contact_step["contact_steps"][0]["step"] == "open_contacts"
+    assert contact_step["contact_steps"][0]["status"] == "success"
+    assert contact_step["contact_steps"][0]["mode"] == "navigate"
+    assert contact_step["contact_steps"][1]["step"] == "wait_contacts_ui"
+    assert contact_step["contact_steps"][1]["status"] == "success"
+    assert contact_step["contact_steps"][2]["step"] == "open_add_contact_menu"
+    assert contact_step["contact_steps"][2]["status"] == "success"
+    assert contact_step["contact_steps"][3]["step"] == "wait_add_contact_menu_item"
+    assert contact_step["contact_steps"][3]["status"] == "success"
+    assert contact_step["contact_steps"][4]["step"] == "open_add_contact_modal"
+    assert contact_step["contact_steps"][4]["status"] == "success"
+    assert contact_step["contact_steps"][5]["step"] == "wait_add_contact_modal"
+    assert contact_step["contact_steps"][5]["status"] == "success"
+    assert contact_step["contact_steps"][6]["step"] == "select_mobile_number_tab"
+    assert contact_step["contact_steps"][6]["status"] == "success"
+    assert contact_step["contact_steps"][7]["step"] == "fill_phone"
+    assert contact_step["contact_steps"][7]["status"] == "success"
+    assert contact_step["contact_steps"][7]["value"] == "9120000001"
+    assert contact_step["contact_steps"][8]["step"] == "fill_name"
+    assert contact_step["contact_steps"][8]["status"] == "success"
+    assert contact_step["contact_steps"][8]["value"] == "Bale-000001"
+    assert page.urls[-1] == "https://web.bale.ai/contacts"
+    assert selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0] in page.clicked
+    assert selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0] in page.clicked
+    assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
+    assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9120000001") in page.filled
+    assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
     assert (selectors.MESSAGE_INPUT_SELECTORS[0], "hello real text") in page.filled
     assert "Enter" in page.keyboard.pressed
-    assert result["failed_step"] == "confirm_sent"
+
+
+def test_save_contact_by_phone_returns_saved_for_captured_modal_flow() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(
+        page,
+        normalized_phone="989304073331",
+        contact_naming_value="Bale-000001",
+        account_id="bale_test",
+        job_id="job_001",
+    )
+
+    assert result["status"] == "success"
+    assert result["contact_save_status"] == "saved"
+    assert result["account_id"] == "bale_test"
+    assert result["job_id"] == "job_001"
+    assert result["contact_phone_value"] == "9304073331"
+    assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
+    assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9304073331") in page.filled
+    assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+
+
+def test_save_contact_by_phone_returns_structured_failure_when_entrypoint_missing() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(
+        page,
+        normalized_phone="989304073331",
+        contact_naming_value="Bale-000001",
+        account_id="bale_test",
+    )
+
+    assert result["status"] == "failed"
+    assert result["contact_save_status"] == "failed"
+    assert result["account_id"] == "bale_test"
+    assert result["error_code"] == "contact_save_failed"
+    assert result["detail_error_code"] == "add_contact_entrypoint_not_found"
+    assert result["user_message"] == "مخاطب در بله ذخیره نشد"
+    assert result["reason"] == "add_contact_entrypoint_not_found"
+    assert result["contact_steps"][0]["step"] == "open_contacts"
+    assert result["contact_steps"][0]["status"] == "success"
+    assert result["contact_steps"][0]["mode"] == "already_open"
+    assert result["contact_steps"][1]["step"] == "wait_contacts_ui"
+    assert result["contact_steps"][1]["status"] == "success"
+    assert result["contact_steps"][2]["step"] == "open_add_contact_menu"
+    assert result["contact_steps"][2]["status"] == "failed"
+
+
+def test_save_contact_by_phone_returns_structured_failure_when_add_contact_menu_item_missing() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "contact_save_failed"
+    assert result["detail_error_code"] == "add_contact_menu_item_not_found"
+    assert result["contact_steps"][3]["step"] == "wait_add_contact_menu_item"
+    assert result["contact_steps"][3]["status"] == "failed"
+
+
+def test_save_contact_by_phone_returns_structured_failure_when_modal_missing() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "contact_save_failed"
+    assert result["detail_error_code"] == "add_contact_modal_not_found"
+    assert result["contact_steps"][4]["step"] == "open_add_contact_modal"
+    assert result["contact_steps"][4]["status"] == "success"
+    assert result["contact_steps"][5]["step"] == "wait_add_contact_modal"
+    assert result["contact_steps"][5]["status"] == "failed"
+
+
+def test_save_contact_by_phone_returns_structured_failure_when_mobile_tab_missing() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "contact_save_failed"
+    assert result["detail_error_code"] == "mobile_number_tab_not_found"
+    assert result["contact_steps"][6]["step"] == "select_mobile_number_tab"
+    assert result["contact_steps"][6]["status"] == "failed"
+
+
+def test_send_text_message_uses_modal_scoped_phone_input_fallback_after_country_selector() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_COUNTRY_SELECTOR_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_FALLBACK_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+            selectors.MESSAGE_SENT_INDICATOR_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.send_text_message(
+        "bale_test",
+        normalized_phone="+989304073331",
+        contact_naming_value="Bale-000001",
+        message_text="hello real text",
+    )
+
+    assert result["ok"] is True
+    assert result["contact_save_status"] == "saved"
+    contact_step = next(item for item in result["step_results"] if item["step"] == "save_or_resolve_contact")
+    assert contact_step["country_selector"] == selectors.ADD_CONTACT_COUNTRY_SELECTOR_SELECTORS[0]
+    assert contact_step["phone_input_fallback_used"] is True
+    assert (selectors.ADD_CONTACT_PHONE_INPUT_FALLBACK_SELECTORS[0], "9304073331") in page.filled
+
+
+def test_send_text_message_uses_second_modal_input_name_fallback() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_FALLBACK_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+            selectors.MESSAGE_SENT_INDICATOR_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.send_text_message(
+        "bale_test",
+        normalized_phone="989304073331",
+        contact_naming_value="Bale-000001",
+        message_text="hello real text",
+    )
+
+    assert result["ok"] is True
+    contact_step = next(item for item in result["step_results"] if item["step"] == "save_or_resolve_contact")
+    assert contact_step["name_input_fallback_used"] is True
+    assert (selectors.ADD_CONTACT_NAME_INPUT_FALLBACK_SELECTORS[0], "Bale-000001") in page.filled
+
+
+def test_bale_contact_phone_strips_iran_country_code_for_contact_modal() -> None:
+    assert phone_for_bale_contact_field("989304073331") == "9304073331"
+    assert phone_for_bale_contact_field("+989304073331") == "9304073331"
+    assert phone_for_bale_contact_field("09304073331") == "9304073331"
+    assert phone_for_bale_contact_field("9304073331") == "9304073331"
 
 
 def test_send_text_message_target_not_found_returns_open_target_chat_failure() -> None:
     page = MockPage(
         {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
             selectors.SEARCH_ICON_SELECTORS[0],
             selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
             selectors.MESSAGE_INPUT_SELECTORS[0],
@@ -306,6 +594,14 @@ def test_send_text_message_target_not_found_returns_open_target_chat_failure() -
 def test_send_text_message_message_input_missing_returns_structured_error() -> None:
     page = MockPage(
         {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
             selectors.SEARCH_ICON_SELECTORS[0],
             selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
             selectors.CHAT_ITEM_SELECTORS[0],
@@ -1452,7 +1748,7 @@ class StubBalePlugin:
             "started_at": "2026-07-04T00:00:00+00:00",
             "finished_at": "2026-07-04T00:00:01+00:00",
             "duration_ms": 1000,
-            "contact_save_status": "not_supported_yet",
+            "contact_save_status": "saved" if self.ok else "failed",
             "step_results": [],
         }
         if self.ok:
@@ -1769,6 +2065,15 @@ if __name__ == "__main__":
     test_send_test_message_install_prompt_maps_error()
     test_open_login_returns_profile_dir_without_real_browser()
     test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
+    test_send_text_message_saves_contact_with_captured_add_contact_modal_flow()
+    test_save_contact_by_phone_returns_saved_for_captured_modal_flow()
+    test_save_contact_by_phone_returns_structured_failure_when_entrypoint_missing()
+    test_save_contact_by_phone_returns_structured_failure_when_add_contact_menu_item_missing()
+    test_save_contact_by_phone_returns_structured_failure_when_modal_missing()
+    test_save_contact_by_phone_returns_structured_failure_when_mobile_tab_missing()
+    test_send_text_message_uses_modal_scoped_phone_input_fallback_after_country_selector()
+    test_send_text_message_uses_second_modal_input_name_fallback()
+    test_bale_contact_phone_strips_iran_country_code_for_contact_modal()
     test_send_text_message_target_not_found_returns_open_target_chat_failure()
     test_send_text_message_message_input_missing_returns_structured_error()
     test_send_test_message_message_input_missing_path()
