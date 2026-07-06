@@ -465,13 +465,16 @@ def test_save_contact_by_phone_returns_structured_failure_when_modal_missing() -
     assert result["contact_steps"][5]["status"] == "failed"
 
 
-def test_save_contact_by_phone_returns_structured_failure_when_mobile_tab_missing() -> None:
+def test_save_contact_by_phone_continues_when_mobile_tab_missing() -> None:
     page = MockPage(
         {
             selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
             selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
             selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
             selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
         },
         url="https://web.bale.ai/contacts?uid=123",
     )
@@ -479,11 +482,13 @@ def test_save_contact_by_phone_returns_structured_failure_when_mobile_tab_missin
 
     result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
 
-    assert result["status"] == "failed"
-    assert result["error_code"] == "contact_save_failed"
-    assert result["detail_error_code"] == "mobile_number_tab_not_found"
+    assert result["status"] == "success"
+    assert result["contact_save_status"] == "saved"
     assert result["contact_steps"][6]["step"] == "select_mobile_number_tab"
-    assert result["contact_steps"][6]["status"] == "failed"
+    assert result["contact_steps"][6]["status"] == "skipped"
+    assert result["contact_steps"][6]["reason"] == "already_default_or_not_required"
+    assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9304073331") in page.filled
+    assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
 
 
 def test_send_text_message_uses_modal_scoped_phone_input_fallback_after_country_selector() -> None:
@@ -2070,7 +2075,7 @@ if __name__ == "__main__":
     test_save_contact_by_phone_returns_structured_failure_when_entrypoint_missing()
     test_save_contact_by_phone_returns_structured_failure_when_add_contact_menu_item_missing()
     test_save_contact_by_phone_returns_structured_failure_when_modal_missing()
-    test_save_contact_by_phone_returns_structured_failure_when_mobile_tab_missing()
+    test_save_contact_by_phone_continues_when_mobile_tab_missing()
     test_send_text_message_uses_modal_scoped_phone_input_fallback_after_country_selector()
     test_send_text_message_uses_second_modal_input_name_fallback()
     test_bale_contact_phone_strips_iran_country_code_for_contact_modal()

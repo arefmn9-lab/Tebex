@@ -968,19 +968,23 @@ class BalePlugin:
             return result
 
         phone_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_MODE_SELECTORS, timeout_ms=2000)
-        if not phone_mode:
-            result["error_code"] = "mobile_number_tab_not_found"
-            result["reason"] = "mobile_number_tab_not_found"
-            result["message"] = "Bale Add Contact mobile number tab was not found"
-            contact_steps.append({"step": "select_mobile_number_tab", "status": "failed", "error_code": "mobile_number_tab_not_found"})
-            return result
-        self._click_if_possible(page, phone_mode)
-        result["phone_mode_selector"] = phone_mode
-        contact_steps.append({"step": "select_mobile_number_tab", "status": "success", "selector": phone_mode})
+        if phone_mode:
+            self._click_if_possible(page, phone_mode)
+            result["phone_mode_selector"] = phone_mode
+            contact_steps.append({"step": "select_mobile_number_tab", "status": "success", "selector": phone_mode})
+        else:
+            contact_steps.append(
+                {
+                    "step": "select_mobile_number_tab",
+                    "status": "skipped",
+                    "reason": "already_default_or_not_required",
+                }
+            )
         username_mode = self._first_visible_selector(page, selectors.ADD_CONTACT_USERNAME_MODE_SELECTORS, timeout_ms=500)
         if username_mode:
             result["username_mode_selector"] = username_mode
 
+        modal_inputs = self._visible_modal_inputs(page, modal)
         name_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_NAME_INPUT_SELECTORS, timeout_ms=3000)
         name_input_fallback_used = False
         if not name_selector:
@@ -995,6 +999,12 @@ class BalePlugin:
                 result["country_selector"] = country_selector
                 phone_selector = self._first_visible_selector(page, selectors.ADD_CONTACT_PHONE_INPUT_FALLBACK_SELECTORS, timeout_ms=2000)
                 phone_input_fallback_used = bool(phone_selector)
+        if not phone_selector:
+            phone_selector = self._modal_phone_input_selector(modal_inputs)
+            phone_input_fallback_used = bool(phone_selector)
+        if not name_selector:
+            name_selector = self._modal_name_input_selector(modal_inputs, exclude_selector=phone_selector)
+            name_input_fallback_used = bool(name_selector)
         if not name_selector or not phone_selector:
             result.update(
                 {
@@ -1044,7 +1054,16 @@ class BalePlugin:
         if last_name_selector and last_name:
             self._fill_or_type(page, last_name_selector, last_name)
 
-        save_button = self._first_visible_selector(page, selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS, timeout_ms=3000)
+        save_button = self._first_visible_selector(
+            page,
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS
+            + [
+                'text=افزودن',
+                'button:has-text("افزودن")',
+                '[role="button"]:has-text("افزودن")',
+            ],
+            timeout_ms=3000,
+        )
         if not save_button:
             result.update(
                 {
@@ -1074,6 +1093,55 @@ class BalePlugin:
             }
         )
         return result
+
+    def _visible_modal_inputs(self, page: Any, modal_selector: str) -> list[dict[str, str]]:
+        inputs: list[dict[str, str]] = []
+        roots = [modal_selector, ".ReactModal__Content", ".ReactModal__Overlay", '[role="dialog"]']
+        seen: set[str] = set()
+        for root in roots:
+            if not root:
+                continue
+            input_group = f"{root} input"
+            try:
+                count = page.locator(input_group).count()
+            except Exception:
+                count = 0
+            for index in range(count):
+                selector = f"{input_group} >> nth={index}"
+                if selector in seen:
+                    continue
+                try:
+                    locator = page.locator(input_group).nth(index)
+                    locator.wait_for(state="visible", timeout=1000)
+                    placeholder = str(locator.get_attribute("placeholder", timeout=1000) or "")
+                    input_type = str(locator.get_attribute("type", timeout=1000) or "text")
+                except Exception:
+                    continue
+                if input_type.lower() in {"hidden", "button", "submit"}:
+                    continue
+                seen.add(selector)
+                inputs.append({"selector": selector, "placeholder": placeholder, "type": input_type})
+        return inputs
+
+    def _modal_phone_input_selector(self, modal_inputs: list[dict[str, str]]) -> str:
+        for item in modal_inputs:
+            placeholder = item.get("placeholder", "")
+            if any(token in placeholder for token in ("912", "345", "6789")):
+                return item.get("selector", "")
+        return modal_inputs[0].get("selector", "") if modal_inputs else ""
+
+    def _modal_name_input_selector(self, modal_inputs: list[dict[str, str]], exclude_selector: str | None = None) -> str:
+        for item in modal_inputs:
+            selector = item.get("selector", "")
+            if selector == exclude_selector:
+                continue
+            placeholder = item.get("placeholder", "")
+            if any(token in placeholder for token in ("Name", "required", "نام")):
+                return selector
+        remaining = [item.get("selector", "") for item in modal_inputs if item.get("selector") != exclude_selector]
+        if len(remaining) >= 2:
+            return remaining[1]
+        return remaining[0] if remaining else ""
 
     def _add_step(self, step_results: list[dict[str, Any]], step: str, status: str, **details: Any) -> None:
         step_results.append({"step": step, "status": status, **details})
