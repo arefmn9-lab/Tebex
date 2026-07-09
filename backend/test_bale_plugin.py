@@ -245,6 +245,13 @@ class MockBrowserManager:
 
 
 class SearchOpensOnClickPage(MockPage):
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        super().fill(selector, text, timeout)
+        if selector in selectors.TEXT_SEARCH_INPUT_SELECTORS:
+            for candidate_selector, candidate_text in list(self.selector_text.items()):
+                if candidate_selector in selectors.CHAT_ITEM_SELECTORS and candidate_text == text:
+                    self.visible_selectors.add(candidate_selector)
+
     def click(self, selector: str, timeout: int) -> None:
         super().click(selector, timeout)
         if selector in {selectors.SEARCH_ICON_SELECTORS[0], selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS[0]}:
@@ -254,6 +261,13 @@ class SearchOpensOnClickPage(MockPage):
 
 
 class SearchSvgInterceptedParentOpensPage(MockPage):
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        super().fill(selector, text, timeout)
+        if selector in selectors.TEXT_SEARCH_INPUT_SELECTORS:
+            for candidate_selector, candidate_text in list(self.selector_text.items()):
+                if candidate_selector in selectors.CHAT_ITEM_SELECTORS and candidate_text == text:
+                    self.visible_selectors.add(candidate_selector)
+
     def click(self, selector: str, timeout: int) -> None:
         if selector in selectors.SEARCH_ICON_SVG_SELECTORS:
             raise TimeoutError('<div class="ZGzps0"></div> intercepts pointer events')
@@ -269,6 +283,197 @@ class ContactsSearchAppearsAfterReloadPage(MockPage):
         super().goto(url, wait_until)
         if url.endswith("/contacts"):
             self.visible_selectors.add('input[type="search"][placeholder="Search Contact..."]')
+
+
+class StuckContactsAfterReturnPage(MockPage):
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        self.url = "https://web.bale.ai/contacts"
+
+
+class ChatReadyAfterReturnRetryPage(MockPage):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.chat_goto_count = 0
+
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        if url.endswith("/chat"):
+            self.chat_goto_count += 1
+            if self.chat_goto_count == 1:
+                self.url = "https://web.bale.ai/contacts"
+                return
+            self.url = "https://web.bale.ai/chat"
+            self.visible_selectors.add(selectors.SEARCH_ICON_SELECTORS[0])
+            return
+        self.url = url
+
+
+class DelayedChatReadyAfterReturnPage(MockPage):
+    def __init__(self, *args: object, ready_after_locator_calls: int = 6, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.ready_after_locator_calls = ready_after_locator_calls
+        self.locator_calls = 0
+
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        self.url = "https://web.bale.ai/chat" if url.endswith("/chat") else url
+
+    def locator(self, selector: str) -> MockLocator:
+        self.locator_calls += 1
+        if self.url.endswith("/chat") and self.locator_calls >= self.ready_after_locator_calls:
+            self.visible_selectors.add(selectors.SEARCH_ICON_SELECTORS[0])
+        return MockLocator(selector, self)
+
+
+class ChatUrlNeverReadyAfterReturnPage(MockPage):
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        self.url = "https://web.bale.ai/chat" if url.endswith("/chat") else url
+
+
+class ChatShellTextOnlyAfterReturnPage(MockPage):
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        self.url = "https://web.bale.ai/chat" if url.endswith("/chat") else url
+        self.selector_text["body"] = "گفتگو همه شخصی گروه کانال بازو"
+
+
+class ContactsToChatSearchReadyPage(SearchOpensOnClickPage):
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        if url.endswith("/chat"):
+            self.url = "https://web.bale.ai/chat"
+            self.visible_selectors.add(selectors.SEARCH_ICON_SELECTORS[0])
+            self.visible_selectors.add(selectors.SEARCH_ICON_CLICK_TARGET_SELECTORS[0])
+            self.visible_selectors.add(selectors.CHAT_ITEM_SELECTORS[0])
+            return
+        self.url = url
+
+    def mouse_click(self, x: float, y: float) -> None:
+        self.visible_selectors.add(selectors.MESSAGE_INPUT_SELECTORS[0])
+        self.url = "https://web.bale.ai/chat?uid=mock"
+
+
+class ChatAppBarOpenPage(MockPage):
+    def evaluate(self, script: str) -> object:
+        if "ChatAppBar" in script:
+            return self.right_header_text
+        return super().evaluate(script)
+
+
+class QHFPB6RealRowPage(MockPage):
+    row_selector = "div.qHFpb6"
+
+    def __init__(
+        self,
+        visible_selectors: set[str],
+        query_results: dict[str, str],
+        confirm_with_chat_app_bar: bool = True,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(visible_selectors, **kwargs)
+        self.query_results = query_results
+        self.confirm_with_chat_app_bar = confirm_with_chat_app_bar
+
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        super().fill(selector, text, timeout)
+        if selector in selectors.TEXT_SEARCH_INPUT_SELECTORS and self.query_results.get(text):
+            self.visible_selectors.add(self.row_selector)
+
+    def evaluate(self, script: str) -> object:
+        if "querySelectorAll(\".qHFpb6" in script or "querySelectorAll(\".qHFpb6, [class*='qHFpb6']\")" in script:
+            query = self.filled[-1][1] if self.filled else ""
+            return [
+                {
+                    "text": f"{query}\n@safora4321",
+                    "className": "qHFpb6",
+                    "box": {"x": 91, "y": 132, "w": 361, "h": 74},
+                    "clickBox": {"x": 91, "y": 132, "w": 361, "h": 74},
+                    "accepted_reason": "qhfpb6_row_contains_contact",
+                }
+            ]
+        if "ChatAppBar" in script:
+            return self.right_header_text
+        return super().evaluate(script)
+
+    def mouse_click(self, x: float, y: float) -> None:
+        if self.confirm_with_chat_app_bar:
+            self.right_header_text = "Bale-000001\n\nlast seen recently"
+            self.visible_selectors.add(selectors.MESSAGE_INPUT_SELECTORS[0])
+            self.url = "https://web.bale.ai/chat?uid=qhfpb6"
+
+
+class NormalChatListPage(MockPage):
+    row_selector = '[aria-label="dialog-item"]'
+
+    def __init__(self, *args: object, confirm_on_click: bool = True, use_evaluate_candidate: bool = False, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.confirm_on_click = confirm_on_click
+        self.use_evaluate_candidate = use_evaluate_candidate
+
+    def evaluate(self, script: str) -> object:
+        if "ChatAppBar" in script:
+            return self.right_header_text
+        if "data-clinicos-bale-chat-list" in script and self.use_evaluate_candidate:
+            return [
+                {
+                    "selector": "[data-clinicos-bale-chat-list=\"mock\"]",
+                    "click_selector": "[data-clinicos-bale-chat-list=\"mock\"]",
+                    "text": "Bale-000001\n۲۲:۰۱",
+                    "className": "chat-row",
+                    "box": {"x": 20, "y": 120, "w": 360, "h": 74},
+                    "clickBox": {"x": 20, "y": 120, "w": 360, "h": 74},
+                    "accepted_reason": "left_chat_list_row_contains_contact",
+                }
+            ]
+        return super().evaluate(script)
+
+    def mouse_click(self, x: float, y: float) -> None:
+        if self.confirm_on_click:
+            self.right_header_text = "Bale-000001\n\nlast seen recently"
+            self.visible_selectors.add(selectors.MESSAGE_INPUT_SELECTORS[0])
+            self.url = "https://web.bale.ai/chat?uid=normal-list"
+
+
+class ContactBounceKeyboard:
+    def __init__(self, page: "ContactBounceDuringSearchActivationPage") -> None:
+        self.page = page
+        self.pressed: list[str] = []
+
+    def press(self, key: str) -> None:
+        self.pressed.append(key)
+        if key == "Control+K":
+            self.page.url = "https://web.bale.ai/contacts"
+            self.page.visible_selectors.discard(selectors.SEARCH_ICON_SELECTORS[0])
+            return
+        if key == "Control+F":
+            self.page.visible_selectors.add(selectors.TEXT_SEARCH_INPUT_SELECTORS[2])
+
+
+class ContactBounceDuringSearchActivationPage(MockPage):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.keyboard = ContactBounceKeyboard(self)
+
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        self.urls.append(url)
+        if url.endswith("/chat"):
+            self.url = "https://web.bale.ai/chat"
+            self.visible_selectors.add(selectors.SEARCH_ICON_SELECTORS[0])
+            return
+        self.url = url
+
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        super().fill(selector, text, timeout)
+        if selector in selectors.TEXT_SEARCH_INPUT_SELECTORS and text:
+            self.visible_selectors.add(selectors.CHAT_ITEM_SELECTORS[0])
+            self.selector_text[selectors.CHAT_ITEM_SELECTORS[0]] = text
+
+    def click(self, selector: str, timeout: int) -> None:
+        MockPage.click(self, selector, timeout)
+        if selector in selectors.CHAT_ITEM_SELECTORS:
+            self.url = "https://web.bale.ai/chat?uid=mock"
 
 
 class ContactsQueryResultPage(MockPage):
@@ -776,12 +981,56 @@ def test_send_text_message_saves_contact_with_captured_add_contact_modal_flow() 
     assert contact_step["contact_steps"][8]["status"] == "success"
     assert contact_step["contact_steps"][8]["value"] == "Bale-000001"
     assert "https://web.bale.ai/contacts" in page.urls
-    assert page.urls[-1] == plugin.web_url
+    assert page.urls[-1] == f"{plugin.web_url}/chat"
     assert selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0] in page.clicked
     assert selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0] in page.clicked
     assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
     assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9120000001") in page.filled
     assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+    assert (selectors.MESSAGE_INPUT_SELECTORS[0], "hello real text") in page.filled
+    assert "Enter" in page.keyboard.pressed
+    assert page.timeouts
+    assert max(page.timeouts) <= 1500
+    assert all(timeout < 30000 for timeout in page.timeouts)
+
+
+def test_send_text_message_assumes_success_when_send_confirmation_missing() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.send_text_message(
+        "bale_test",
+        normalized_phone="989120000001",
+        contact_naming_value="Bale-000001",
+        message_text="hello real text",
+    )
+
+    confirm_step = next(item for item in result["step_results"] if item["step"] == "confirm_sent")
+    assert result["ok"] is True
+    assert result["success"] is True
+    assert result["warning_code"] == "send_confirmation_not_implemented"
+    assert result["warning_message"] == "Message send was triggered, but delivery confirmation is not implemented yet."
+    assert confirm_step["status"] == "assumed_success"
+    assert confirm_step["reason"] == "send_confirmation_not_implemented"
+    assert confirm_step["status"] != "failed"
+    assert result["failed_step"] is None
     assert (selectors.MESSAGE_INPUT_SELECTORS[0], "hello real text") in page.filled
     assert "Enter" in page.keyboard.pressed
 
@@ -1121,11 +1370,356 @@ def test_send_text_message_target_not_found_returns_open_target_chat_failure() -
     assert result["search_attempts"]
 
 
+def test_return_to_chat_after_contact_save_does_not_succeed_on_contacts_page() -> None:
+    page = StuckContactsAfterReturnPage(
+        {
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "main_chat_ui_not_ready"
+    assert result["return_to_chat_url_before"] == "https://web.bale.ai/contacts"
+    assert result["return_to_chat_final_url"] == "https://web.bale.ai/contacts"
+    assert result["return_to_chat_ready_confirmed"] is False
+    assert result["return_to_chat_retry_used"] is True
+    assert result["return_to_chat_contacts_ui_visible"] is True
+    assert result["return_to_chat_main_chat_ui_visible"] is False
+    assert page.urls == [f"{plugin.web_url}/chat", f"{plugin.web_url}/chat"]
+    assert all(timeout < 30000 for timeout in page.timeouts)
+
+
+def test_return_to_chat_after_contact_save_retries_until_chat_page_ready() -> None:
+    page = ChatReadyAfterReturnRetryPage(
+        {
+            selectors.CONTACTS_UI_READY_SELECTORS[0],
+        },
+        url="https://web.bale.ai/contacts",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["return_to_chat_url_before"] == "https://web.bale.ai/contacts"
+    assert result["return_to_chat_url_after_goto"] == "https://web.bale.ai/contacts"
+    assert result["return_to_chat_final_url"] == "https://web.bale.ai/chat"
+    assert result["return_to_chat_ready_confirmed"] is True
+    assert result["return_to_chat_retry_used"] is True
+    assert result["return_to_chat_contacts_ui_visible"] is False
+    assert result["return_to_chat_main_chat_ui_visible"] is True
+    assert result["return_to_chat_ready_selector"] == selectors.SEARCH_ICON_SELECTORS[0]
+    assert page.urls == [f"{plugin.web_url}/chat", f"{plugin.web_url}/chat"]
+    assert all(timeout < 30000 for timeout in page.timeouts)
+
+
+def test_return_to_chat_after_contact_save_succeeds_when_ready_signal_is_immediate() -> None:
+    page = MockPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["mode"] == "already_ready"
+    assert result["return_to_chat_ready_confirmed"] is True
+    assert result["return_to_chat_ready_selector"] == selectors.SEARCH_ICON_SELECTORS[0]
+    assert result["return_to_chat_wait_budget_ms"] == 300
+    assert len(result["return_to_chat_ready_attempts"]) == 1
+    assert page.urls == []
+
+
+def test_return_to_chat_after_contact_save_succeeds_after_several_polls() -> None:
+    page = DelayedChatReadyAfterReturnPage(set(), url="https://web.bale.ai/contacts", ready_after_locator_calls=12)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["return_to_chat_final_url"] == "https://web.bale.ai/chat"
+    assert result["return_to_chat_ready_confirmed"] is True
+    assert result["return_to_chat_wait_budget_ms"] == 5000
+    assert result["return_to_chat_poll_interval_ms"] == 100
+    assert len(result["return_to_chat_ready_attempts"]) >= 1
+    assert result["return_to_chat_ready_selector"] == selectors.SEARCH_ICON_SELECTORS[0]
+    assert all(timeout < 30000 for timeout in page.timeouts)
+
+
+def test_return_to_chat_after_contact_save_fails_when_chat_url_never_ready() -> None:
+    page = ChatUrlNeverReadyAfterReturnPage(set(), url="https://web.bale.ai/contacts")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "main_chat_ui_not_ready"
+    assert result["return_to_chat_final_url"] == "https://web.bale.ai/chat"
+    assert result["return_to_chat_ready_confirmed"] is False
+    assert result["return_to_chat_ready_selector"] == ""
+    assert result["return_to_chat_wait_budget_ms"] == 5000
+    assert result["return_to_chat_ready_attempts"]
+    assert all(timeout < 30000 for timeout in page.timeouts)
+
+
+def test_return_to_chat_after_contact_save_does_not_accept_shell_text_only() -> None:
+    page = ChatShellTextOnlyAfterReturnPage(set(), url="https://web.bale.ai/contacts")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "main_chat_ui_not_ready"
+    assert result["return_to_chat_final_url"] == "https://web.bale.ai/chat"
+    assert result["return_to_chat_ready_confirmed"] is False
+    assert result["return_to_chat_ready_selector"] == ""
+    assert result["return_to_chat_text_shell_seen"] is True
+    assert result["return_to_chat_real_ready_seen"] is False
+
+
+def test_return_to_chat_after_contact_save_succeeds_when_dialog_item_visible() -> None:
+    page = MockPage(
+        {
+            selectors.CHAT_ITEM_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._return_to_chat_after_contact_save(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["return_to_chat_ready_confirmed"] is True
+    assert result["return_to_chat_ready_selector"] == selectors.CHAT_ITEM_SELECTORS[0]
+    assert result["return_to_chat_real_ready_seen"] is True
+
+
+def test_open_target_chat_contacts_guard_waits_for_chat_before_searching() -> None:
+    contact_name = "Bale-000001"
+    page = ContactsToChatSearchReadyPage(
+        {selectors.CONTACTS_UI_READY_SELECTORS[0]},
+        url="https://web.bale.ai/contacts",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: contact_name},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["open_target_chat_ready_guard_used"] is True
+    assert result["open_target_chat_ready_guard_success"] is True
+    assert result["open_target_chat_url_before_ready_guard"] == "https://web.bale.ai/contacts"
+    assert result["open_target_chat_url_after_ready_guard"] == "https://web.bale.ai/chat"
+    assert result["normal_chat_list_click_confirmed"] is True
+    assert result["search_activation_skipped_reason"] == "normal_chat_list_result_clicked"
+    assert page.filled == []
+
+
+def test_open_target_chat_contacts_guard_fails_when_chat_not_ready() -> None:
+    page = ChatUrlNeverReadyAfterReturnPage(set(), url="https://web.bale.ai/contacts")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "main_chat_ui_not_ready"
+    assert result["open_target_chat_ready_guard_used"] is True
+    assert result["open_target_chat_ready_guard_success"] is False
+    assert result["open_target_chat_url_before_ready_guard"] == "https://web.bale.ai/contacts"
+    assert result["open_target_chat_url_after_ready_guard"] == "https://web.bale.ai/chat"
+    assert page.filled == []
+
+
+def test_open_target_chat_recovers_when_control_k_bounces_to_contacts() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[2]
+    page = ContactBounceDuringSearchActivationPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: contact_name},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["open_target_chat_ready_guard_used"] is True
+    assert result["open_target_chat_recovered_from_contacts_count"] >= 1
+    assert any(check["reason"] == "after_Control+K" and check["guard_used"] for check in result["open_target_chat_ready_guard_checks"])
+    assert result["open_target_chat_ready_guard_success"] is True
+    assert (search_input, contact_name) in page.filled
+    assert "Control+K" in page.keyboard.pressed
+    assert "Control+F" in page.keyboard.pressed
+
+
+def test_open_target_chat_contacts_recovery_failure_is_main_chat_ui_not_ready() -> None:
+    page = ChatUrlNeverReadyAfterReturnPage(set(), url="https://web.bale.ai/contacts")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "main_chat_ui_not_ready"
+    assert result["open_target_chat_ready_guard_used"] is True
+    assert result["open_target_chat_ready_guard_success"] is False
+    assert result["open_target_chat_failed_due_to_contacts_page"] is False
+    assert result["search_attempts"] == []
+
+
+def test_open_target_chat_already_open_chat_app_bar_succeeds_without_search() -> None:
+    page = ChatAppBarOpenPage(
+        {
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+        right_header_text="Bale-000001\n\nlast seen recently",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["target_already_open_detected"] is True
+    assert result["target_already_open_chat_app_bar_text"] == "Bale-000001\n\nlast seen recently"
+    assert result["target_already_open_message_input_visible"] is True
+    assert result["contacts_fallback_skipped_reason"] == "target_already_open"
+    assert page.filled == []
+
+
+def test_open_target_chat_clicks_real_qhfpb6_row_and_confirms_chat_app_bar() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    page = QHFPB6RealRowPage(
+        {search_input},
+        query_results={contact_name: f"{contact_name}\n@safora4321"},
+        url="https://web.bale.ai/chat",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["qhfpb6_candidate_count"] == 1
+    assert result["qhfpb6_click_box"] == {"x": 91, "y": 132, "w": 361, "h": 74}
+    assert result["qhfpb6_click_coordinates"] == {"x": 271.5, "y": 169.0}
+    assert result["qhfpb6_click_confirmed"] is True
+    assert result["selected_candidate_reason"] == "qhfpb6_row_contains_contact"
+    assert result["contacts_fallback_skipped_reason"] == "qhfpb6_result_visible"
+    assert page.mouse.clicks == [(271.5, 169.0)]
+
+
+def test_open_target_chat_qhfpb6_click_not_confirmed_fails_without_contacts_fallback() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    page = QHFPB6RealRowPage(
+        {search_input},
+        query_results={contact_name: f"{contact_name}\n@safora4321"},
+        url="https://web.bale.ai/chat",
+        confirm_with_chat_app_bar=False,
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "result_click_not_confirmed"
+    assert result["qhfpb6_candidate_count"] == 1
+    assert result["contacts_fallback_skipped_reason"] == "qhfpb6_result_visible"
+
+
+def test_open_target_chat_clicks_normal_dialog_item_before_search() -> None:
+    page = NormalChatListPage(
+        {selectors.SEARCH_ICON_SELECTORS[0], selectors.CHAT_ITEM_SELECTORS[0]},
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001\n۲۲:۰۱"},
+        bounding_boxes={selectors.CHAT_ITEM_SELECTORS[0]: {"x": 20, "y": 120, "w": 360, "h": 74}},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["normal_chat_list_scan_attempted"] is True
+    assert result["normal_chat_list_candidate_count"] >= 1
+    assert result["normal_chat_list_click_confirmed"] is True
+    assert result["normal_chat_list_selector_used"] == selectors.CHAT_ITEM_SELECTORS[0]
+    assert result["normal_chat_list_click_coordinates"] == {"x": 200.0, "y": 157.0}
+    assert result["search_activation_skipped_reason"] == "normal_chat_list_result_clicked"
+    assert page.keyboard.pressed == []
+    assert page.filled == []
+
+
+def test_open_target_chat_clicks_normal_chat_list_text_node_ancestor() -> None:
+    page = NormalChatListPage(
+        {selectors.SEARCH_ICON_SELECTORS[0]},
+        url="https://web.bale.ai/chat",
+        use_evaluate_candidate=True,
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["normal_chat_list_candidate_count"] == 1
+    assert result["text_node_chat_list_candidate_count"] == 1
+    assert result["normal_chat_list_click_box"] == {"x": 20, "y": 120, "w": 360, "h": 74}
+    assert result["search_activation_skipped_reason"] == "normal_chat_list_result_clicked"
+    assert page.keyboard.pressed == []
+
+
+def test_open_target_chat_normal_list_item_precedes_qhfpb6_absent_search() -> None:
+    page = NormalChatListPage(
+        {selectors.SEARCH_ICON_SELECTORS[0], selectors.CHAT_ITEM_SELECTORS[0]},
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001\nسلام"},
+        bounding_boxes={selectors.CHAT_ITEM_SELECTORS[0]: {"x": 30, "y": 150, "w": 340, "h": 70}},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "success"
+    assert result["qhfpb6_candidate_count"] == 0
+    assert result["contacts_fallback_skipped_reason"] == "normal_chat_list_result_clicked"
+    assert page.filled == []
+
+
+def test_open_target_chat_visible_normal_list_click_not_confirmed_blocks_contacts_fallback() -> None:
+    page = NormalChatListPage(
+        {selectors.SEARCH_ICON_SELECTORS[0], selectors.CHAT_ITEM_SELECTORS[0]},
+        url="https://web.bale.ai/chat",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001\n۲۲:۰۱"},
+        bounding_boxes={selectors.CHAT_ITEM_SELECTORS[0]: {"x": 20, "y": 120, "w": 360, "h": 74}},
+        confirm_on_click=False,
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, "Bale-000001", "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "result_click_not_confirmed"
+    assert result["contacts_fallback_blocked_reason"] == "normal_chat_list_result_visible"
+    assert result["contacts_fallback_skipped_reason"] == "normal_chat_list_result_visible"
+    assert page.keyboard.pressed == []
+    assert page.filled == []
+
+
 def test_open_target_chat_activates_search_from_icon_before_typing() -> None:
     page = SearchOpensOnClickPage(
         {
             selectors.SEARCH_ICON_SELECTORS[0],
-            selectors.CHAT_ITEM_SELECTORS[0],
         },
         url="https://web.bale.ai/chat",
         selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "ClinicOS_Bale_Test_Existing_001"},
@@ -1150,7 +1744,6 @@ def test_open_target_chat_clicks_search_icon_parent_when_svg_is_intercepted() ->
         {
             selectors.SEARCH_ICON_SVG_SELECTORS[0],
             parent_selector,
-            selectors.CHAT_ITEM_SELECTORS[0],
         },
         url="https://web.bale.ai/chat",
         selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "ClinicOS_Bale_Test_Existing_001"},
@@ -3341,6 +3934,7 @@ if __name__ == "__main__":
     test_open_login_returns_profile_dir_without_real_browser()
     test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
     test_send_text_message_saves_contact_with_captured_add_contact_modal_flow()
+    test_send_text_message_assumes_success_when_send_confirmation_missing()
     test_save_contact_by_phone_returns_saved_for_captured_modal_flow()
     test_save_contact_by_phone_does_not_use_broad_page_level_add_text_for_submit()
     test_save_contact_by_phone_disabled_submit_returns_fast_failure()
@@ -3353,6 +3947,24 @@ if __name__ == "__main__":
     test_send_text_message_uses_second_modal_input_name_fallback()
     test_bale_contact_phone_strips_iran_country_code_for_contact_modal()
     test_send_text_message_target_not_found_returns_open_target_chat_failure()
+    test_return_to_chat_after_contact_save_does_not_succeed_on_contacts_page()
+    test_return_to_chat_after_contact_save_retries_until_chat_page_ready()
+    test_return_to_chat_after_contact_save_succeeds_when_ready_signal_is_immediate()
+    test_return_to_chat_after_contact_save_succeeds_after_several_polls()
+    test_return_to_chat_after_contact_save_fails_when_chat_url_never_ready()
+    test_return_to_chat_after_contact_save_does_not_accept_shell_text_only()
+    test_return_to_chat_after_contact_save_succeeds_when_dialog_item_visible()
+    test_open_target_chat_contacts_guard_waits_for_chat_before_searching()
+    test_open_target_chat_contacts_guard_fails_when_chat_not_ready()
+    test_open_target_chat_recovers_when_control_k_bounces_to_contacts()
+    test_open_target_chat_contacts_recovery_failure_is_main_chat_ui_not_ready()
+    test_open_target_chat_already_open_chat_app_bar_succeeds_without_search()
+    test_open_target_chat_clicks_real_qhfpb6_row_and_confirms_chat_app_bar()
+    test_open_target_chat_qhfpb6_click_not_confirmed_fails_without_contacts_fallback()
+    test_open_target_chat_clicks_normal_dialog_item_before_search()
+    test_open_target_chat_clicks_normal_chat_list_text_node_ancestor()
+    test_open_target_chat_normal_list_item_precedes_qhfpb6_absent_search()
+    test_open_target_chat_visible_normal_list_click_not_confirmed_blocks_contacts_fallback()
     test_open_target_chat_activates_search_from_icon_before_typing()
     test_open_target_chat_clicks_search_icon_parent_when_svg_is_intercepted()
     test_open_target_chat_matches_plus98_phone_result()
