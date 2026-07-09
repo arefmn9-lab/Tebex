@@ -352,7 +352,7 @@ class ChatSearchAncestorResultPage(ChatSearchQueryResultPage):
             self.visible_selectors.add(self.ancestor_selector)
 
     def evaluate(self, script: str) -> object:
-        if "querySelectorAll('[aria-label=\"dialog-item\"]" in script:
+        if '[aria-label="dialog-item"]' in script or "qHFpb6" in script or "dialog-item-content" in script:
             text = self.selector_text.get(self.text_selector, "")
             if not text:
                 return []
@@ -392,6 +392,128 @@ class ChatSearchCoordinateFallbackPage(ChatSearchAncestorResultPage):
 
     def mouse_click(self, x: float, y: float) -> None:
         self.url = "https://web.bale.ai/chat?uid=coordinate"
+
+
+class BaleDomEvidenceSearchPage(ChatSearchQueryResultPage):
+    name_selector = "div.oUKPfP"
+    row_selector = "div.z8DuPl.I2osyO.dialog-item-content"
+    container_selector = "div.qHFpb6"
+    input_selector = "input.e8AzTv"
+    row_click_class = "z8DuPl I2osyO dialog-item-content"
+    row_accepted_reason = "exact_oUKPfP_dialog_item_content"
+
+    def __init__(
+        self,
+        visible_selectors: set[str],
+        query_results: dict[str, str],
+        include_input_candidate: bool = False,
+        include_row_candidate: bool = True,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(visible_selectors, query_results, row_selector=self.row_selector, opens_uid_on_click=False, **kwargs)
+        self.include_input_candidate = include_input_candidate
+        self.include_row_candidate = include_row_candidate
+
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        MockPage.fill(self, selector, text, timeout)
+        if selector in selectors.TEXT_SEARCH_INPUT_SELECTORS and self.query_results.get(text):
+            self.visible_selectors.add(self.input_selector)
+            if self.include_row_candidate:
+                self.visible_selectors.update({self.name_selector, self.row_selector, self.container_selector})
+
+    def evaluate(self, script: str) -> object:
+        if 'document.querySelectorAll(".oUKPfP")' in script:
+            query = self.filled[-1][1] if self.filled else ""
+            candidates = []
+            if self.include_input_candidate:
+                candidates.append(
+                    {
+                        "selector": self.input_selector,
+                        "click_selector": self.input_selector,
+                        "text": query,
+                        "tag": "INPUT",
+                        "className": "e8AzTv",
+                        "role": "searchbox",
+                        "box": {"x": 820, "y": 84, "w": 360, "h": 42},
+                        "clickBox": {"x": 820, "y": 84, "w": 360, "h": 42},
+                    }
+                )
+            if self.include_row_candidate:
+                candidates.append(
+                    {
+                        "selector": self.name_selector,
+                        "click_selector": self.row_selector,
+                        "text": f"{query} ØªØµÙˆÛŒØ±",
+                        "tag": "DIV",
+                        "className": "oUKPfP",
+                        "role": "",
+                        "clickTag": "DIV",
+                        "clickClass": self.row_click_class,
+                        "clickRole": "",
+                        "clickText": f"{query} ØªØµÙˆÛŒØ±",
+                        "box": {"x": 1024, "y": 144, "w": 91, "h": 24},
+                        "clickBox": {"x": 828, "y": 132, "w": 287, "h": 74},
+                        "accepted_reason": self.row_accepted_reason,
+                    }
+                )
+            else:
+                for selector, text in self.selector_text.items():
+                    if query and query in text:
+                        candidates.append(
+                            {
+                                "selector": selector,
+                                "click_selector": selector,
+                                "text": text,
+                                "tag": "DIV",
+                                "className": "",
+                                "role": "",
+                                "box": {"x": 0, "y": 0, "w": 900, "h": 420},
+                                "clickBox": {"x": 0, "y": 0, "w": 900, "h": 420},
+                                "rejected_reason": "broad_search_panel_text",
+                            }
+                        )
+            return candidates
+        return super().evaluate(script)
+
+    def click(self, selector: str, timeout: int) -> None:
+        super().click(selector, timeout)
+        if selector in {self.row_selector, self.container_selector}:
+            self.url = "https://web.bale.ai/chat?uid=1672056687"
+
+
+class BaleQHFpb6DomEvidenceSearchPage(BaleDomEvidenceSearchPage):
+    row_selector = "div.qHFpb6"
+    container_selector = "div.qHFpb6"
+    row_click_class = "qHFpb6"
+    row_accepted_reason = "exact_oUKPfP_qHFpb6"
+
+
+class BaleTextNodeFallbackPage(BaleDomEvidenceSearchPage):
+    def __init__(self, *args: object, opens_uid_on_mouse_click: bool = True, **kwargs: object) -> None:
+        super().__init__(*args, include_row_candidate=False, **kwargs)
+        self.opens_uid_on_mouse_click = opens_uid_on_mouse_click
+
+    def evaluate(self, script: str) -> object:
+        if "body *" in script and "broadWords" in script:
+            query = self.filled[-1][1] if self.filled else ""
+            return [
+                {
+                    "text": f"{query} Ã˜ÂªÃ˜ÂµÃ™Ë†Ã›Å’Ã˜Â±",
+                    "box": {"x": 1040, "y": 142, "w": 92, "h": 24},
+                    "clickBox": {"x": 836, "y": 132, "w": 286, "h": 72},
+                    "tag": "SPAN",
+                    "clickTag": "DIV",
+                    "exact": False,
+                    "picture": True,
+                    "score": 20692,
+                }
+            ]
+        return super().evaluate(script)
+
+    def mouse_click(self, x: float, y: float) -> None:
+        super().mouse_click(x, y)
+        if self.opens_uid_on_mouse_click:
+            self.url = "https://web.bale.ai/chat?uid=text-node"
 
 
 class ThreadErrorBrowserManager(MockBrowserManager):
@@ -1115,7 +1237,7 @@ def test_open_target_chat_clicks_nested_result_parent_after_text_match() -> None
 def test_open_target_chat_chat_search_name_result_clicks_uid_without_phone_fallback() -> None:
     contact_name = "ClinicOS-Dynamic-Bale-001"
     search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
-    row_selector = selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[4]
+    row_selector = selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[0]
     page = ChatSearchQueryResultPage(
         {search_input},
         query_results={contact_name: f"{contact_name} last seen recently"},
@@ -1143,13 +1265,13 @@ def test_open_target_chat_chat_search_name_result_clicks_uid_without_phone_fallb
 def test_open_target_chat_visible_name_result_not_confirmed_skips_phone_fallback() -> None:
     contact_name = "ClinicOS-Dynamic-Bale-002"
     search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
-    row_selector = selectors.SEARCH_RESULT_CANDIDATE_SELECTORS[4]
+    row_selector = "div:nth-child(2) > div > .qHFpb6 > .ZGzps0"
     page = ChatSearchQueryResultPage(
         {search_input},
         query_results={contact_name: f"{contact_name} last seen recently"},
         row_selector=row_selector,
         opens_uid_on_click=False,
-        url="https://web.bale.ai/chat",
+        url="https://web.bale.ai/chat/search",
     )
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
 
@@ -1159,7 +1281,7 @@ def test_open_target_chat_visible_name_result_not_confirmed_skips_phone_fallback
     assert result["error_code"] == "chat_open_not_confirmed"
     assert result["name_result_visible"] is True
     assert result["matched_contact_text"] == f"{contact_name} last seen recently"
-    assert result["page_url_after_click"] == "https://web.bale.ai/chat"
+    assert result["page_url_after_click"] == "https://web.bale.ai/chat/search"
     assert result["message_input_visible"] is False
     assert result["click_attempts"]
     assert result["clicked_result"] is True
@@ -1191,7 +1313,7 @@ def test_open_target_chat_broad_search_panel_name_text_does_not_confirm_open() -
     result = plugin._open_target_chat(page, contact_name, "989304073331")
 
     assert result["status"] == "failed"
-    assert result["error_code"] == "chat_open_not_confirmed"
+    assert result["error_code"] == "result_row_not_found"
     assert result["name_result_visible"] is True
     assert result["chat_open_confirmed"] is False
     assert result["false_positive_confirmation_prevented"] is True
@@ -1203,6 +1325,143 @@ def test_open_target_chat_broad_search_panel_name_text_does_not_confirm_open() -
     assert result["phone_fallback_skipped_reason"] == "visible_name_result_not_confirmed"
     assert len(result["chat_query_attempts"]) == 1
     assert not any(value in {"989304073331", "09304073331", "9304073331"} for _, value in page.filled)
+
+
+def test_open_target_chat_dom_evidence_row_clicks_dialog_item_content() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    page = BaleDomEvidenceSearchPage(
+        {search_input},
+        query_results={contact_name: f"{contact_name} ØªØµÙˆÛŒØ±"},
+        include_input_candidate=True,
+        url="https://web.bale.ai/chat/search",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["matched_result_selector"] == BaleDomEvidenceSearchPage.name_selector
+    assert result["matched_result_class"] == "oUKPfP"
+    assert result["matched_result_box"] == {"x": 1024, "y": 144, "w": 91, "h": 24}
+    assert result["clickable_ancestor_selector"] == BaleDomEvidenceSearchPage.row_selector
+    assert result["clickable_ancestor_class"] == "z8DuPl I2osyO dialog-item-content"
+    assert result["clickable_ancestor_box"] == {"x": 828, "y": 132, "w": 287, "h": 74}
+    assert BaleDomEvidenceSearchPage.row_selector in page.clicked
+    assert BaleDomEvidenceSearchPage.name_selector not in page.clicked
+    assert BaleDomEvidenceSearchPage.input_selector not in page.clicked
+    assert result["chat_open_confirmed"] is True
+    assert result["chat_open_confirmed_by"] == "chat_uid_url"
+    assert result["page_url_after_click"] == "https://web.bale.ai/chat?uid=1672056687"
+    assert result["tight_candidate_count"] == 1
+    assert all(item["class"] != "e8AzTv" for item in result["candidate_debug"])
+
+
+def test_open_target_chat_dom_evidence_row_clicks_qHFpb6_container() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    page = BaleQHFpb6DomEvidenceSearchPage(
+        {search_input},
+        query_results={contact_name: f"{contact_name} Ã˜ÂªÃ˜ÂµÃ™Ë†Ã›Å’Ã˜Â±"},
+        include_input_candidate=True,
+        url="https://web.bale.ai/chat/search",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["clickable_ancestor_selector"] == BaleQHFpb6DomEvidenceSearchPage.row_selector
+    assert result["clickable_ancestor_class"] == "qHFpb6"
+    assert BaleQHFpb6DomEvidenceSearchPage.row_selector in page.clicked
+    assert BaleQHFpb6DomEvidenceSearchPage.name_selector not in page.clicked
+    assert BaleQHFpb6DomEvidenceSearchPage.input_selector not in page.clicked
+    assert result["row_candidate_count"] == 1
+    assert result["accepted_row_candidate_count"] == 1
+    assert result["first_result_fallback_used"] is True
+    assert result["first_result_fallback_selector"] == BaleQHFpb6DomEvidenceSearchPage.row_selector
+    assert result["chat_open_confirmed_by"] == "chat_uid_url"
+
+
+def test_open_target_chat_text_node_fallback_clicks_small_visible_name() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    broad_selector = "div"
+    broad_text = (
+        "ÃšÂ¯Ã™ÂÃ˜ÂªÃšÂ¯Ã™Ë†\nÃ™â€¦Ã˜Â¬Ã™â€žÃ™â€¡\nÃ˜Â®Ã˜Â¯Ã™â€¦Ã˜Â§Ã˜Âª\nÃ™â€¦Ã˜Â®Ã˜Â§Ã˜Â·Ã˜Â¨Ã›Å’Ã™â€ \n"
+        f"{contact_name}\nÃ˜ÂªÃ˜ÂµÃ™Ë†Ã›Å’Ã˜Â±"
+    )
+    page = BaleTextNodeFallbackPage(
+        {search_input, broad_selector},
+        query_results={contact_name: contact_name},
+        url="https://web.bale.ai/chat/search",
+        selector_text={broad_selector: broad_text},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["text_node_fallback_used"] is True
+    assert result["text_node_candidate_count"] == 1
+    assert result["text_node_click_box"] == {"x": 836, "y": 132, "w": 286, "h": 72}
+    assert result["text_node_click_coordinates"] == {"x": 979.0, "y": 168.0}
+    assert result["click_method"] == "mouse_click_text_node_fallback"
+    assert result["chat_open_confirmed_by"] == "chat_uid_url"
+    assert result["page_url_after_click"] == "https://web.bale.ai/chat?uid=text-node"
+    assert page.mouse.clicks == [(979.0, 168.0)]
+
+
+def test_open_target_chat_ignores_search_input_candidate_without_phone_fallback() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    broad_selector = "div"
+    broad_text = (
+        "Ú¯ÙØªÚ¯ÙˆÙ‡Ø§\n"
+        f"{contact_name}\n"
+        "Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯"
+    )
+    page = BaleDomEvidenceSearchPage(
+        {search_input, broad_selector},
+        query_results={contact_name: contact_name},
+        include_input_candidate=True,
+        include_row_candidate=False,
+        url="https://web.bale.ai/chat/search",
+        selector_text={broad_selector: broad_text},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "result_row_not_found"
+    assert result["name_result_visible"] is True
+    assert result["tight_candidate_count"] == 0
+    assert result["click_attempts"] == []
+    assert BaleDomEvidenceSearchPage.input_selector not in page.clicked
+    assert not any(value in {"989304073331", "09304073331", "9304073331"} for _, value in page.filled)
+
+
+def test_open_target_chat_codegen_selector_fallback_confirms_uid_url() -> None:
+    contact_name = "Bale-000001"
+    search_input = selectors.TEXT_SEARCH_INPUT_SELECTORS[-1]
+    codegen_selector = "div:nth-child(2) > div > .qHFpb6 > .ZGzps0"
+    page = ChatSearchQueryResultPage(
+        {search_input},
+        query_results={contact_name: f"{contact_name} ØªØµÙˆÛŒØ±"},
+        row_selector=codegen_selector,
+        url="https://web.bale.ai/chat/search",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._open_target_chat(page, contact_name, "989304073331")
+
+    assert result["status"] == "success"
+    assert result["matched_result_selector"] == codegen_selector
+    assert result["clickable_ancestor_selector"] == codegen_selector
+    assert codegen_selector in page.clicked
+    assert result["chat_open_confirmed_by"] == "chat_uid_url"
+    assert result["page_url_after_click"] == "https://web.bale.ai/chat?uid=dynamic"
 
 
 def test_open_target_chat_visible_name_result_clicks_clickable_ancestor() -> None:
@@ -1674,6 +1933,7 @@ def test_api_routes_import() -> None:
     assert "/automation/platforms/bale/accounts/{account_id}/open-login" in paths
     assert "/automation/platforms/bale/accounts/{account_id}/check-login" in paths
     assert "/automation/platforms/bale/send-test" in paths
+    assert "/automation/platforms/bale/latest-job" in paths
     assert "/automation/platforms/bale/message-config" in paths
     assert "/automation/platforms/bale/profile-groups" in paths
     assert "/automation/platforms/bale/accounts/{account_id}/assign-profile-group" in paths
@@ -3101,6 +3361,11 @@ if __name__ == "__main__":
     test_open_target_chat_chat_search_name_result_clicks_uid_without_phone_fallback()
     test_open_target_chat_visible_name_result_not_confirmed_skips_phone_fallback()
     test_open_target_chat_broad_search_panel_name_text_does_not_confirm_open()
+    test_open_target_chat_dom_evidence_row_clicks_dialog_item_content()
+    test_open_target_chat_dom_evidence_row_clicks_qHFpb6_container()
+    test_open_target_chat_text_node_fallback_clicks_small_visible_name()
+    test_open_target_chat_ignores_search_input_candidate_without_phone_fallback()
+    test_open_target_chat_codegen_selector_fallback_confirms_uid_url()
     test_open_target_chat_visible_name_result_clicks_clickable_ancestor()
     test_open_target_chat_visible_name_result_coordinate_fallback_succeeds()
     test_open_target_chat_does_not_succeed_without_matching_result()

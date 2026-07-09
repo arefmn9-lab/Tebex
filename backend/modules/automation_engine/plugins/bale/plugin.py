@@ -603,7 +603,7 @@ class BalePlugin:
             "Bale search input was not found",
         )
         self._record_step(execution_logs, account_id, "search_target", "started", f"Searching target: {target}")
-        page.fill(search_input, target, timeout=self.default_timeout_ms)
+        page.fill(search_input, target, timeout=min(self.default_timeout_ms, 2000))
         chat_item = self._require_selector(
             page,
             selectors.CHAT_ITEM_SELECTORS,
@@ -613,7 +613,7 @@ class BalePlugin:
         self._record_step(execution_logs, account_id, "search_target", "success", f"Target candidate found: {chat_item}")
 
         self._record_step(execution_logs, account_id, "open_chat", "started", "Opening target chat")
-        page.click(chat_item, timeout=self.default_timeout_ms)
+        page.click(chat_item, timeout=min(self.default_timeout_ms, 2000))
         self._record_step(execution_logs, account_id, "open_chat", "success", "Target chat opened")
 
         message_input = self._require_selector(
@@ -623,7 +623,7 @@ class BalePlugin:
             "Bale message input was not found",
         )
         self._record_step(execution_logs, account_id, "type_message", "started", "Typing one test message")
-        page.fill(message_input, message, timeout=self.default_timeout_ms)
+        page.fill(message_input, message, timeout=min(self.default_timeout_ms, 2000))
         self._record_step(execution_logs, account_id, "type_message", "success", "Test message typed")
 
         send_button = self._require_selector(
@@ -633,7 +633,7 @@ class BalePlugin:
             "Bale send button was not found",
         )
         self._record_step(execution_logs, account_id, "click_send", "started", "Clicking send button once")
-        page.click(send_button, timeout=self.default_timeout_ms)
+        page.click(send_button, timeout=min(self.default_timeout_ms, 2000))
 
         sent_indicator = self._first_visible_selector(
             page,
@@ -1014,6 +1014,7 @@ class BalePlugin:
                 "matched_result_class": "",
                 "matched_result_box": {},
                 "clickable_ancestor_selector": "",
+                "clickable_ancestor_class": "",
                 "clickable_ancestor_text": "",
                 "clickable_ancestor_box": {},
                 "rejected_broad_candidates": [],
@@ -1030,14 +1031,38 @@ class BalePlugin:
                 "right_header_text_source": "",
                 "false_positive_confirmation_prevented": False,
                 "phone_fallback_skipped_reason": "",
+                "row_candidate_count": 0,
+                "accepted_row_candidate_count": 0,
+                "row_candidate_debug": [],
+                "first_result_fallback_used": False,
+                "first_result_fallback_selector": "",
+                "first_result_fallback_reason": "",
+                "text_node_fallback_used": False,
+                "text_node_candidate_count": 0,
+                "text_node_candidate_debug": [],
+                "text_node_click_box": {},
+                "text_node_click_coordinates": {},
+                "text_node_rejection_reasons": [],
             }
             search_attempts.append(attempt)
             if len(search_attempts) > 1:
                 self._clear_search_input(page, search_input)
             self._fill_or_type(page, search_input, query)
-            candidates = self._collect_search_result_candidates(page, timeout_ms=1500)
+            candidates = self._collect_search_result_candidates(page, query=query, timeout_ms=3500)
             rejected_broad_candidates = [item for item in candidates if self._is_broad_chat_search_candidate(item)]
-            matchable_candidates = [item for item in candidates if not self._is_broad_chat_search_candidate(item)]
+            row_candidates = [
+                item
+                for item in candidates
+                if not self._is_broad_chat_search_candidate(item)
+                and not self._is_search_input_candidate(item)
+                and self._is_likely_chat_search_row_candidate(item)
+            ]
+            accepted_row_candidates = [
+                item
+                for item in row_candidates
+                if self._candidate_text_contains_query(item, query) or not is_name_query
+            ]
+            matchable_candidates = accepted_row_candidates
             name_visible_in_candidates = bool(
                 is_name_query
                 and contact_name
@@ -1045,6 +1070,12 @@ class BalePlugin:
             )
             match = self._match_search_result_candidate(matchable_candidates, query, contact_naming_value, normalized_phone)
             attempt["result_candidate_count"] = len(candidates)
+            attempt["broad_candidate_count"] = len(rejected_broad_candidates)
+            attempt["tight_candidate_count"] = len(matchable_candidates)
+            attempt["row_candidate_count"] = len(row_candidates)
+            attempt["accepted_row_candidate_count"] = len(accepted_row_candidates)
+            attempt["candidate_debug"] = self._search_candidate_debug(candidates)
+            attempt["row_candidate_debug"] = self._search_candidate_debug(row_candidates)
             attempt["result_candidates_text"] = [item.get("text", "") for item in candidates[:15]]
             attempt["normalized_candidates"] = [item.get("normalized_text", "") for item in candidates[:15]]
             attempt["rejected_broad_candidates"] = [
@@ -1057,6 +1088,9 @@ class BalePlugin:
                 for item in rejected_broad_candidates[:10]
             ]
             if match:
+                attempt["first_result_fallback_used"] = bool(accepted_row_candidates and match is accepted_row_candidates[0])
+                attempt["first_result_fallback_selector"] = str(match.get("click_selector") or match.get("selector") or "")
+                attempt["first_result_fallback_reason"] = "first_accepted_row_candidate" if attempt["first_result_fallback_used"] else str(match.get("accepted_reason") or "")
                 attempt["name_result_visible"] = bool(is_name_query)
                 attempt["matched_contact_text"] = str(match.get("text", ""))
                 attempt["matched_result_selector"] = str(match.get("selector") or "")
@@ -1065,6 +1099,7 @@ class BalePlugin:
                 attempt["matched_result_class"] = str(match.get("className") or "")
                 attempt["matched_result_box"] = match.get("box") or {}
                 attempt["clickable_ancestor_selector"] = str(match.get("click_selector") or match.get("selector") or "")
+                attempt["clickable_ancestor_class"] = str(match.get("clickClass") or "")
                 attempt["clickable_ancestor_text"] = str(match.get("clickText") or match.get("text") or "")
                 attempt["clickable_ancestor_box"] = match.get("clickBox") or match.get("box") or {}
                 attempt["page_url_before_click"] = _safe_page_url(page)
@@ -1101,9 +1136,20 @@ class BalePlugin:
                         "matched_result_class": attempt["matched_result_class"],
                         "matched_result_box": attempt["matched_result_box"],
                         "clickable_ancestor_selector": attempt["clickable_ancestor_selector"],
+                        "clickable_ancestor_class": attempt["clickable_ancestor_class"],
                         "clickable_ancestor_text": attempt["clickable_ancestor_text"],
                         "clickable_ancestor_box": attempt["clickable_ancestor_box"],
                         "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                        "result_candidate_count": attempt["result_candidate_count"],
+                        "broad_candidate_count": attempt["broad_candidate_count"],
+                        "tight_candidate_count": attempt["tight_candidate_count"],
+                        "row_candidate_count": attempt["row_candidate_count"],
+                        "accepted_row_candidate_count": attempt["accepted_row_candidate_count"],
+                        "candidate_debug": attempt["candidate_debug"],
+                        "row_candidate_debug": attempt["row_candidate_debug"],
+                        "first_result_fallback_used": attempt["first_result_fallback_used"],
+                        "first_result_fallback_selector": attempt["first_result_fallback_selector"],
+                        "first_result_fallback_reason": attempt["first_result_fallback_reason"],
                         "matched_candidate_text": attempt["matched_candidate_text"],
                         "matched_contact_text": attempt["matched_contact_text"],
                         "clicked_result": attempt["clicked_result"],
@@ -1141,9 +1187,20 @@ class BalePlugin:
                         "matched_result_class": attempt["matched_result_class"],
                         "matched_result_box": attempt["matched_result_box"],
                         "clickable_ancestor_selector": attempt["clickable_ancestor_selector"],
+                        "clickable_ancestor_class": attempt["clickable_ancestor_class"],
                         "clickable_ancestor_text": attempt["clickable_ancestor_text"],
                         "clickable_ancestor_box": attempt["clickable_ancestor_box"],
                         "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                        "result_candidate_count": attempt["result_candidate_count"],
+                        "broad_candidate_count": attempt["broad_candidate_count"],
+                        "tight_candidate_count": attempt["tight_candidate_count"],
+                        "row_candidate_count": attempt["row_candidate_count"],
+                        "accepted_row_candidate_count": attempt["accepted_row_candidate_count"],
+                        "candidate_debug": attempt["candidate_debug"],
+                        "row_candidate_debug": attempt["row_candidate_debug"],
+                        "first_result_fallback_used": attempt["first_result_fallback_used"],
+                        "first_result_fallback_selector": attempt["first_result_fallback_selector"],
+                        "first_result_fallback_reason": attempt["first_result_fallback_reason"],
                         "matched_candidate_text": attempt["matched_candidate_text"],
                         "matched_contact_text": attempt["matched_contact_text"],
                         "clicked_result": attempt["clicked_result"],
@@ -1168,13 +1225,139 @@ class BalePlugin:
                 attempt["reason"] = "chat_open_not_confirmed"
             else:
                 if is_name_query and name_visible_in_candidates:
+                    if attempt["row_candidate_count"] == 0:
+                        fallback_result = self._click_text_node_search_result_fallback(page, query, contact_naming_value)
+                        attempt["text_node_fallback_used"] = bool(fallback_result.get("text_node_fallback_used"))
+                        attempt["text_node_candidate_count"] = int(fallback_result.get("text_node_candidate_count") or 0)
+                        attempt["text_node_candidate_debug"] = fallback_result.get("text_node_candidate_debug", [])
+                        attempt["text_node_click_box"] = fallback_result.get("text_node_click_box", {})
+                        attempt["text_node_click_coordinates"] = fallback_result.get("text_node_click_coordinates", {})
+                        attempt["text_node_rejection_reasons"] = fallback_result.get("text_node_rejection_reasons", [])
+                        attempt["click_attempts"] = fallback_result.get("click_attempts", [])
+                        attempt["clicked_result"] = bool(fallback_result.get("clicked_result"))
+                        attempt["click_method"] = str(fallback_result.get("click_method") or "")
+                        attempt["page_url_before_click"] = str(fallback_result.get("page_url_before_click") or _safe_page_url(page))
+                        attempt["page_url_after_click"] = _safe_page_url(page)
+                        confirmation_state = self._chat_open_confirmation_state(page, contact_naming_value, str(fallback_result.get("matched_contact_text") or ""))
+                        confirmation_reason = str(fallback_result.get("chat_open_confirmed_by") or confirmation_state.get("reason") or "")
+                        attempt["chat_open_confirmed"] = bool(confirmation_reason)
+                        attempt["chat_open_confirmed_by"] = confirmation_reason
+                        attempt["message_input_visible"] = bool(confirmation_state.get("message_input_visible") or self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100))
+                        attempt["right_chat_header_text"] = self._right_chat_header_text(page)
+                        attempt["scoped_header_text"] = str(confirmation_state.get("scoped_header_text") or "")
+                        attempt["right_header_text_source"] = str(confirmation_state.get("right_header_text_source") or "")
+                        attempt["false_positive_confirmation_prevented"] = bool(confirmation_state.get("false_positive_confirmation_prevented"))
+                        if confirmation_reason:
+                            return {
+                                "step": "open_target_chat",
+                                "status": "success",
+                                "searched_value": query,
+                                "search_phase": attempt["search_phase"],
+                                "name_result_visible": True,
+                                "matched_selector": "",
+                                "matched_result_selector": "",
+                                "matched_result_tag": "",
+                                "matched_result_role": "",
+                                "matched_result_class": "",
+                                "matched_result_box": attempt["text_node_click_box"],
+                                "clickable_ancestor_selector": "",
+                                "clickable_ancestor_class": "",
+                                "clickable_ancestor_text": str(fallback_result.get("matched_contact_text") or ""),
+                                "clickable_ancestor_box": attempt["text_node_click_box"],
+                                "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                                "result_candidate_count": attempt["result_candidate_count"],
+                                "broad_candidate_count": attempt["broad_candidate_count"],
+                                "tight_candidate_count": attempt["tight_candidate_count"],
+                                "row_candidate_count": attempt["row_candidate_count"],
+                                "accepted_row_candidate_count": attempt["accepted_row_candidate_count"],
+                                "candidate_debug": attempt["candidate_debug"],
+                                "row_candidate_debug": attempt["row_candidate_debug"],
+                                "first_result_fallback_used": attempt["first_result_fallback_used"],
+                                "first_result_fallback_selector": attempt["first_result_fallback_selector"],
+                                "first_result_fallback_reason": attempt["first_result_fallback_reason"],
+                                "text_node_fallback_used": attempt["text_node_fallback_used"],
+                                "text_node_candidate_count": attempt["text_node_candidate_count"],
+                                "text_node_candidate_debug": attempt["text_node_candidate_debug"],
+                                "text_node_click_box": attempt["text_node_click_box"],
+                                "text_node_click_coordinates": attempt["text_node_click_coordinates"],
+                                "text_node_rejection_reasons": attempt["text_node_rejection_reasons"],
+                                "matched_candidate_text": str(fallback_result.get("matched_contact_text") or ""),
+                                "matched_contact_text": str(fallback_result.get("matched_contact_text") or ""),
+                                "clicked_result": True,
+                                "click_method": attempt["click_method"],
+                                "click_attempts": attempt["click_attempts"],
+                                "page_url_before_click": attempt["page_url_before_click"],
+                                "page_url_after_click": attempt["page_url_after_click"],
+                                "search_attempts": search_attempts,
+                                "chat_query_attempts": search_attempts,
+                                "chat_open_confirmed": True,
+                                "chat_open_confirmed_by": confirmation_reason,
+                                "message_input_visible": attempt["message_input_visible"],
+                                "right_chat_header_text": attempt["right_chat_header_text"],
+                                "scoped_header_text": attempt["scoped_header_text"],
+                                "right_header_text_source": attempt["right_header_text_source"],
+                                "false_positive_confirmation_prevented": attempt["false_positive_confirmation_prevented"],
+                                "phone_fallback_skipped_reason": "name_result_opened",
+                                "duration_ms": int((time.perf_counter() - started) * 1000),
+                            }
+                        if fallback_result.get("clicked_result"):
+                            attempt["reason"] = "chat_open_not_confirmed"
+                            attempt["phone_fallback_skipped_reason"] = "visible_name_result_not_confirmed"
+                            return {
+                                "step": "open_target_chat",
+                                "status": "failed",
+                                "error_code": "chat_open_not_confirmed",
+                                "searched_value": query,
+                                "search_phase": attempt["search_phase"],
+                                "name_result_visible": True,
+                                "matched_contact_text": str(fallback_result.get("matched_contact_text") or ""),
+                                "matched_result_selector": "",
+                                "matched_result_box": attempt["text_node_click_box"],
+                                "clickable_ancestor_selector": "",
+                                "clickable_ancestor_class": "",
+                                "clickable_ancestor_text": str(fallback_result.get("matched_contact_text") or ""),
+                                "clickable_ancestor_box": attempt["text_node_click_box"],
+                                "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                                "result_candidate_count": attempt["result_candidate_count"],
+                                "broad_candidate_count": attempt["broad_candidate_count"],
+                                "tight_candidate_count": attempt["tight_candidate_count"],
+                                "row_candidate_count": attempt["row_candidate_count"],
+                                "accepted_row_candidate_count": attempt["accepted_row_candidate_count"],
+                                "candidate_debug": attempt["candidate_debug"],
+                                "row_candidate_debug": attempt["row_candidate_debug"],
+                                "first_result_fallback_used": attempt["first_result_fallback_used"],
+                                "first_result_fallback_selector": attempt["first_result_fallback_selector"],
+                                "first_result_fallback_reason": attempt["first_result_fallback_reason"],
+                                "text_node_fallback_used": attempt["text_node_fallback_used"],
+                                "text_node_candidate_count": attempt["text_node_candidate_count"],
+                                "text_node_candidate_debug": attempt["text_node_candidate_debug"],
+                                "text_node_click_box": attempt["text_node_click_box"],
+                                "text_node_click_coordinates": attempt["text_node_click_coordinates"],
+                                "text_node_rejection_reasons": attempt["text_node_rejection_reasons"],
+                                "click_attempts": attempt["click_attempts"],
+                                "clicked_result": True,
+                                "click_method": attempt["click_method"],
+                                "page_url_before_click": attempt["page_url_before_click"],
+                                "page_url_after_click": attempt["page_url_after_click"],
+                                "search_attempts": search_attempts,
+                                "chat_query_attempts": search_attempts,
+                                "chat_open_confirmed": False,
+                                "chat_open_confirmed_by": "",
+                                "message_input_visible": attempt["message_input_visible"],
+                                "right_chat_header_text": attempt["right_chat_header_text"],
+                                "scoped_header_text": attempt["scoped_header_text"],
+                                "right_header_text_source": attempt["right_header_text_source"],
+                                "false_positive_confirmation_prevented": attempt["false_positive_confirmation_prevented"],
+                                "phone_fallback_skipped_reason": "visible_name_result_not_confirmed",
+                                "duration_ms": int((time.perf_counter() - started) * 1000),
+                            }
                     attempt["name_result_visible"] = True
-                    attempt["reason"] = "visible_name_result_rejected_as_broad"
+                    attempt["reason"] = "result_row_not_found"
                     attempt["phone_fallback_skipped_reason"] = "visible_name_result_not_confirmed"
                     return {
                         "step": "open_target_chat",
                         "status": "failed",
-                        "error_code": "chat_open_not_confirmed",
+                        "error_code": "result_row_not_found",
                         "searched_value": query,
                         "search_phase": attempt["search_phase"],
                         "name_result_visible": True,
@@ -1182,9 +1365,26 @@ class BalePlugin:
                         "matched_result_selector": "",
                         "matched_result_box": {},
                         "clickable_ancestor_selector": "",
+                        "clickable_ancestor_class": "",
                         "clickable_ancestor_text": "",
                         "clickable_ancestor_box": {},
                         "rejected_broad_candidates": attempt["rejected_broad_candidates"],
+                        "result_candidate_count": attempt["result_candidate_count"],
+                        "broad_candidate_count": attempt["broad_candidate_count"],
+                        "tight_candidate_count": attempt["tight_candidate_count"],
+                        "row_candidate_count": attempt["row_candidate_count"],
+                        "accepted_row_candidate_count": attempt["accepted_row_candidate_count"],
+                        "candidate_debug": attempt["candidate_debug"],
+                        "row_candidate_debug": attempt["row_candidate_debug"],
+                        "first_result_fallback_used": attempt["first_result_fallback_used"],
+                        "first_result_fallback_selector": attempt["first_result_fallback_selector"],
+                        "first_result_fallback_reason": attempt["first_result_fallback_reason"],
+                        "text_node_fallback_used": attempt["text_node_fallback_used"],
+                        "text_node_candidate_count": attempt["text_node_candidate_count"],
+                        "text_node_candidate_debug": attempt["text_node_candidate_debug"],
+                        "text_node_click_box": attempt["text_node_click_box"],
+                        "text_node_click_coordinates": attempt["text_node_click_coordinates"],
+                        "text_node_rejection_reasons": attempt["text_node_rejection_reasons"],
                         "click_attempts": [],
                         "clicked_result": False,
                         "click_method": "",
@@ -1255,6 +1455,21 @@ class BalePlugin:
             "contacts_panel_box": contacts_fallback.get("contacts_panel_box", {}),
             "search_input_value": self._search_input_value(page, search_input),
             "result_candidate_count": last_attempt.get("result_candidate_count", 0),
+            "broad_candidate_count": last_attempt.get("broad_candidate_count", 0),
+            "tight_candidate_count": last_attempt.get("tight_candidate_count", 0),
+            "row_candidate_count": last_attempt.get("row_candidate_count", 0),
+            "accepted_row_candidate_count": last_attempt.get("accepted_row_candidate_count", 0),
+            "candidate_debug": last_attempt.get("candidate_debug", []),
+            "row_candidate_debug": last_attempt.get("row_candidate_debug", []),
+            "first_result_fallback_used": last_attempt.get("first_result_fallback_used", False),
+            "first_result_fallback_selector": last_attempt.get("first_result_fallback_selector", ""),
+            "first_result_fallback_reason": last_attempt.get("first_result_fallback_reason", ""),
+            "text_node_fallback_used": last_attempt.get("text_node_fallback_used", False),
+            "text_node_candidate_count": last_attempt.get("text_node_candidate_count", 0),
+            "text_node_candidate_debug": last_attempt.get("text_node_candidate_debug", []),
+            "text_node_click_box": last_attempt.get("text_node_click_box", {}),
+            "text_node_click_coordinates": last_attempt.get("text_node_click_coordinates", {}),
+            "text_node_rejection_reasons": last_attempt.get("text_node_rejection_reasons", []),
             "result_candidates_text": last_attempt.get("result_candidates_text", []),
             "matched_candidate_text": last_attempt.get("matched_candidate_text", ""),
             "normalized_candidates": last_attempt.get("normalized_candidates", []),
@@ -1359,7 +1574,7 @@ class BalePlugin:
         add_contact_step("open_add_contact_modal", "success", step_started, selector=menu_item)
 
         step_started = time.perf_counter()
-        modal = self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=2500)
+        modal = self._first_visible_selector(page, selectors.ADD_CONTACT_MODAL_SELECTORS, timeout_ms=2000)
         if modal:
             result["modal_selector"] = modal
             add_contact_step("wait_add_contact_modal", "success", step_started, selector=modal)
@@ -1536,9 +1751,9 @@ class BalePlugin:
                     continue
                 try:
                     locator = page.locator(input_group).nth(index)
-                    locator.wait_for(state="visible", timeout=1000)
-                    placeholder = str(locator.get_attribute("placeholder", timeout=1000) or "")
-                    input_type = str(locator.get_attribute("type", timeout=1000) or "text")
+                    locator.wait_for(state="visible", timeout=500)
+                    placeholder = str(locator.get_attribute("placeholder", timeout=500) or "")
+                    input_type = str(locator.get_attribute("type", timeout=500) or "text")
                 except Exception:
                     continue
                 if input_type.lower() in {"hidden", "button", "submit"}:
@@ -1600,7 +1815,7 @@ class BalePlugin:
                 disabled_seen = True
                 continue
             try:
-                locator.click(timeout=2000)
+                locator.click(timeout=1000)
                 return {
                     "status": "success",
                     "selector": selector,
@@ -1942,12 +2157,12 @@ class BalePlugin:
             pass
         return info
 
-    def _collect_search_result_candidates(self, page: Any, timeout_ms: int = 1500) -> list[dict[str, Any]]:
+    def _collect_search_result_candidates(self, page: Any, query: str = "", timeout_ms: int = 1500) -> list[dict[str, Any]]:
         deadline = time.monotonic() + (timeout_ms / 1000)
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         while time.monotonic() < deadline:
-            candidates = self._visible_search_result_candidates(page)
+            candidates = self._visible_search_result_candidates(page, query=query)
             filtered = []
             for item in candidates:
                 key = str(item.get("selector") or item.get("text") or "")
@@ -1960,19 +2175,43 @@ class BalePlugin:
             time.sleep(0.15)
         return candidates[:30]
 
-    def _visible_search_result_candidates(self, page: Any) -> list[dict[str, Any]]:
+    def _visible_search_result_candidates(self, page: Any, query: str = "") -> list[dict[str, Any]]:
+        query_literal = json.dumps(str(query or ""))
         try:
-            data = page.evaluate(
+            script = (
                 """() => {
+                    const query = __QUERY_LITERAL__;
+                    const queryLower = String(query || "").trim().toLowerCase();
                     const visible = (el) => {
                         const style = window.getComputedStyle(el);
                         const rect = el.getBoundingClientRect();
                         return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
                     };
+                    const textOf = (el) => (el.innerText || el.textContent || "").trim();
+                    const isSearchInput = (el) => {
+                        if (!el) return false;
+                        const tag = el.tagName || "";
+                        const cls = String(el.className || "");
+                        const role = el.getAttribute("role") || "";
+                        return tag === "INPUT" || tag === "TEXTAREA" || role === "searchbox" || el.isContentEditable || cls.includes("e8AzTv");
+                    };
+                    const hasBroadText = (text) => {
+                        return text.includes("برای شروع یکی از گفتگوها را انتخاب کنید")
+                            || text.includes("Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯")
+                            || text.includes("گفتگوها")
+                            || text.includes("Ú¯ÙØªÚ¯ÙˆÙ‡Ø§");
+                    };
+                    const boxOf = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+                    };
                     const clickableParent = (el) => {
                         let node = el;
                         for (let depth = 0; node && depth <= 5; depth += 1, node = node.parentElement) {
                             if (!(node instanceof HTMLElement)) continue;
+                            const cls = String(node.className || "");
+                            if (cls.includes("dialog-item-content")) return node;
+                            if (cls.includes("qHFpb6")) return node;
                             const style = window.getComputedStyle(node);
                             const role = node.getAttribute("role") || "";
                             if (node.tagName === "BUTTON" || node.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer" || typeof node.onclick === "function") {
@@ -1991,64 +2230,312 @@ class BalePlugin:
                         if (role) return `${tag}[role="${role}"]`;
                         const testid = el.getAttribute("data-testid");
                         if (testid) return `${tag}[data-testid="${testid.replaceAll('"', '\\"')}"]`;
-                        return "";
+                        const existing = el.getAttribute("data-clinicos-bale-result");
+                        if (existing) return `[data-clinicos-bale-result="${existing}"]`;
+                        const assigned = `r${Math.random().toString(36).slice(2)}`;
+                        el.setAttribute("data-clinicos-bale-result", assigned);
+                        return `[data-clinicos-bale-result="${assigned}"]`;
                     };
-                    const nodes = Array.from(document.querySelectorAll('[aria-label="dialog-item"], [data-testid="chat-list-item"], [role="listitem"], [data-testid*="chat"], [role="button"], a, div'));
                     const rows = [];
                     const seen = new Set();
-                    for (const el of nodes) {
-                        if (!visible(el)) continue;
-                        const text = (el.innerText || el.textContent || "").trim();
-                        if (!text || text.length > 500) continue;
-                        const click = clickableParent(el);
-                        const selector = selectorFor(el);
-                        const clickSelector = selectorFor(click) || selector;
-                        const key = `${selector}|${text}`;
-                        if (seen.has(key)) continue;
+                    const isLikelyRow = (el) => {
+                        if (!el) return false;
+                        const cls = String(el.className || "");
+                        return cls.includes("qHFpb6")
+                            || cls.includes("dialog-item-content")
+                            || el.getAttribute("aria-label") === "dialog-item";
+                    };
+                    const pushCandidate = (textEl, clickEl, acceptedReason) => {
+                        if (!textEl || !clickEl || isSearchInput(textEl) || isSearchInput(clickEl)) return;
+                        if (!visible(textEl) || !visible(clickEl)) return;
+                        if (!isLikelyRow(clickEl)) return;
+                        const text = textOf(clickEl) || textOf(textEl);
+                        if (!text || !queryLower || !text.toLowerCase().includes(queryLower)) return;
+                        if (hasBroadText(text)) return;
+                        const clickBox = boxOf(clickEl);
+                        if (!clickBox.w || !clickBox.h || clickBox.w > 650 || clickBox.h > 160) return;
+                        const selector = selectorFor(textEl);
+                        const clickSelector = selectorFor(clickEl);
+                        const key = `${selector}|${clickSelector}|${text}`;
+                        if (seen.has(key)) return;
                         seen.add(key);
                         rows.push({
                             selector,
                             click_selector: clickSelector,
                             text,
-                            tag: el.tagName || "",
-                            className: el.className || "",
-                            role: el.getAttribute("role") || "",
-                            ariaLabel: el.getAttribute("aria-label") || "",
-                            clickTag: click ? click.tagName || "" : "",
-                            clickClass: click ? click.className || "" : "",
-                            clickRole: click ? click.getAttribute("role") || "" : "",
-                            clickText: click ? (click.innerText || click.textContent || "").trim().slice(0, 200) : "",
-                            box: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)},
-                            clickBox: click ? (() => { const b = click.getBoundingClientRect(); return {x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height)}; })() : {}
+                            tag: textEl.tagName || "",
+                            className: textEl.className || "",
+                            role: textEl.getAttribute("role") || "",
+                            ariaLabel: textEl.getAttribute("aria-label") || "",
+                            clickTag: clickEl.tagName || "",
+                            clickClass: clickEl.className || "",
+                            clickRole: clickEl.getAttribute("role") || "",
+                            clickText: text,
+                            box: boxOf(textEl),
+                            clickBox,
+                            accepted_reason: acceptedReason
                         });
-                        if (rows.length >= 30) break;
+                    };
+                    for (const nameEl of Array.from(document.querySelectorAll(".oUKPfP"))) {
+                        if (isSearchInput(nameEl)) continue;
+                        const text = textOf(nameEl);
+                        if (!queryLower || text.toLowerCase() !== queryLower) continue;
+                        const dialogRow = nameEl.closest(".dialog-item-content");
+                        const qRow = nameEl.closest(".qHFpb6");
+                        pushCandidate(nameEl, dialogRow, "exact_oUKPfP_dialog_item_content");
+                        pushCandidate(nameEl, qRow, "exact_oUKPfP_qHFpb6");
+                    }
+                    if (rows.length) return rows;
+                    for (const row of Array.from(document.querySelectorAll('div.qHFpb6, div.z8DuPl.I2osyO.dialog-item-content, [class*="dialog-item-content"], [class*="qHFpb6"], [aria-label="dialog-item"]'))) {
+                        if (!visible(row) || isSearchInput(row)) continue;
+                        const text = textOf(row);
+                        if (!queryLower || !text.toLowerCase().includes(queryLower) || hasBroadText(text)) continue;
+                        const nameEl = Array.from(row.querySelectorAll(".oUKPfP, div, span")).find((el) => visible(el) && !isSearchInput(el) && textOf(el).toLowerCase() === queryLower) || row;
+                        pushCandidate(nameEl, row, String(row.className || "").includes("dialog-item-content") ? "dialog_item_content_contains_name" : "qHFpb6_contains_name");
                     }
                     return rows;
                 }"""
-            )
+            ).replace("__QUERY_LITERAL__", query_literal)
+            data = page.evaluate(script)
             if isinstance(data, list):
-                return [self._candidate_with_normalized_text(item) for item in data if isinstance(item, dict)]
+                dynamic_candidates = [
+                    self._candidate_with_normalized_text(item)
+                    for item in data
+                    if isinstance(item, dict) and not self._is_search_input_candidate(item)
+                ]
+                if dynamic_candidates:
+                    return dynamic_candidates
         except Exception:
             pass
         return self._selector_search_result_candidates(page)
 
     def _selector_search_result_candidates(self, page: Any) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
-        for selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS:
+        fallback_selectors = [
+            "div:nth-child(2) > div > .qHFpb6 > .ZGzps0",
+            *selectors.SEARCH_RESULT_CANDIDATE_SELECTORS,
+        ]
+        for selector in fallback_selectors:
             try:
                 locator = page.locator(selector).first
                 locator.wait_for(state="visible", timeout=150)
                 text = str(locator.inner_text(timeout=150) or "").strip()
+                box = locator.bounding_box(timeout=150)
             except Exception:
                 continue
             if not text:
                 continue
+            if not box:
+                continue
+            width = float(box.get("w", box.get("width", 0)) or 0)
+            height = float(box.get("h", box.get("height", 0)) or 0)
+            if width <= 0 or height <= 0:
+                continue
             candidates.append(
                 self._candidate_with_normalized_text(
-                    {"selector": selector, "click_selector": selector, "text": text}
+                    {
+                        "selector": selector,
+                        "click_selector": selector,
+                        "text": text,
+                        "box": box,
+                        "clickBox": box,
+                        "accepted_reason": "codegen_fallback_selector" if selector == fallback_selectors[0] else "selector_fallback",
+                    }
                 )
             )
         return candidates[:30]
+
+    def _click_text_node_search_result_fallback(self, page: Any, query: str, contact_naming_value: str) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "text_node_fallback_used": False,
+            "text_node_candidate_count": 0,
+            "text_node_candidate_debug": [],
+            "text_node_click_box": {},
+            "text_node_click_coordinates": {},
+            "text_node_rejection_reasons": [],
+            "clicked_result": False,
+            "click_method": "",
+            "click_attempts": [],
+            "matched_contact_text": "",
+            "page_url_before_click": _safe_page_url(page),
+            "chat_open_confirmed_by": "",
+        }
+        candidates = self._text_node_search_result_candidates(page, query)
+        accepted = [item for item in candidates if not item.get("rejected_reason")]
+        result["text_node_candidate_count"] = len(accepted)
+        result["text_node_candidate_debug"] = candidates[:20]
+        result["text_node_rejection_reasons"] = [
+            {"reason": item.get("rejected_reason", ""), "text": item.get("text", ""), "box": item.get("box", {})}
+            for item in candidates
+            if item.get("rejected_reason")
+        ][:20]
+        if not accepted:
+            return result
+
+        candidate = accepted[0]
+        box = candidate.get("clickBox") or candidate.get("box") or {}
+        width = float(box.get("w", box.get("width", 0)) or 0)
+        height = float(box.get("h", box.get("height", 0)) or 0)
+        if width <= 0 or height <= 0:
+            return result
+        x = float(box.get("x", 0)) + width / 2
+        y = float(box.get("y", 0)) + height / 2
+        result["text_node_fallback_used"] = True
+        result["text_node_click_box"] = box
+        result["text_node_click_coordinates"] = {"x": x, "y": y}
+        result["matched_contact_text"] = str(candidate.get("text") or "")
+        before_url = _safe_page_url(page)
+        try:
+            page.mouse.click(x, y)
+            _safe_wait_for_timeout(page, 300)
+            confirmation_state = self._chat_open_confirmation_state(page, contact_naming_value, str(candidate.get("text") or ""))
+            confirmation = str(confirmation_state.get("reason") or "")
+            result["clicked_result"] = True
+            result["click_method"] = "mouse_click_text_node_fallback"
+            result["chat_open_confirmed_by"] = confirmation
+            result["click_attempts"] = [
+                {
+                    "method": "mouse_click_text_node_fallback",
+                    "selector": "",
+                    "before_url": before_url,
+                    "after_url": _safe_page_url(page),
+                    "success": bool(confirmation),
+                    "error": "",
+                    "chat_open_confirmed_by": confirmation,
+                    "message_input_visible": bool(confirmation_state.get("message_input_visible")),
+                    "scoped_header_text": confirmation_state.get("scoped_header_text", ""),
+                    "right_header_text_source": confirmation_state.get("right_header_text_source", ""),
+                    "false_positive_confirmation_prevented": bool(confirmation_state.get("false_positive_confirmation_prevented")),
+                    "coordinates": result["text_node_click_coordinates"],
+                    "box": box,
+                }
+            ]
+        except Exception as exc:
+            result["click_attempts"] = [
+                {
+                    "method": "mouse_click_text_node_fallback",
+                    "selector": "",
+                    "before_url": before_url,
+                    "after_url": _safe_page_url(page),
+                    "success": False,
+                    "error": str(exc),
+                    "coordinates": result["text_node_click_coordinates"],
+                    "box": box,
+                }
+            ]
+        return result
+
+    def _text_node_search_result_candidates(self, page: Any, query: str) -> list[dict[str, Any]]:
+        query_literal = json.dumps(str(query or ""))
+        try:
+            script = (
+                """() => {
+                    const query = __QUERY_LITERAL__;
+                    const needle = String(query || "").trim().toLowerCase();
+                    const viewportW = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+                    const viewportH = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+                    const broadWords = ["گفتگو", "مجله", "خدمات", "مخاطبین"];
+                    const badTags = new Set(["INPUT", "TEXTAREA", "SCRIPT", "STYLE", "SVG", "PATH"]);
+                    const textOf = (el) => (el.innerText || el.textContent || "").trim();
+                    const boxOf = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+                    };
+                    const visible = (el) => {
+                        if (!el || !(el instanceof HTMLElement)) return false;
+                        if (badTags.has(el.tagName)) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        if (!style || style.display === "none" || style.visibility === "hidden" || Number(style.opacity || 1) === 0) return false;
+                        if (rect.width <= 0 || rect.height <= 0) return false;
+                        return rect.bottom >= 0 && rect.right >= 0 && rect.top <= viewportH && rect.left <= viewportW;
+                    };
+                    const isSearchInput = (el) => {
+                        if (!el) return false;
+                        const tag = el.tagName || "";
+                        const cls = String(el.className || "");
+                        const role = el.getAttribute("role") || "";
+                        return tag === "INPUT" || tag === "TEXTAREA" || role === "searchbox" || el.isContentEditable || cls.includes("e8AzTv");
+                    };
+                    const isFullPage = (box) => {
+                        if (!box || !viewportW || !viewportH) return false;
+                        return box.w >= viewportW * 0.72 && box.h >= viewportH * 0.45;
+                    };
+                    const hasBroadNavigation = (text) => broadWords.every((word) => text.includes(word));
+                    const normalized = (text) => String(text || "").trim().toLowerCase().replace(/\s+/g, " ");
+                    const clickableParent = (el) => {
+                        let best = el;
+                        for (let node = el; node && node instanceof HTMLElement && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+                            if (!visible(node) || isSearchInput(node)) continue;
+                            const text = textOf(node);
+                            const box = boxOf(node);
+                            if (!text || !normalized(text).includes(needle) || hasBroadNavigation(text) || isFullPage(box)) continue;
+                            if (box.h >= 28 && box.h <= 140 && box.w >= 40 && box.w <= Math.min(760, viewportW * 0.72)) {
+                                best = node;
+                            }
+                        }
+                        return best;
+                    };
+                    const rows = [];
+                    const rejected = [];
+                    const seen = new Set();
+                    for (const el of Array.from(document.querySelectorAll("body *"))) {
+                        if (!visible(el)) continue;
+                        const text = textOf(el);
+                        if (!text || !needle || !normalized(text).includes(needle)) continue;
+                        const baseBox = boxOf(el);
+                        let rejectedReason = "";
+                        if (isSearchInput(el)) rejectedReason = "search_input";
+                        else if (hasBroadNavigation(text)) rejectedReason = "broad_navigation_text";
+                        else if (isFullPage(baseBox)) rejectedReason = "full_page_container";
+                        if (rejectedReason) {
+                            rejected.push({text: text.slice(0, 220), box: baseBox, rejected_reason: rejectedReason});
+                            continue;
+                        }
+                        const clickEl = clickableParent(el);
+                        const clickText = textOf(clickEl);
+                        const clickBox = boxOf(clickEl);
+                        if (!clickText || !normalized(clickText).includes(needle)) {
+                            rejected.push({text: text.slice(0, 220), box: baseBox, rejected_reason: "click_parent_text_mismatch"});
+                            continue;
+                        }
+                        if (hasBroadNavigation(clickText) || isFullPage(clickBox) || clickBox.w <= 0 || clickBox.h <= 0) {
+                            rejected.push({text: clickText.slice(0, 220), box: clickBox, rejected_reason: hasBroadNavigation(clickText) ? "broad_navigation_text" : "bad_click_box"});
+                            continue;
+                        }
+                        const key = `${clickBox.x}|${clickBox.y}|${clickBox.w}|${clickBox.h}|${normalized(clickText)}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        const exact = normalized(text) === needle || normalized(clickText) === needle;
+                        const picture = text.includes("تصویر") || clickText.includes("تصویر");
+                        rows.push({
+                            text: clickText.slice(0, 220),
+                            box: baseBox,
+                            clickBox,
+                            tag: el.tagName || "",
+                            clickTag: clickEl.tagName || "",
+                            exact,
+                            picture,
+                            score: (exact ? 0 : 1000) + (picture ? 0 : 100) + Math.round(clickBox.w * clickBox.h)
+                        });
+                    }
+                    rows.sort((a, b) => a.score - b.score);
+                    return rows.slice(0, 15).concat(rejected.slice(0, 15));
+                }"""
+            ).replace("__QUERY_LITERAL__", query_literal)
+            data = page.evaluate(script)
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _is_search_input_candidate(self, candidate: dict[str, Any]) -> bool:
+        tag = str(candidate.get("tag") or "").upper()
+        class_name = str(candidate.get("className") or "")
+        selector = str(candidate.get("selector") or "")
+        role = str(candidate.get("role") or "").lower()
+        return tag in {"INPUT", "TEXTAREA"} or role == "searchbox" or "e8AzTv" in class_name or "input" in selector.lower()
 
     def _candidate_with_normalized_text(self, item: dict[str, Any]) -> dict[str, Any]:
         text = str(item.get("text") or "")
@@ -2056,7 +2543,31 @@ class BalePlugin:
         item["normalized_phone_text"] = _normalize_bale_phone_text(text)
         return item
 
+    def _search_candidate_debug(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        debug: list[dict[str, Any]] = []
+        for item in candidates[:30]:
+            rejected_reason = str(item.get("rejected_reason") or "")
+            if not rejected_reason and self._is_broad_chat_search_candidate(item):
+                rejected_reason = "broad_search_panel_text"
+            accepted_reason = str(item.get("accepted_reason") or "")
+            if not rejected_reason and not accepted_reason:
+                accepted_reason = "matchable_candidate"
+            debug.append(
+                {
+                    "selector": item.get("selector", ""),
+                    "text": item.get("text", ""),
+                    "class": item.get("className", ""),
+                    "role": item.get("role", ""),
+                    "box": item.get("box", {}),
+                    "rejected_reason": rejected_reason,
+                    "accepted_reason": "" if rejected_reason else accepted_reason,
+                }
+            )
+        return debug
+
     def _is_broad_chat_search_candidate(self, candidate: dict[str, Any]) -> bool:
+        if candidate.get("rejected_reason"):
+            return True
         text = str(candidate.get("text") or "")
         normalized = _normalize_bale_match_text(text)
         if not normalized:
@@ -2083,6 +2594,22 @@ class BalePlugin:
         if width > 650 or height > 260:
             return True
         return False
+
+    def _is_likely_chat_search_row_candidate(self, candidate: dict[str, Any]) -> bool:
+        selector = str(candidate.get("click_selector") or candidate.get("selector") or "")
+        class_name = str(candidate.get("className") or "")
+        click_class = str(candidate.get("clickClass") or "")
+        aria_label = str(candidate.get("ariaLabel") or "")
+        row_signal = " ".join([selector, class_name, click_class, aria_label])
+        if "dialog-item" in aria_label or '[aria-label="dialog-item"]' in selector:
+            return True
+        return "qHFpb6" in row_signal or "dialog-item-content" in row_signal
+
+    def _candidate_text_contains_query(self, candidate: dict[str, Any], query: str) -> bool:
+        query_text = _normalize_bale_match_text(query)
+        if not query_text:
+            return False
+        return query_text in str(candidate.get("normalized_text") or _normalize_bale_match_text(str(candidate.get("text") or "")))
 
     def _match_search_result_candidate(
         self,
@@ -2959,26 +3486,26 @@ class BalePlugin:
 
     def _click_if_possible(self, page: Any, selector: str) -> None:
         try:
-            page.click(selector, timeout=self.default_timeout_ms)
+            page.click(selector, timeout=min(self.default_timeout_ms, 1500))
         except Exception:
             try:
-                page.locator(selector).first.click(timeout=self.default_timeout_ms)
+                page.locator(selector).first.click(timeout=min(self.default_timeout_ms, 1500))
             except Exception:
                 pass
 
     def _fill_or_type(self, page: Any, selector: str, text: str) -> None:
         try:
-            page.fill(selector, text, timeout=self.default_timeout_ms)
+            page.fill(selector, text, timeout=min(self.default_timeout_ms, 1500))
             return
         except Exception:
             pass
         locator = page.locator(selector).first
         try:
-            locator.fill(text, timeout=self.default_timeout_ms)
+            locator.fill(text, timeout=min(self.default_timeout_ms, 1500))
             return
         except Exception:
             pass
-        locator.type(text, timeout=self.default_timeout_ms)
+        locator.type(text, timeout=min(self.default_timeout_ms, 1500))
 
     def _press_key(self, page: Any, key: str) -> None:
         keyboard = getattr(page, "keyboard", None)
@@ -2986,7 +3513,7 @@ class BalePlugin:
             keyboard.press(key)
             return
         try:
-            page.press("body", key, timeout=self.default_timeout_ms)
+            page.press("body", key, timeout=min(self.default_timeout_ms, 1500))
         except Exception as exc:
             raise BalePluginError("send_button_not_found", f"Unable to press {key}") from exc
 
@@ -3003,7 +3530,7 @@ class BalePlugin:
         selector_list: list[str],
         timeout_ms: int | None = None,
     ) -> str | None:
-        timeout = timeout_ms if timeout_ms is not None else self.default_timeout_ms
+        timeout = timeout_ms if timeout_ms is not None else min(self.default_timeout_ms, 2000)
         for selector in selector_list:
             try:
                 locator = page.locator(selector).first
