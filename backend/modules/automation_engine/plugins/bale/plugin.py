@@ -12,6 +12,7 @@ from uuid import uuid4
 from modules.automation_engine.browser import actions_browser
 from modules.automation_engine.browser.browser_manager import BrowserManager, resolve_system_browser_executable
 from modules.automation_engine.browser.providers import get_provider
+from modules.automation_engine.scenario_runner import ScenarioRunner
 
 from .account_store import bale_account_store
 from . import selectors
@@ -495,6 +496,149 @@ class BalePlugin:
             diagnostics = getattr(exc, "diagnostics", {}) or {}
             self._add_step(step_results, "unexpected_error", "failed", error_code=error_code, error=str(exc))
             return finish(False, error_code, str(exc), "unexpected_error", diagnostics)
+
+    def forward_latest_channel_message(
+        self,
+        account_id: str,
+        payload: dict[str, Any],
+        provider_mode: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        action = "forward_latest_channel_message"
+        context_result = self._build_forward_latest_channel_message_context(payload)
+        context = context_result.get("context") or {}
+        source_channel_url = str(context.get("channel_url") or context_result.get("source_channel_url") or "")
+        message_selector = context.get("message_selector") if isinstance(context.get("message_selector"), dict) else {"strategy": "latest_visible"}
+        contact = (context.get("contacts") or [{}])[0] if isinstance(context.get("contacts"), list) else {}
+
+        def finish(extra: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "ok": bool(extra.get("success")),
+                "success": bool(extra.get("success")),
+                "action": action,
+                "account_id": account_id,
+                "source_channel_url": source_channel_url,
+                "message_selector": message_selector,
+                "target_phone": str(contact.get("phone") or ""),
+                "target_name": str(contact.get("name") or ""),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                **extra,
+            }
+
+        if not context_result.get("success"):
+            return finish(
+                {
+                    "success": False,
+                    "failed_step": "validate_input",
+                    "error_code": context_result.get("error_code") or "invalid_input",
+                    "error_message": context_result.get("error_message") or "Invalid forward input",
+                    "step_results": [],
+                    "current_url": "",
+                }
+            )
+
+        scenario_path = Path(__file__).resolve().parents[2] / "scenarios" / "bale" / "forward_latest_channel_message.json"
+        try:
+            with self._page_session(account_id, provider_mode) as (page, session_meta):
+                runner = ScenarioRunner(page, scenario_path, context)
+                result = runner.run()
+                if result.get("success"):
+                    self.browser_manager.save_session(account_id)
+                    return finish(
+                        {
+                            "success": True,
+                            "forward_triggered": True,
+                            "step_results": result.get("step_results") or [],
+                            "current_url": result.get("current_url") or _safe_page_url(page),
+                            **session_meta,
+                        }
+                    )
+                return finish(
+                    {
+                        "success": False,
+                        "forward_triggered": False,
+                        "failed_step": result.get("failed_step") or "scenario_runner",
+                        "error_code": result.get("error_code") or "scenario_step_failed",
+                        "error_message": result.get("error_message") or "Scenario step failed",
+                        "step_results": result.get("step_results") or [],
+                        "screenshot_path": result.get("screenshot_path") or "",
+                        "current_url": result.get("current_url") or _safe_page_url(page),
+                        **session_meta,
+                    }
+                )
+        except Exception as exc:
+            return finish(
+                {
+                    "success": False,
+                    "forward_triggered": False,
+                    "failed_step": "scenario_runner",
+                    "error_code": _browser_error_code(exc),
+                    "error_message": str(exc),
+                    "step_results": [],
+                    "current_url": "",
+                    **self._browser_failure_meta(account_id, provider_mode or "native_chrome"),
+                }
+            )
+
+    def _build_forward_latest_channel_message_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        target = payload.get("target") if isinstance(payload.get("target"), dict) else {}
+        source_type = str(source.get("type") or "channel")
+        channel_url = str(source.get("channel_url") or "").strip()
+        if not channel_url:
+            return {
+                "success": False,
+                "source_channel_url": "",
+                "error_code": "missing_channel_url",
+                "error_message": "source.channel_url is required",
+            }
+
+        selector_payload = source.get("message_selector") if isinstance(source.get("message_selector"), dict) else {}
+        strategy = str(selector_payload.get("strategy") or "latest_visible").strip() or "latest_visible"
+        if source_type == "channel_latest":
+            source_type = "channel"
+            strategy = "latest_visible"
+        if strategy != "latest_visible":
+            return {
+                "success": False,
+                "source_channel_url": channel_url,
+                "error_code": "unsupported_message_selector",
+                "error_message": f"Unsupported message selector strategy: {strategy}",
+            }
+
+        phone = str(payload.get("normalized_phone") or target.get("phone") or "").strip()
+        if not phone:
+            return {
+                "success": False,
+                "source_channel_url": channel_url,
+                "error_code": "missing_target_phone",
+                "error_message": "normalized_phone or target.phone is required",
+            }
+        name = str(payload.get("contact_naming_value") or target.get("name") or phone).strip()
+        return {
+            "success": True,
+            "source_channel_url": channel_url,
+            "context": {
+                "channel_url": channel_url,
+                "message_selector": {"strategy": "latest_visible"},
+                "contacts": [
+                    {
+                        "id": "target",
+                        "phone": phone,
+                        "name": name,
+                        "username": "",
+                    }
+                ],
+                "contact": {
+                    "id": "target",
+                    "phone": phone,
+                    "name": name,
+                    "username": "",
+                },
+                "method": "phone",
+                "phone_name": "phone",
+            },
+        }
 
     def save_contact_by_phone(
         self,

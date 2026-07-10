@@ -832,6 +832,45 @@ def get_latest_bale_job(response: Response) -> dict[str, Any] | None:
     return sorted(jobs, key=lambda job: str(job.get("updated_at") or job.get("created_at") or ""), reverse=True)[0]
 
 
+@router.get("/platforms/bale/jobs")
+def list_bale_jobs(response: Response, limit: int = 10) -> list[dict[str, Any]]:
+    _set_dashboard_cors_headers(response)
+    limit = max(1, min(int(limit or 10), 100))
+    jobs = [
+        _bale_job_diagnostics_shape(job)
+        for job in execution_queue_store.list_jobs()
+        if str(job.get("platform_id") or "").lower() == "bale"
+    ]
+    jobs.sort(key=lambda job: str(job.get("updated_at") or job.get("created_at") or ""), reverse=True)
+    return jobs[:limit]
+
+
+def _bale_job_diagnostics_shape(job: dict[str, Any]) -> dict[str, Any]:
+    execution_result = job.get("execution_result") if isinstance(job.get("execution_result"), dict) else {}
+    plugin_result = execution_result.get("plugin_result") if isinstance(execution_result.get("plugin_result"), dict) else None
+    diagnostics = plugin_result or execution_result
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "action": diagnostics.get("action") or execution_result.get("action") or job.get("scenario_id"),
+        "scenario_id": job.get("scenario_id"),
+        "account_id": job.get("account_id"),
+        "platform_id": job.get("platform_id"),
+        "normalized_phone": job.get("normalized_phone"),
+        "contact_naming_value": job.get("contact_naming_value"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "error_code": job.get("error_code") or diagnostics.get("error_code") or execution_result.get("error_code"),
+        "error_message": job.get("error_message") or diagnostics.get("error_message") or diagnostics.get("error") or execution_result.get("error_message"),
+        "execution_result": execution_result,
+        "plugin_result": plugin_result,
+        "failed_step": diagnostics.get("failed_step") or execution_result.get("failed_step"),
+        "last_successful_step": diagnostics.get("last_successful_step") or execution_result.get("last_successful_step"),
+        "screenshot_path": diagnostics.get("screenshot_path") or execution_result.get("screenshot_path"),
+        "step_results": diagnostics.get("step_results") or execution_result.get("step_results") or [],
+    }
+
+
 @router.put("/platforms/bale/accounts/{account_id}")
 def update_bale_account(
     account_id: str,

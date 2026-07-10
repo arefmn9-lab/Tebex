@@ -253,6 +253,14 @@ export function listPlatformLogs(platformId) {
   return request(`/automation/platforms/${encodeURIComponent(platformId)}/logs`);
 }
 
+export function getLatestBaleJob() {
+  return request("/automation/platforms/bale/latest-job");
+}
+
+export function getBaleJobs(limit = 10) {
+  return request(`/automation/platforms/bale/jobs?limit=${encodeURIComponent(limit)}`);
+}
+
 export function openBaleAccount(accountId) {
   return request("/automation/platforms/bale/open-account", {
     method: "POST",

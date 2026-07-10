@@ -1,0 +1,110 @@
+{
+  "context": {},
+  "elements": {
+    "channel_message": [
+      {"type": "css", "value": "[data-testid*=\"message\"]"},
+      {"type": "css", "value": "[data-testid*=\"post\"]"},
+      {"type": "css", "value": "[class*=\"message\"]"},
+      {"type": "css", "value": "[class*=\"post\"]"},
+      {"type": "css", "value": "article"}
+    ],
+    "latest_visible_message": [
+      {"type": "css", "value": "[data-testid*=\"message\"]:last-of-type"},
+      {"type": "css", "value": "[data-testid*=\"post\"]:last-of-type"},
+      {"type": "css", "value": "[class*=\"message\"]:last-of-type"},
+      {"type": "css", "value": "[class*=\"post\"]:last-of-type"},
+      {"type": "css", "value": "article:last-of-type"}
+    ],
+    "message_forward_button": [
+      {"type": "css", "value": "button:has([aria-label=\"Forward-icon\"])"},
+      {"type": "css", "value": "[role=\"button\"]:has([aria-label=\"Forward-icon\"])"},
+      {"type": "css", "value": "[aria-label=\"Forward-icon\"]"},
+      {"type": "css", "value": "[aria-label*=\"Forward\"]"},
+      {"type": "css", "value": "[aria-label*=\"Share\"]"},
+      {"type": "css", "value": "button:has-text(\"Forward\")"}
+    ],
+    "forward_search_input": [
+      {"type": "css", "value": ".ReactModal__Content input[type=\"search\"]"},
+      {"type": "css", "value": ".ReactModal__Content input[placeholder*=\"Search\"]"},
+      {"type": "css", "value": ".ReactModal__Content [role=\"searchbox\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] input[type=\"search\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] [role=\"searchbox\"]"}
+    ],
+    "forward_target_result": [
+      {"type": "css", "value": ".ReactModal__Content [aria-label=\"dialog-item\"]"},
+      {"type": "css", "value": ".ReactModal__Content [role=\"listitem\"]"},
+      {"type": "css", "value": ".ReactModal__Content [role=\"button\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] [aria-label=\"dialog-item\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] [role=\"listitem\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] [role=\"button\"]"}
+    ],
+    "forward_send_button": [
+      {"type": "css", "value": ".ReactModal__Content [data-testid*=\"send\"]"},
+      {"type": "css", "value": ".ReactModal__Content [aria-label*=\"Send\"]"},
+      {"type": "css", "value": ".ReactModal__Content [aria-label*=\"Forward\"]"},
+      {"type": "css", "value": ".ReactModal__Content button:has-text(\"Send\")"},
+      {"type": "css", "value": ".ReactModal__Content button:has-text(\"Forward\")"},
+      {"type": "css", "value": "[role=\"dialog\"] [data-testid*=\"send\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] [aria-label*=\"Send\"]"},
+      {"type": "css", "value": "[role=\"dialog\"] [aria-label*=\"Forward\"]"}
+    ]
+  },
+  "steps": [
+    {
+      "id": "open_source_channel",
+      "type": "navigate",
+      "url": "{{channel_url}}"
+    },
+    {
+      "id": "wait_channel_messages",
+      "type": "wait",
+      "selector": "$channel_message",
+      "timeout_ms": 3000,
+      "error_code": "source_message_missing_selector"
+    },
+    {
+      "id": "scroll_latest_visible_message",
+      "type": "scroll_to_element",
+      "selector": "$latest_visible_message",
+      "error_code": "latest_message_missing_selector"
+    },
+    {
+      "id": "hover_latest_visible_message",
+      "type": "hover",
+      "selector": "$latest_visible_message",
+      "error_code": "latest_message_missing_selector"
+    },
+    {
+      "id": "click_forward_button",
+      "type": "click",
+      "selector": "$message_forward_button",
+      "error_code": "forward_button_missing_selector"
+    },
+    {
+      "id": "wait_forward_modal_search",
+      "type": "wait",
+      "selector": "$forward_search_input",
+      "timeout_ms": 2000,
+      "error_code": "forward_search_missing_selector"
+    },
+    {
+      "id": "search_forward_target",
+      "type": "type",
+      "selector": "$forward_search_input",
+      "text": "{{contact.name}}",
+      "error_code": "forward_search_missing_selector"
+    },
+    {
+      "id": "select_forward_target",
+      "type": "click",
+      "selector": "$forward_target_result",
+      "error_code": "forward_target_missing_selector"
+    },
+    {
+      "id": "confirm_forward_send",
+      "type": "click",
+      "selector": "$forward_send_button",
+      "error_code": "forward_send_missing_selector"
+    }
+  ]
+}

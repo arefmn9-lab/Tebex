@@ -17,8 +17,10 @@ import {
   dryRunBulkExecutionQueue,
   dryRunBalePreparation,
   dryRunBaleSchedule,
+  getBaleJobs,
   getBaleMessageConfig,
   getBalePreparation,
+  getLatestBaleJob,
   getAdsPowerConfig,
   getBulkExecutionQueueSummary,
   importBulkContactList,
@@ -337,6 +339,10 @@ export default function PlatformWorkspace({ platformId }) {
   const [simpleSendResult, setSimpleSendResult] = useState(null);
   const [simpleSendContactResult, setSimpleSendContactResult] = useState(null);
   const [simpleBaleLoginStatus, setSimpleBaleLoginStatus] = useState(null);
+  const [baleLatestJob, setBaleLatestJob] = useState(null);
+  const [baleJobs, setBaleJobs] = useState([]);
+  const [selectedBaleJobId, setSelectedBaleJobId] = useState("");
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
   const [assignmentForm, setAssignmentForm] = useState({
     planned_for_date: today,
     max_contacts_per_account: "",
@@ -385,6 +391,15 @@ export default function PlatformWorkspace({ platformId }) {
     return () => {
       ignore = true;
       window.clearInterval(timer);
+    };
+  }, [platform.id]);
+
+  useEffect(() => {
+    if (platform.id !== "bale") return;
+    let ignore = false;
+    loadBaleDiagnostics(ignore);
+    return () => {
+      ignore = true;
     };
   }, [platform.id]);
 
@@ -444,6 +459,55 @@ export default function PlatformWorkspace({ platformId }) {
 
   async function refresh() {
     await loadPlatformData(false);
+  }
+
+  async function loadBaleDiagnostics(ignore = false) {
+    try {
+      const [latest, recent] = await Promise.all([getLatestBaleJob(), getBaleJobs(10)]);
+      if (ignore) return;
+      const recentJobs = Array.isArray(recent) ? recent : [];
+      setBaleLatestJob(latest || null);
+      setBaleJobs(recentJobs);
+      setSelectedBaleJobId((current) => current || latest?.job_id || recentJobs[0]?.job_id || "");
+    } catch (error) {
+      if (!ignore) setActionError(error.message);
+    }
+  }
+
+  async function refreshLatestBaleJob() {
+    try {
+      const latest = await getLatestBaleJob();
+      setBaleLatestJob(latest || null);
+      setSelectedBaleJobId((current) => current || latest?.job_id || "");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
+  async function refreshBaleJobs() {
+    try {
+      const jobs = await getBaleJobs(10);
+      const recentJobs = Array.isArray(jobs) ? jobs : [];
+      setBaleJobs(recentJobs);
+      setSelectedBaleJobId((current) => current || recentJobs[0]?.job_id || "");
+    } catch (error) {
+      setActionError(error.message);
+    }
+  }
+
+  async function copyBaleDiagnostics() {
+    const selected = baleJobs.find((job) => job.job_id === selectedBaleJobId) || baleLatestJob;
+    if (!selected) {
+      setActionError("No Bale diagnostics are available to copy.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(selected, null, 2));
+      setDiagnosticsCopied(true);
+      window.setTimeout(() => setDiagnosticsCopied(false), 1800);
+    } catch (error) {
+      setActionError(error.message || "Copy failed");
+    }
   }
 
   async function handleOpenBrowser(accountId) {
@@ -878,6 +942,7 @@ export default function PlatformWorkspace({ platformId }) {
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(simpleSendResult.campaign_id);
+      await loadBaleDiagnostics(false);
       if (result.failed_jobs) {
         const failed = result.sample_results?.find((item) => item.status === "failed") || {};
         setActionError(friendlyBulkError(failed.error_code || failed.error_message || "not_logged_in"));
@@ -975,6 +1040,7 @@ export default function PlatformWorkspace({ platformId }) {
       });
       setBulkRealRunResult(result);
       await refreshBulkQueue(campaignId);
+      await loadBaleDiagnostics(false);
       setToast(result.ok ? "اجرای واقعی محدود Bale ثبت شد" : result.error_message || "اجرای واقعی محدود Bale انجام نشد");
     } catch (error) {
       setActionError(error.message);
@@ -1203,7 +1269,21 @@ export default function PlatformWorkspace({ platformId }) {
           planResult={planResult}
         />
       ) : null}
-      {activeTab === "reports" ? <ReportsSection platform={platform} logs={platformLogs} /> : null}
+      {activeTab === "reports" ? (
+        <BaleReportsSection
+          platform={platform}
+          logs={platformLogs}
+          baleLatestJob={baleLatestJob}
+          baleJobs={baleJobs}
+          selectedBaleJobId={selectedBaleJobId}
+          setSelectedBaleJobId={setSelectedBaleJobId}
+          onRefreshLatestBaleJob={refreshLatestBaleJob}
+          onRefreshBaleJobs={refreshBaleJobs}
+          onRefreshBaleDiagnostics={() => loadBaleDiagnostics(false)}
+          onCopyBaleDiagnostics={copyBaleDiagnostics}
+          diagnosticsCopied={diagnosticsCopied}
+        />
+      ) : null}
       {activeTab === "settings" ? (
         <SettingsSection
           accountGroups={accountGroups}
@@ -2483,6 +2563,148 @@ function ReportsSection({ platform, logs }) {
       </div>
       <LogsTable platform={platform} logs={logs} />
     </section>
+  );
+}
+
+function baleJobPluginResult(job) {
+  return job?.plugin_result || job?.execution_result?.plugin_result || {};
+}
+
+function baleJobValue(job, key) {
+  const pluginResult = baleJobPluginResult(job);
+  return job?.[key] ?? pluginResult?.[key] ?? job?.execution_result?.[key] ?? "";
+}
+
+function baleJobTarget(job) {
+  return baleJobValue(job, "contact_naming_value") || baleJobValue(job, "normalized_phone") || job?.contact_id || "-";
+}
+
+function BaleReportsSection({
+  platform,
+  logs,
+  baleLatestJob,
+  baleJobs,
+  selectedBaleJobId,
+  setSelectedBaleJobId,
+  onRefreshLatestBaleJob,
+  onRefreshBaleJobs,
+  onRefreshBaleDiagnostics,
+  onCopyBaleDiagnostics,
+  diagnosticsCopied,
+}) {
+  const selectedJob = baleJobs.find((job) => job.job_id === selectedBaleJobId) || baleLatestJob || null;
+  return (
+    <section className="panel" style={{ marginTop: 16 }}>
+      <div className="panel-header"><h3 className="panel-title">Reports</h3><span className="pill">{logs.length} logs</span></div>
+      <BaleDiagnosticsPanel
+        latestJob={baleLatestJob}
+        jobs={baleJobs}
+        selectedJob={selectedJob}
+        selectedJobId={selectedBaleJobId}
+        setSelectedJobId={setSelectedBaleJobId}
+        onRefreshLatest={onRefreshLatestBaleJob}
+        onRefreshJobs={onRefreshBaleJobs}
+        onRefreshAll={onRefreshBaleDiagnostics}
+        onCopy={onCopyBaleDiagnostics}
+        copied={diagnosticsCopied}
+      />
+      <LogsTable platform={platform} logs={logs} />
+    </section>
+  );
+}
+
+function BaleDiagnosticsPanel({
+  latestJob,
+  jobs,
+  selectedJob,
+  selectedJobId,
+  setSelectedJobId,
+  onRefreshLatest,
+  onRefreshJobs,
+  onRefreshAll,
+  onCopy,
+  copied,
+}) {
+  return (
+    <section className="panel" style={{ marginTop: 16 }}>
+      <div className="panel-header">
+        <div>
+          <h3 className="panel-title">Bale Diagnostics / Logs</h3>
+          <p className="page-copy">Copy one complete diagnostics JSON when a Bale automation job fails.</p>
+        </div>
+        <div className="toolbar compact-toolbar">
+          <button className="secondary-button" onClick={onRefreshAll} type="button">Refresh</button>
+          <button className="secondary-button" onClick={onRefreshLatest} type="button">Refresh latest job</button>
+          <button className="secondary-button" onClick={onRefreshJobs} type="button">Refresh recent jobs</button>
+          <button className="primary-button" onClick={onCopy} type="button">Copy diagnostics JSON</button>
+          {copied ? <span className="pill">Copied</span> : null}
+        </div>
+      </div>
+
+      <section className="safe-policy-section">
+        <div className="panel-header"><h4 className="panel-title">Latest Bale job summary</h4><span className="pill">{latestJob?.job_id || "no job"}</span></div>
+        {latestJob ? (
+          <div className="settings-grid">
+            <ReadOnlyValue label="status" value={latestJob.status} />
+            <ReadOnlyValue label="action" value={baleJobValue(latestJob, "action")} />
+            <ReadOnlyValue label="error_code" value={baleJobValue(latestJob, "error_code")} />
+            <ReadOnlyValue label="failed_step" value={baleJobValue(latestJob, "failed_step")} />
+            <ReadOnlyValue label="last_successful_step" value={baleJobValue(latestJob, "last_successful_step")} />
+            <ReadOnlyValue label="screenshot_path" value={baleJobValue(latestJob, "screenshot_path")} />
+            <ReadOnlyValue label="updated_at" value={displayDate(latestJob.updated_at)} />
+          </div>
+        ) : (
+          <div className="empty-state">No Bale execution jobs are available.</div>
+        )}
+      </section>
+
+      <section className="safe-policy-section">
+        <div className="panel-header"><h4 className="panel-title">Recent Bale jobs</h4><span className="pill">{jobs.length} jobs</span></div>
+        <div className="table-scroll">
+          <table className="table rtl-table wide-table">
+            <thead><tr><th>updated_at</th><th>status</th><th>action</th><th>target/contact_naming_value</th><th>error_code</th><th>failed_step</th></tr></thead>
+            <tbody>{jobs.map((job) => (
+              <tr
+                key={job.job_id}
+                onClick={() => setSelectedJobId(job.job_id)}
+                style={{ cursor: "pointer", outline: selectedJobId === job.job_id ? "2px solid #2563eb" : "none" }}
+              >
+                <td>{displayDate(job.updated_at)}</td>
+                <td><Pill value={job.status} /></td>
+                <td>{baleJobValue(job, "action") || "-"}</td>
+                <td className="truncate">{baleJobTarget(job)}</td>
+                <td className="truncate">{baleJobValue(job, "error_code") || "-"}</td>
+                <td>{baleJobValue(job, "failed_step") || "-"}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+        {jobs.length === 0 ? <div className="empty-state">No recent Bale jobs found.</div> : null}
+      </section>
+
+      <section className="safe-policy-section">
+        <div className="panel-header">
+          <h4 className="panel-title">Selected diagnostics JSON</h4>
+          <span className="pill">{selectedJob?.job_id || "latest fallback"}</span>
+        </div>
+        {selectedJob ? (
+          <pre style={{ direction: "ltr", textAlign: "left", whiteSpace: "pre-wrap", maxHeight: 520, overflow: "auto" }}>
+            {JSON.stringify(selectedJob, null, 2)}
+          </pre>
+        ) : (
+          <div className="empty-state">Select a Bale job to view full diagnostics JSON.</div>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function ReadOnlyValue({ label, value }) {
+  return (
+    <label>
+      <span>{label}</span>
+      <input value={value || "-"} readOnly />
+    </label>
   );
 }
 

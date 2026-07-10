@@ -30,6 +30,7 @@ from modules.automation_engine.plugins.bale import selectors
 from modules.automation_engine.plugins.bale.account_store import BaleAccountStore
 from modules.automation_engine.plugins.bale.governance import can_account_run_scenario
 from modules.automation_engine.plugins.bale.plugin import BalePlugin, phone_for_bale_contact_field
+from modules.automation_engine.scenario_runner import ScenarioRunner
 from modules.automation_engine.scenario_library import (
     ScenarioExecutorStub,
     ScenarioLoader,
@@ -112,6 +113,12 @@ class MockLocator:
     def inner_text(self, timeout: int) -> str:
         self.page.timeouts.append(timeout)
         return self.page.selector_text.get(self.selector, "")
+
+    def hover(self, timeout: int) -> None:
+        self.page.timeouts.append(timeout)
+
+    def scroll_into_view_if_needed(self, timeout: int) -> None:
+        self.page.timeouts.append(timeout)
 
 
 class MockKeyboard:
@@ -1392,6 +1399,146 @@ def test_bale_contact_phone_strips_iran_country_code_for_contact_modal() -> None
     assert phone_for_bale_contact_field("9304073331") == "9304073331"
 
 
+def _forward_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "source": {
+            "type": "channel",
+            "channel_url": "https://web.bale.ai/channel/source",
+            "channel_name": "Default Bale Source Channel",
+            "message_selector": {"strategy": "latest_visible"},
+        },
+        "target": {"phone": "989304073331", "name": "Bale-000001"},
+        "normalized_phone": "989304073331",
+        "contact_naming_value": "Bale-000001",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_forward_latest_channel_message_exists_as_separate_action() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    assert hasattr(plugin, "forward_latest_channel_message")
+    assert callable(plugin.forward_latest_channel_message)
+    assert callable(plugin.send_text_message)
+    assert plugin.forward_latest_channel_message != plugin.send_text_message
+
+
+def test_forward_latest_channel_message_missing_channel_url_fails_validation() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    result = plugin.forward_latest_channel_message(
+        "bale_test",
+        _forward_payload(source={"type": "channel", "channel_url": ""}),
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "missing_channel_url"
+    assert result["failed_step"] == "validate_input"
+
+
+def test_forward_latest_channel_message_defaults_missing_selector_to_latest_visible() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    context_result = plugin._build_forward_latest_channel_message_context(
+        _forward_payload(source={"type": "channel", "channel_url": "https://web.bale.ai/channel/source"})
+    )
+    assert context_result["success"] is True
+    assert context_result["context"]["message_selector"]["strategy"] == "latest_visible"
+
+
+def test_forward_latest_channel_message_unsupported_selector_fails_validation() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    result = plugin.forward_latest_channel_message(
+        "bale_test",
+        _forward_payload(
+            source={
+                "type": "channel",
+                "channel_url": "https://web.bale.ai/channel/source",
+                "message_selector": {"strategy": "pinned"},
+            }
+        ),
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "unsupported_message_selector"
+    assert result["failed_step"] == "validate_input"
+
+
+def test_forward_latest_channel_message_channel_latest_maps_to_latest_visible() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    context_result = plugin._build_forward_latest_channel_message_context(
+        _forward_payload(source={"type": "channel_latest", "channel_url": "https://web.bale.ai/channel/source"})
+    )
+    assert context_result["success"] is True
+    assert context_result["context"]["message_selector"]["strategy"] == "latest_visible"
+
+
+def test_forward_latest_channel_message_input_mapping_matches_old_context() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    context_result = plugin._build_forward_latest_channel_message_context(_forward_payload())
+    context = context_result["context"]
+    assert context["channel_url"] == "https://web.bale.ai/channel/source"
+    assert context["message_selector"]["strategy"] == "latest_visible"
+    assert context["contacts"][0]["phone"] == "989304073331"
+    assert context["contacts"][0]["name"] == "Bale-000001"
+    assert context["contacts"][0]["username"] == ""
+    assert context["method"] == "phone"
+    assert context["phone_name"] == "phone"
+
+
+def test_forward_latest_channel_message_uses_phone_as_name_when_name_missing() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    context_result = plugin._build_forward_latest_channel_message_context(
+        _forward_payload(target={"phone": "989304073331"}, contact_naming_value="")
+    )
+    assert context_result["context"]["contacts"][0]["name"] == "989304073331"
+
+
+def test_forward_latest_channel_message_missing_target_phone_fails_validation() -> None:
+    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
+    result = plugin.forward_latest_channel_message(
+        "bale_test",
+        _forward_payload(target={"name": "Bale-000001"}, normalized_phone=""),
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "missing_target_phone"
+    assert result["failed_step"] == "validate_input"
+
+
+def test_forward_latest_channel_message_old_scenario_schema_is_accepted() -> None:
+    scenario_path = Path(__file__).parent / "modules" / "automation_engine" / "scenarios" / "bale" / "forward_latest_channel_message.json"
+    scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
+    assert set(scenario.keys()) == {"context", "elements", "steps"}
+    runner = ScenarioRunner(MockPage(set()), scenario_path, {"channel_url": "https://web.bale.ai/channel/source"})
+    assert runner.scenario["context"] == {}
+    assert isinstance(runner.scenario["elements"], dict)
+    assert isinstance(runner.scenario["steps"], list)
+
+
+def test_scenario_runner_interpolates_forward_context_values() -> None:
+    scenario_path = Path(__file__).parent / "modules" / "automation_engine" / "scenarios" / "bale" / "forward_latest_channel_message.json"
+    runner = ScenarioRunner(
+        MockPage(set()),
+        scenario_path,
+        {
+            "channel_url": "https://web.bale.ai/channel/source",
+            "message_selector": {"strategy": "latest_visible"},
+            "contact": {"phone": "989304073331", "name": "Bale-000001", "username": ""},
+        },
+    )
+    assert runner.interpolate("{{channel_url}}") == "https://web.bale.ai/channel/source"
+    assert runner.interpolate("{{contact.phone}}") == "989304073331"
+    assert runner.interpolate("{{contact.name}}") == "Bale-000001"
+    assert runner.interpolate("{{message_selector.strategy}}") == "latest_visible"
+
+
+def test_scenario_runner_missing_selector_fails_clearly() -> None:
+    page = MockPage(set(), url="https://web.bale.ai/chat")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_latest_channel_message("bale_test", _forward_payload())
+    assert result["success"] is False
+    assert "selector" in result["error_code"]
+    assert result["failed_step"]
+    assert result["screenshot_path"]
+    assert result["current_url"] == "https://web.bale.ai/channel/source"
+
+
 def test_send_text_message_target_not_found_returns_open_target_chat_failure() -> None:
     page = MockPage(
         {
@@ -2636,6 +2783,7 @@ def test_api_routes_import() -> None:
     assert "/automation/platforms/bale/accounts/{account_id}/check-login" in paths
     assert "/automation/platforms/bale/send-test" in paths
     assert "/automation/platforms/bale/latest-job" in paths
+    assert "/automation/platforms/bale/jobs" in paths
     assert "/automation/platforms/bale/message-config" in paths
     assert "/automation/platforms/bale/profile-groups" in paths
     assert "/automation/platforms/bale/accounts/{account_id}/assign-profile-group" in paths
@@ -2689,6 +2837,68 @@ def test_latest_bale_job_route_returns_execution_and_plugin_result_shape() -> No
     assert payload["execution_result"]["action"] == "send_text_message"
     assert payload["execution_result"]["plugin_result"]["failed_step"] == "open_target_chat"
     assert payload["execution_result"]["plugin_result"]["screenshot_path"]
+
+
+def test_bale_jobs_route_returns_recent_jobs_with_full_diagnostics() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        old_plugin_result = {
+            "ok": True,
+            "success": True,
+            "action": "send_text_message",
+            "account_id": "bale_recent_1",
+            "normalized_phone": "989120000001",
+            "contact_naming_value": "Bale-GHAB-old",
+            "step_results": [{"step": "confirm_sent", "status": "success"}],
+        }
+        failed_plugin_result = {
+            "ok": False,
+            "success": False,
+            "action": "send_text_message",
+            "account_id": "bale_recent_2",
+            "normalized_phone": "989120000002",
+            "contact_naming_value": "Bale-GHAB-new",
+            "failed_step": "open_target_chat",
+            "last_successful_step": "return_to_chat_after_contact_save",
+            "screenshot_path": "runtime/debug/bale_recent_2.png",
+            "step_results": [{"step": "open_target_chat", "status": "failed"}],
+        }
+        queue_store.save_jobs(
+            [
+                {
+                    **_queue_job("old", account_id="bale_recent_1"),
+                    "status": "completed",
+                    "updated_at": "2026-07-10T09:00:00+00:00",
+                    "execution_result": {"success": True, "action": "send_text_message", "plugin_result": old_plugin_result},
+                },
+                {
+                    **_queue_job("new", account_id="bale_recent_2"),
+                    "status": "failed",
+                    "error_code": "target_not_found",
+                    "updated_at": "2026-07-10T10:00:00+00:00",
+                    "execution_result": {"success": False, "action": "send_text_message", "plugin_result": failed_plugin_result},
+                },
+            ]
+        )
+        previous_store = automation_routes.execution_queue_store
+        automation_routes.execution_queue_store = queue_store
+        try:
+            response = TestClient(app).get("/automation/platforms/bale/jobs?limit=1")
+        finally:
+            automation_routes.execution_queue_store = previous_store
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["job_id"] == "new"
+    assert payload[0]["action"] == "send_text_message"
+    assert payload[0]["error_code"] == "target_not_found"
+    assert payload[0]["failed_step"] == "open_target_chat"
+    assert payload[0]["last_successful_step"] == "return_to_chat_after_contact_save"
+    assert payload[0]["screenshot_path"] == "runtime/debug/bale_recent_2.png"
+    assert payload[0]["step_results"] == failed_plugin_result["step_results"]
+    assert payload[0]["plugin_result"] == failed_plugin_result
+    assert payload[0]["execution_result"]["plugin_result"] == failed_plugin_result
 
 
 def test_browser_manager_resolves_system_browser_on_windows() -> None:
@@ -4100,6 +4310,17 @@ if __name__ == "__main__":
     test_send_text_message_uses_modal_scoped_phone_input_fallback_after_country_selector()
     test_send_text_message_uses_second_modal_input_name_fallback()
     test_bale_contact_phone_strips_iran_country_code_for_contact_modal()
+    test_forward_latest_channel_message_exists_as_separate_action()
+    test_forward_latest_channel_message_missing_channel_url_fails_validation()
+    test_forward_latest_channel_message_defaults_missing_selector_to_latest_visible()
+    test_forward_latest_channel_message_unsupported_selector_fails_validation()
+    test_forward_latest_channel_message_channel_latest_maps_to_latest_visible()
+    test_forward_latest_channel_message_input_mapping_matches_old_context()
+    test_forward_latest_channel_message_uses_phone_as_name_when_name_missing()
+    test_forward_latest_channel_message_missing_target_phone_fails_validation()
+    test_forward_latest_channel_message_old_scenario_schema_is_accepted()
+    test_scenario_runner_interpolates_forward_context_values()
+    test_scenario_runner_missing_selector_fails_clearly()
     test_send_text_message_target_not_found_returns_open_target_chat_failure()
     test_send_text_message_type_message_failure_includes_input_diagnostics()
     test_return_to_chat_after_contact_save_does_not_succeed_on_contacts_page()
@@ -4155,6 +4376,7 @@ if __name__ == "__main__":
     test_send_test_message_maps_greenlet_thread_error()
     test_api_routes_import()
     test_latest_bale_job_route_returns_execution_and_plugin_result_shape()
+    test_bale_jobs_route_returns_recent_jobs_with_full_diagnostics()
     test_browser_manager_resolves_system_browser_on_windows()
     test_bale_account_persistence_create_edit_delete()
     test_adspower_account_requires_profile_id()
