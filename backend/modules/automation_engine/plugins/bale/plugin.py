@@ -307,9 +307,13 @@ class BalePlugin:
             extra: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             finished_at = datetime.now(timezone.utc).isoformat()
+            final_extra = dict(extra or {})
+            page_url = str(final_extra.get("page_url") or final_extra.get("current_url") or current_url_value)
+            current_url = str(final_extra.get("current_url") or page_url)
             result = {
                 "ok": ok,
                 "success": ok,
+                "action": "send_text_message",
                 "logged_in": error_code not in {"not_logged_in", "bale_install_prompt"},
                 "platform": self.platform_id,
                 "account_id": account_id,
@@ -317,9 +321,12 @@ class BalePlugin:
                 "target": normalized_phone,
                 "contact_naming_value": contact_naming_value,
                 "contact_save_status": contact_save_status,
-                "current_url": (extra or {}).get("current_url") or current_url_value,
+                "current_url": current_url,
+                "page_url": page_url,
+                "page_title": str(final_extra.get("page_title") or ""),
                 "message": user_message or ("Bale text message sent" if ok else "Bale text message failed"),
                 "user_message": user_message,
+                "error_message": "" if ok else user_message,
                 "error_code": error_code,
                 "failed_step": failed_step,
                 "last_successful_step": _last_successful_step(step_results) if not ok else None,
@@ -328,8 +335,16 @@ class BalePlugin:
                 "finished_at": finished_at,
                 "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
                 **browser_meta,
-                **(extra or {}),
+                **final_extra,
             }
+            result["current_url"] = str(result.get("current_url") or current_url)
+            result["page_url"] = str(result.get("page_url") or result.get("current_url") or page_url)
+            result["page_title"] = str(result.get("page_title") or "")
+            result["error_message"] = str(result.get("error_message") or ("" if ok else result.get("message") or ""))
+            result["browser_path"] = result.get("browser_path") or getattr(self.browser_manager, "last_browser_path", None)
+            if ok:
+                result.setdefault("send_triggered", True)
+                result.setdefault("confirm_sent_status", "confirmed" if not result.get("warning_code") else "assumed")
             return result
 
         if not normalized_phone.strip():
@@ -427,14 +442,34 @@ class BalePlugin:
                 self._add_step(step_results, "type_message", "success", selector=message_input)
 
                 self._add_step(step_results, "click_send", "started", action="press_enter")
-                self._press_key(page, "Enter")
+                try:
+                    self._press_key(page, "Enter")
+                except Exception as exc:
+                    diagnostics = {
+                        **self._page_debug_info(page, account_id),
+                        **self._send_button_diagnostics(page, message_input),
+                    }
+                    self._add_step(step_results, "click_send", "failed", error_code=_browser_error_code(exc), error=str(exc), **diagnostics)
+                    return finish(False, _browser_error_code(exc), str(exc), "click_send", diagnostics)
                 self._add_step(step_results, "click_send", "success", action="press_enter")
 
                 sent_selector = self._first_visible_selector(page, selectors.MESSAGE_SENT_INDICATOR_SELECTORS, timeout_ms=1500)
                 if sent_selector:
                     self.browser_manager.save_session(account_id)
                     self._add_step(step_results, "confirm_sent", "success", matched_selector=sent_selector)
-                    return finish(True, None, "Bale text message sent", None, {"current_url": _safe_page_url(page)})
+                    return finish(
+                        True,
+                        None,
+                        "Bale text message sent",
+                        None,
+                        {
+                            "current_url": _safe_page_url(page),
+                            "page_url": _safe_page_url(page),
+                            "page_title": _safe_page_title(page),
+                            "send_triggered": True,
+                            "confirm_sent_status": "confirmed",
+                        },
+                    )
 
                 diagnostics = {
                     **self._page_debug_info(page, account_id),
@@ -443,6 +478,8 @@ class BalePlugin:
                 warning = {
                     "warning_code": "send_confirmation_not_implemented",
                     "warning_message": "Message send was triggered, but delivery confirmation is not implemented yet.",
+                    "send_triggered": True,
+                    "confirm_sent_status": "assumed",
                     **diagnostics,
                 }
                 self._add_step(step_results, "confirm_sent", "assumed_success", reason="send_confirmation_not_implemented", **warning)
@@ -802,12 +839,14 @@ class BalePlugin:
                 "provider_mode": "native_chrome",
                 "browser_reused": False,
                 "profile_dir": str(profile_dir),
+                "browser_path": getattr(self.browser_manager, "last_browser_path", None),
             }
         account = bale_account_store.get_account(account_id) or {}
         return {
             "provider_mode": provider_mode,
             "browser_reused": True,
             "profile_dir": str(account.get("user_data_dir") or ""),
+            "browser_path": getattr(self.browser_manager, "last_browser_path", None),
         }
 
     def _detect_login_state(self, page: Any, timeout_ms: int = 3000) -> dict[str, Any]:
@@ -885,9 +924,12 @@ class BalePlugin:
         }
 
     def _page_debug_info(self, page: Any, account_id: str) -> dict[str, Any]:
+        current_url = _safe_page_url(page)
         info: dict[str, Any] = {
-            "current_url": _safe_page_url(page),
+            "current_url": current_url,
+            "page_url": current_url,
             "page_title": _safe_page_title(page),
+            "visible_text_sample": _visible_text_sample(page),
         }
         screenshot_path = _save_login_debug_screenshot(page, account_id)
         if screenshot_path:
@@ -1159,8 +1201,39 @@ class BalePlugin:
             )
             return ready
 
+        def failed_open_result(details: dict[str, Any]) -> dict[str, Any]:
+            result = {
+                "step": "open_target_chat",
+                "status": "failed",
+                "searched_value": details.get("searched_value") or contact_naming_value or normalized_phone,
+                "search_phase": details.get("search_phase") or "",
+                "search_attempts": details.get("search_attempts") or search_attempts,
+                "chat_query_attempts": details.get("chat_query_attempts") or details.get("search_attempts") or search_attempts,
+                "contacts_fallback_attempted": bool(details.get("contacts_fallback_attempted", False)),
+                "contacts_result_count": int(details.get("contacts_result_count") or 0),
+                "matched_contact_text": str(details.get("matched_contact_text") or ""),
+                "matched_candidate_text": str(details.get("matched_candidate_text") or ""),
+                "clicked_result": bool(details.get("clicked_result", False)),
+                "click_method": str(details.get("click_method") or ""),
+                "click_attempts": details.get("click_attempts") or [],
+                "chat_open_confirmed": bool(details.get("chat_open_confirmed", False)),
+                "chat_open_confirmed_by": str(details.get("chat_open_confirmed_by") or ""),
+                "normal_chat_list_candidate_count": int(details.get("normal_chat_list_candidate_count") or ready_guard_meta.get("normal_chat_list_candidate_count") or 0),
+                "normal_chat_list_candidate_debug": details.get("normal_chat_list_candidate_debug") or ready_guard_meta.get("normal_chat_list_candidate_debug") or [],
+                "target_already_open_detected": bool(details.get("target_already_open_detected", ready_guard_meta.get("target_already_open_detected", False))),
+                "target_already_open_chat_app_bar_text": str(details.get("target_already_open_chat_app_bar_text") or ready_guard_meta.get("target_already_open_chat_app_bar_text") or ""),
+                "target_already_open_message_input_visible": bool(details.get("target_already_open_message_input_visible", ready_guard_meta.get("target_already_open_message_input_visible", False))),
+                "visible_text_sample": _visible_text_sample(page),
+                "page_url": _safe_page_url(page),
+                "current_url": _safe_page_url(page),
+                "page_title": _safe_page_title(page),
+                **details,
+            }
+            result["chat_query_attempts"] = result.get("chat_query_attempts") or result.get("search_attempts") or []
+            return result
+
         if not ensure_chat_ready_for_search("open_target_chat_start"):
-            return {
+            return failed_open_result({
                 "step": "open_target_chat",
                 "status": "failed",
                 "error_code": "main_chat_ui_not_ready",
@@ -1168,7 +1241,7 @@ class BalePlugin:
                 "chat_open_confirmed": False,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 **ready_guard_meta,
-            }
+            })
 
         already_open = self._target_already_open_state(page, contact_naming_value)
         ready_guard_meta.update(already_open)
@@ -1244,7 +1317,7 @@ class BalePlugin:
             ready_guard_meta["search_activation_skipped_reason"] = "normal_chat_list_result_click_not_confirmed"
             ready_guard_meta["contacts_fallback_blocked_reason"] = "normal_chat_list_result_visible"
             ready_guard_meta["contacts_fallback_skipped_reason"] = "normal_chat_list_result_visible"
-            return {
+            return failed_open_result({
                 "step": "open_target_chat",
                 "status": "failed",
                 "error_code": "result_click_not_confirmed",
@@ -1262,13 +1335,13 @@ class BalePlugin:
                 "contacts_fallback_skipped_reason": "normal_chat_list_result_visible",
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 **ready_guard_meta,
-            }
+            })
 
         search_open = self._open_chat_search_from_main_ui(page, contact_naming_value, normalized_phone, ensure_chat_ready_for_search)
         search_input = str(search_open.get("search_input_selector") or "")
         if not search_input:
             if str(search_open.get("error_code") or "") == "main_chat_ui_not_ready":
-                return {
+                return failed_open_result({
                     "step": "open_target_chat",
                     "status": "failed",
                     "error_code": "main_chat_ui_not_ready",
@@ -1279,9 +1352,9 @@ class BalePlugin:
                     "chat_open_confirmed": False,
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                     **ready_guard_meta,
-                }
+                })
             if not ensure_chat_ready_for_search("before_contacts_fallback"):
-                return {
+                return failed_open_result({
                     "step": "open_target_chat",
                     "status": "failed",
                     "error_code": "main_chat_ui_not_ready",
@@ -1292,7 +1365,7 @@ class BalePlugin:
                     "chat_open_confirmed": False,
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                     **ready_guard_meta,
-                }
+                })
             contacts_fallback = self._open_chat_from_contacts_fallback(page, contact_naming_value, normalized_phone)
             if contacts_fallback.get("status") == "success":
                 return {
@@ -1310,7 +1383,7 @@ class BalePlugin:
                     **ready_guard_meta,
                 }
             diagnostics = self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=contact_naming_value or normalized_phone)
-            return {
+            return failed_open_result({
                 "step": "open_target_chat",
                 "status": "failed",
                 "error_code": contacts_fallback.get("error_code") or "search_input_not_found",
@@ -1327,7 +1400,7 @@ class BalePlugin:
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 **ready_guard_meta,
                 **diagnostics,
-            }
+            })
 
         for query in [contact_naming_value, normalized_phone]:
             query = str(query or "").strip()
@@ -1388,7 +1461,7 @@ class BalePlugin:
                 self._clear_search_input(page, search_input)
             ready_guard_meta["open_target_chat_search_activation_url_before"] = _safe_page_url(page)
             if not ensure_chat_ready_for_search("before_typing_search_query"):
-                return {
+                return failed_open_result({
                     "step": "open_target_chat",
                     "status": "failed",
                     "error_code": "main_chat_ui_not_ready",
@@ -1399,7 +1472,7 @@ class BalePlugin:
                     "chat_open_confirmed": False,
                     "duration_ms": int((time.perf_counter() - started) * 1000),
                     **ready_guard_meta,
-                }
+                })
             ready_guard_meta["open_target_chat_search_activation_url_after"] = _safe_page_url(page)
             self._fill_or_type(page, search_input, query)
             already_open = self._target_already_open_state(page, contact_naming_value)
@@ -1886,7 +1959,7 @@ class BalePlugin:
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 **ready_guard_meta,
             }
-        return {
+        return failed_open_result({
             "step": "open_target_chat",
             "status": "failed",
             "error_code": "target_not_found",
@@ -1946,7 +2019,7 @@ class BalePlugin:
             "duration_ms": int((time.perf_counter() - started) * 1000),
             **ready_guard_meta,
             **self._post_save_ui_diagnostics(page, contact_naming_value, normalized_phone, searched_value=searched_value),
-        }
+        })
 
     def _save_contact_from_modal(
         self,
@@ -4129,8 +4202,10 @@ class BalePlugin:
         searched_value: str,
     ) -> dict[str, Any]:
         search_input_selector = self._first_visible_selector(page, selectors.TEXT_SEARCH_INPUT_SELECTORS, timeout_ms=100)
+        message_input_selector = self._first_visible_selector(page, selectors.MESSAGE_INPUT_SELECTORS, timeout_ms=100)
         return {
             "page_url": _safe_page_url(page),
+            "page_title": _safe_page_title(page),
             "visible_modal_text": self._visible_modal_or_dialog_text(page),
             "search_input_visible": bool(search_input_selector),
             "search_input_selector": search_input_selector or "",
@@ -4139,7 +4214,74 @@ class BalePlugin:
             "normalized_phone": normalized_phone,
             "contacts_ui_visible": self._contacts_ui_visible(page),
             "main_chat_ui_visible": self._main_chat_ui_visible(page),
+            "message_input_visible": bool(message_input_selector),
+            "message_input_selector": message_input_selector or "",
+            "message_input_detected_count": self._visible_selector_count(page, selectors.MESSAGE_INPUT_SELECTORS),
+            "contenteditable_count": self._dom_count(page, "[contenteditable='true'], [contenteditable=true]"),
+            "textarea_count": self._dom_count(page, "textarea"),
+            "input_count": self._dom_count(page, "input"),
+            "chat_app_bar_text": self._right_chat_header_text(page),
+            "visible_text_sample": _visible_text_sample(page),
         }
+
+    def _visible_selector_count(self, page: Any, selector_list: list[str]) -> int:
+        count = 0
+        for selector in selector_list:
+            if self._is_selector_visible(page, selector, timeout_ms=50):
+                count += 1
+        return count
+
+    def _dom_count(self, page: Any, selector: str) -> int:
+        try:
+            value = page.evaluate(
+                """(selector) => {
+                    try {
+                        return document.querySelectorAll(selector).length;
+                    } catch (_) {
+                        return 0;
+                    }
+                }""",
+                selector,
+            )
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def _send_button_diagnostics(self, page: Any, message_input_selector: str = "") -> dict[str, Any]:
+        send_button_selector = self._first_visible_selector(page, selectors.SEND_BUTTON_SELECTORS, timeout_ms=100)
+        return {
+            "send_button_visible": bool(send_button_selector),
+            "send_button_selector": send_button_selector or "",
+            "send_button_candidates": self._visible_selector_snapshot(page, selectors.SEND_BUTTON_SELECTORS),
+            "message_input_text_before_send": self._input_text_value(page, message_input_selector),
+            "current_url": _safe_page_url(page),
+            "page_url": _safe_page_url(page),
+        }
+
+    def _visible_selector_snapshot(self, page: Any, selector_list: list[str]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for selector in selector_list:
+            visible = self._is_selector_visible(page, selector, timeout_ms=50)
+            text = ""
+            if visible:
+                try:
+                    text = str(page.locator(selector).first.inner_text(timeout=100) or "")[:160]
+                except Exception:
+                    text = ""
+            items.append({"selector": selector, "visible": visible, "text": text})
+        return items
+
+    def _input_text_value(self, page: Any, selector: str) -> str:
+        if not selector:
+            return ""
+        try:
+            return str(page.locator(selector).first.input_value(timeout=100) or "")
+        except Exception:
+            pass
+        try:
+            return str(page.locator(selector).first.inner_text(timeout=100) or "")
+        except Exception:
+            return ""
 
     def _visible_modal_or_dialog_text(self, page: Any) -> str:
         for selector in [".ReactModal__Content", ".ReactModal__Overlay", '[role="dialog"]']:

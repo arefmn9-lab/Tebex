@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.main import app
+from app.routes import automation as automation_routes
 from fastapi.testclient import TestClient
 from modules.automation_engine.bulk_messaging import (
     AssignmentStore,
@@ -994,6 +995,52 @@ def test_send_text_message_saves_contact_with_captured_add_contact_modal_flow() 
     assert all(timeout < 30000 for timeout in page.timeouts)
 
 
+def test_send_text_message_success_includes_required_diagnostics() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+            selectors.TEXT_SEARCH_INPUT_SELECTORS[2],
+            selectors.CHAT_ITEM_SELECTORS[0],
+            selectors.MESSAGE_INPUT_SELECTORS[0],
+            selectors.MESSAGE_SENT_INDICATOR_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={selectors.CHAT_ITEM_SELECTORS[0]: "Bale-000001"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.send_text_message("bale_test", "989120000001", "hello real text", "Bale-000001")
+
+    assert result["ok"] is True
+    assert result["success"] is True
+    assert result["action"] == "send_text_message"
+    assert result["account_id"] == "bale_test"
+    assert result["normalized_phone"] == "989120000001"
+    assert result["contact_naming_value"] == "Bale-000001"
+    assert result["failed_step"] is None
+    assert result["last_successful_step"] is None
+    assert result["error_code"] is None
+    assert result["error_message"] == ""
+    assert result["current_url"]
+    assert result["page_url"]
+    assert "page_title" in result
+    assert result["provider_mode"] == "native_chrome"
+    assert result["browser_reused"] is True
+    assert "profile_dir" in result
+    assert "browser_path" in result
+    assert result["step_results"]
+    assert result["send_triggered"] is True
+    assert result["confirm_sent_status"] == "confirmed"
+
+
 def test_send_text_message_assumes_success_when_send_confirmation_missing() -> None:
     page = MockPage(
         {
@@ -1368,6 +1415,68 @@ def test_send_text_message_target_not_found_returns_open_target_chat_failure() -
     assert result["error_code"] == "target_not_found"
     assert result["failed_step"] == "open_target_chat"
     assert result["search_attempts"]
+    assert result["screenshot_path"]
+    assert result["searched_value"]
+    assert "search_phase" in result
+    assert "chat_query_attempts" in result
+    assert "contacts_fallback_attempted" in result
+    assert "contacts_result_count" in result
+    assert "matched_contact_text" in result
+    assert "matched_candidate_text" in result
+    assert "clicked_result" in result
+    assert "click_method" in result
+    assert "click_attempts" in result
+    assert "chat_open_confirmed" in result
+    assert "chat_open_confirmed_by" in result
+    assert "normal_chat_list_candidate_count" in result
+    assert "normal_chat_list_candidate_debug" in result
+    assert "target_already_open_detected" in result
+    assert "target_already_open_chat_app_bar_text" in result
+    assert "target_already_open_message_input_visible" in result
+    assert "visible_text_sample" in result
+
+
+def test_send_text_message_type_message_failure_includes_input_diagnostics() -> None:
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+            selectors.SEARCH_ICON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat?uid=123",
+        selector_text={"body": "chat shell without composer"},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    plugin._open_target_chat = lambda page_arg, contact_name, phone: {  # type: ignore[method-assign]
+        "step": "open_target_chat",
+        "status": "success",
+        "searched_value": contact_name,
+        "chat_open_confirmed": True,
+    }
+
+    result = plugin.send_text_message("bale_test", "989120000001", "hello real text", "Bale-000001")
+
+    assert result["ok"] is False
+    assert result["failed_step"] == "type_message"
+    assert result["error_code"] == "message_input_not_found"
+    assert result["message_input_visible"] is False
+    assert result["message_input_selector"] == ""
+    assert result["message_input_detected_count"] == 0
+    assert "contenteditable_count" in result
+    assert "textarea_count" in result
+    assert "input_count" in result
+    assert "visible_modal_text" in result
+    assert "search_input_visible" in result
+    assert "contacts_ui_visible" in result
+    assert "main_chat_ui_visible" in result
+    assert "chat_app_bar_text" in result
+    assert "visible_text_sample" in result
 
 
 def test_return_to_chat_after_contact_save_does_not_succeed_on_contacts_page() -> None:
@@ -2536,6 +2645,50 @@ def test_api_routes_import() -> None:
     assert "/automation/browser/providers" in paths
     assert "/automation/browser/providers/adspower/config" in paths
     assert "/automation/browser/providers/adspower/health" in paths
+
+
+def test_latest_bale_job_route_returns_execution_and_plugin_result_shape() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        plugin_result = {
+            "ok": False,
+            "success": False,
+            "action": "send_text_message",
+            "account_id": "bale_latest_1",
+            "normalized_phone": "989120000001",
+            "contact_naming_value": "Bale-GHAB-001",
+            "failed_step": "open_target_chat",
+            "screenshot_path": "runtime/debug/bale_latest_1.png",
+            "step_results": [{"step": "open_target_chat", "status": "failed"}],
+        }
+        queue_store.save_jobs(
+            [
+                {
+                    **_queue_job("latest", account_id="bale_latest_1"),
+                    "status": "failed",
+                    "updated_at": "2026-07-10T10:00:00+00:00",
+                    "execution_result": {
+                        "success": False,
+                        "action": "send_text_message",
+                        "provider_mode": "native_chrome",
+                        "plugin_result": plugin_result,
+                    },
+                }
+            ]
+        )
+        previous_store = automation_routes.execution_queue_store
+        automation_routes.execution_queue_store = queue_store
+        try:
+            response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_store
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["platform_id"] == "bale"
+    assert payload["execution_result"]["action"] == "send_text_message"
+    assert payload["execution_result"]["plugin_result"]["failed_step"] == "open_target_chat"
+    assert payload["execution_result"]["plugin_result"]["screenshot_path"]
 
 
 def test_browser_manager_resolves_system_browser_on_windows() -> None:
@@ -3934,6 +4087,7 @@ if __name__ == "__main__":
     test_open_login_returns_profile_dir_without_real_browser()
     test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
     test_send_text_message_saves_contact_with_captured_add_contact_modal_flow()
+    test_send_text_message_success_includes_required_diagnostics()
     test_send_text_message_assumes_success_when_send_confirmation_missing()
     test_save_contact_by_phone_returns_saved_for_captured_modal_flow()
     test_save_contact_by_phone_does_not_use_broad_page_level_add_text_for_submit()
@@ -3947,6 +4101,7 @@ if __name__ == "__main__":
     test_send_text_message_uses_second_modal_input_name_fallback()
     test_bale_contact_phone_strips_iran_country_code_for_contact_modal()
     test_send_text_message_target_not_found_returns_open_target_chat_failure()
+    test_send_text_message_type_message_failure_includes_input_diagnostics()
     test_return_to_chat_after_contact_save_does_not_succeed_on_contacts_page()
     test_return_to_chat_after_contact_save_retries_until_chat_page_ready()
     test_return_to_chat_after_contact_save_succeeds_when_ready_signal_is_immediate()
@@ -3999,6 +4154,7 @@ if __name__ == "__main__":
     test_send_test_message_send_timeout_path()
     test_send_test_message_maps_greenlet_thread_error()
     test_api_routes_import()
+    test_latest_bale_job_route_returns_execution_and_plugin_result_shape()
     test_browser_manager_resolves_system_browser_on_windows()
     test_bale_account_persistence_create_edit_delete()
     test_adspower_account_requires_profile_id()
