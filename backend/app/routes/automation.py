@@ -315,8 +315,12 @@ class BaleOpenAccountRequest(BaseModel):
 
 class BaleSendTestRequest(BaseModel):
     account_id: str
-    target: str
-    message: str
+    target: str | dict[str, Any]
+    message: str = ""
+    action: str = "send_text_message"
+    source: dict[str, Any] | None = None
+    normalized_phone: str | None = None
+    contact_naming_value: str | None = None
 
 
 def _serialize_task(task: TaskRecord) -> dict[str, Any]:
@@ -819,6 +823,15 @@ def list_platform_logs(platform_id: str, response: Response) -> list[dict[str, A
     return logs
 
 
+@router.get("/platforms/bale/latest-job")
+def get_latest_bale_job(response: Response) -> dict[str, Any] | None:
+    _set_dashboard_cors_headers(response)
+    jobs = [job for job in execution_queue_store.list_jobs() if str(job.get("platform_id") or "").lower() == "bale"]
+    if not jobs:
+        return None
+    return sorted(jobs, key=lambda job: str(job.get("updated_at") or job.get("created_at") or ""), reverse=True)[0]
+
+
 @router.put("/platforms/bale/accounts/{account_id}")
 def update_bale_account(
     account_id: str,
@@ -1170,9 +1183,18 @@ def send_bale_test(
     response: Response,
 ) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
+    if request.action == "forward_message":
+        target = request.target if isinstance(request.target, dict) else {"phone": request.target}
+        return bale_plugin.forward_message(
+            account_id=request.account_id,
+            source=request.source,
+            target=target,
+            normalized_phone=request.normalized_phone or str(target.get("phone") or ""),
+            contact_naming_value=request.contact_naming_value or str(target.get("name") or ""),
+        )
     return bale_plugin.send_test_message(
         account_id=request.account_id,
-        target=request.target,
+        target=str(request.target),
         message=request.message,
     )
 

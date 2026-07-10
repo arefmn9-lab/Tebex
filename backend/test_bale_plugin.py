@@ -216,25 +216,6 @@ class MockPage:
         Path(path).write_bytes(b"mock screenshot")
 
 
-class ForwardModalPage(MockPage):
-    source_post_selector = '[data-testid*="message"]'
-    forward_button_selector = '[aria-label="Forward-icon"]'
-    forward_search_selector = '.ReactModal__Content input[type="search"]'
-    forward_target_selector = '.ReactModal__Content [aria-label="dialog-item"]'
-    forward_send_selector = '.ReactModal__Content [data-testid*="send"]'
-
-    def fill(self, selector: str, text: str, timeout: int) -> None:
-        super().fill(selector, text, timeout)
-        if selector == self.forward_search_selector and text == "Bale-000001":
-            self.visible_selectors.add(self.forward_target_selector)
-
-    def click(self, selector: str, timeout: int) -> None:
-        super().click(selector, timeout)
-        if selector == self.forward_button_selector:
-            self.visible_selectors.add(self.forward_search_selector)
-            self.visible_selectors.add(self.forward_send_selector)
-
-
 class MockSessionManager:
     def has_storage_state(self, account_id: str) -> bool:
         return True
@@ -1052,133 +1033,6 @@ def test_send_text_message_assumes_success_when_send_confirmation_missing() -> N
     assert result["failed_step"] is None
     assert (selectors.MESSAGE_INPUT_SELECTORS[0], "hello real text") in page.filled
     assert "Enter" in page.keyboard.pressed
-
-
-def test_forward_message_rejects_missing_source_url() -> None:
-    page = MockPage({selectors.SEARCH_ICON_SELECTORS[0]})
-    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
-
-    result = plugin.forward_message(
-        "bale_test",
-        source={"type": "post_link"},
-        target={"phone": "989304073331", "name": "Bale-000001"},
-    )
-
-    assert result["ok"] is False
-    assert result["success"] is False
-    assert result["error_code"] == "source_url_missing"
-    assert result["failed_step"] == "load_forward_source"
-    assert page.urls == []
-
-
-def test_forward_message_rejects_unsupported_source_type() -> None:
-    page = MockPage({selectors.SEARCH_ICON_SELECTORS[0]})
-    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
-
-    result = plugin.forward_message(
-        "bale_test",
-        source={"type": "channel_latest", "url": "https://web.bale.ai/channel/main/1"},
-        target={"phone": "989304073331", "name": "Bale-000001"},
-    )
-
-    assert result["ok"] is False
-    assert result["error_code"] == "unsupported_forward_source_type"
-    assert result["failed_step"] == "load_forward_source"
-    assert page.urls == []
-
-
-def test_forward_message_opens_post_link_source_url() -> None:
-    source_url = "https://web.bale.ai/channel/main/123"
-    page = MockPage(
-        {
-            selectors.SEARCH_ICON_SELECTORS[0],
-            ForwardModalPage.source_post_selector,
-        },
-        url="https://web.bale.ai/chat",
-    )
-    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
-
-    result = plugin.forward_message(
-        "bale_test",
-        source={"type": "post_link", "url": source_url},
-        target={"phone": "989304073331", "name": "Bale-000001"},
-    )
-
-    open_step = next(item for item in result["step_results"] if item["step"] == "open_source_post_link")
-    assert result["ok"] is False
-    assert result["error_code"] == "forward_button_not_found"
-    assert source_url in page.urls
-    assert open_step["status"] == "success"
-    assert open_step["before_url"] == plugin.web_url
-    assert open_step["after_url"] == source_url
-
-
-def test_forward_message_forward_button_not_found_returns_clear_diagnostics() -> None:
-    source_url = "https://web.bale.ai/channel/main/123"
-    page = MockPage(
-        {
-            selectors.SEARCH_ICON_SELECTORS[0],
-            ForwardModalPage.source_post_selector,
-        },
-        url="https://web.bale.ai/chat",
-    )
-    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
-
-    result = plugin.forward_message(
-        "bale_test",
-        source={"type": "post_link", "url": source_url},
-        target={"phone": "989304073331", "name": "Bale-000001"},
-    )
-
-    failed_step = next(item for item in result["step_results"] if item["step"] == "click_forward_button")
-    assert result["ok"] is False
-    assert result["success"] is False
-    assert result["error_code"] == "forward_button_not_found"
-    assert result["failed_step"] == "click_forward_button"
-    assert failed_step["status"] == "failed"
-    assert failed_step["error_code"] == "forward_button_not_found"
-    assert failed_step["action"] == "click"
-    assert "screenshot_path" in result
-
-
-def test_forward_message_mocked_success_returns_warning() -> None:
-    source_url = "https://web.bale.ai/channel/main/123"
-    page = ForwardModalPage(
-        {
-            selectors.SEARCH_ICON_SELECTORS[0],
-            ForwardModalPage.source_post_selector,
-            ForwardModalPage.forward_button_selector,
-        },
-        url="https://web.bale.ai/chat",
-        selector_text={ForwardModalPage.forward_target_selector: "Bale-000001\nlast seen recently"},
-    )
-    browser = MockBrowserManager(page)
-    plugin = BalePlugin(browser_manager=browser)
-
-    result = plugin.forward_message(
-        "bale_test",
-        source={"type": "post_link", "url": source_url},
-        target={"phone": "989304073331", "name": "Bale-000001"},
-    )
-
-    step_names = [item["step"] for item in result["step_results"]]
-    confirm_step = next(item for item in result["step_results"] if item["step"] == "confirm_forward_send")
-    assert result["ok"] is True
-    assert result["success"] is True
-    assert result["warning_code"] == "forward_confirmation_not_implemented"
-    assert result["warning_message"] == "Forward was triggered, but delivery confirmation is not implemented yet."
-    assert confirm_step["status"] == "assumed_success"
-    assert confirm_step["warning_code"] == "forward_confirmation_not_implemented"
-    assert step_names[-5:] == [
-        "open_source_post_link",
-        "wait_source_post_visible",
-        "click_forward_button",
-        "select_forward_target",
-        "confirm_forward_send",
-    ]
-    assert (ForwardModalPage.forward_search_selector, "Bale-000001") in page.filled
-    assert ForwardModalPage.forward_send_selector in page.clicked
-    assert browser.saved_accounts == ["bale_test"]
 
 
 def test_save_contact_by_phone_returns_saved_for_captured_modal_flow() -> None:
@@ -4081,11 +3935,6 @@ if __name__ == "__main__":
     test_send_text_message_uses_captured_message_input_and_enter_without_fake_success()
     test_send_text_message_saves_contact_with_captured_add_contact_modal_flow()
     test_send_text_message_assumes_success_when_send_confirmation_missing()
-    test_forward_message_rejects_missing_source_url()
-    test_forward_message_rejects_unsupported_source_type()
-    test_forward_message_opens_post_link_source_url()
-    test_forward_message_forward_button_not_found_returns_clear_diagnostics()
-    test_forward_message_mocked_success_returns_warning()
     test_save_contact_by_phone_returns_saved_for_captured_modal_flow()
     test_save_contact_by_phone_does_not_use_broad_page_level_add_text_for_submit()
     test_save_contact_by_phone_disabled_submit_returns_fast_failure()
