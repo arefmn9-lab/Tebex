@@ -459,6 +459,143 @@ class BalePlugin:
             self._add_step(step_results, "unexpected_error", "failed", error_code=error_code, error=str(exc))
             return finish(False, error_code, str(exc), "unexpected_error", diagnostics)
 
+    def forward_message(
+        self,
+        account_id: str,
+        source: dict[str, Any] | None = None,
+        target: dict[str, Any] | None = None,
+        normalized_phone: str = "",
+        contact_naming_value: str = "",
+        provider_mode: str | None = None,
+        message_source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_monotonic = time.perf_counter()
+        effective_provider = str(provider_mode or "native_chrome")
+        step_results: list[dict[str, Any]] = []
+        browser_meta: dict[str, Any] = self._browser_failure_meta(account_id, effective_provider)
+        current_url_value = ""
+        source_data = self._resolve_forward_source(source, message_source)
+        target_data = target or {}
+        target_phone = str(normalized_phone or target_data.get("phone") or "").strip()
+        target_name = str(contact_naming_value or target_data.get("name") or "").strip()
+
+        def finish(
+            ok: bool,
+            error_code: str | None = None,
+            user_message: str = "",
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            finished_at = datetime.now(timezone.utc).isoformat()
+            result = {
+                "ok": ok,
+                "success": ok,
+                "logged_in": error_code not in {"not_logged_in", "bale_install_prompt"},
+                "platform": self.platform_id,
+                "account_id": account_id,
+                "action": "forward_message",
+                "source": source_data,
+                "target": target_data,
+                "normalized_phone": target_phone,
+                "contact_naming_value": target_name,
+                "current_url": (extra or {}).get("current_url") or current_url_value,
+                "message": user_message or ("Bale message forward triggered" if ok else "Bale message forward failed"),
+                "user_message": user_message,
+                "error_code": error_code,
+                "failed_step": failed_step,
+                "last_successful_step": _last_successful_step(step_results) if not ok else None,
+                "step_results": step_results,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_ms": int((time.perf_counter() - started_monotonic) * 1000),
+                **browser_meta,
+                **(extra or {}),
+            }
+            return result
+
+        source_type = str(source_data.get("type") or "").strip()
+        source_url = str(source_data.get("url") or "").strip()
+        if not source_data or not source_url:
+            return finish(False, "source_url_missing", "Forward source URL is required", "load_forward_source")
+        if source_type != "post_link":
+            return finish(False, "unsupported_forward_source_type", "Only post_link forward sources are supported", "load_forward_source")
+
+        try:
+            with self._page_session(account_id, provider_mode) as (page, session_meta):
+                browser_meta = {**browser_meta, **session_meta}
+                self._add_step(step_results, "open_bale_web", "started", action="navigate", current_url=_safe_page_url(page))
+                page.goto(self.web_url, wait_until="load")
+                current_url_value = _safe_page_url(page)
+                self._add_step(step_results, "open_bale_web", "success", action="navigate", page_url=current_url_value, current_url=current_url_value)
+
+                self._add_step(step_results, "verify_login", "started", action="detect_login", current_url=current_url_value)
+                login_check = self._detect_login_state(page, timeout_ms=3000)
+                if login_check["install_prompt_detected"]:
+                    diagnostics = {"login_check": login_check, **self._page_debug_info(page, account_id)}
+                    self._add_step(step_results, "verify_login", "failed", action="detect_login", error_code="bale_install_prompt", **diagnostics)
+                    return finish(False, "bale_install_prompt", "Bale install/help prompt is visible.", "verify_login", diagnostics)
+                if not login_check["logged_in"]:
+                    diagnostics = {"login_check": login_check, **self._page_debug_info(page, account_id)}
+                    error_code = str(login_check.get("error_code") or "not_logged_in")
+                    self._add_step(step_results, "verify_login", "failed", action="detect_login", error_code=error_code, **diagnostics)
+                    return finish(False, error_code, "Manual Bale login is required before forwarding a message", "verify_login", diagnostics)
+                self._add_step(step_results, "verify_login", "success", action="detect_login", login_check=login_check, current_url=_safe_page_url(page))
+
+                open_result = self._open_source_post_link(page, source_url)
+                step_results.append(open_result)
+                current_url_value = str(open_result.get("current_url") or _safe_page_url(page))
+                if open_result["status"] != "success":
+                    diagnostics = {**open_result, **self._page_debug_info(page, account_id)}
+                    if diagnostics.get("screenshot_path"):
+                        open_result["screenshot_path"] = diagnostics["screenshot_path"]
+                    return finish(False, str(open_result.get("error_code") or "source_post_not_found"), "Bale source post link could not be opened", "open_source_post_link", diagnostics)
+
+                visible_result = self._wait_source_post_visible(page)
+                step_results.append(visible_result)
+                if visible_result["status"] != "success":
+                    diagnostics = {**visible_result, **self._page_debug_info(page, account_id)}
+                    if diagnostics.get("screenshot_path"):
+                        visible_result["screenshot_path"] = diagnostics["screenshot_path"]
+                    return finish(False, "source_post_not_found", "Bale source post was not found", "wait_source_post_visible", diagnostics)
+
+                forward_result = self._click_forward_button(page)
+                step_results.append(forward_result)
+                if forward_result["status"] != "success":
+                    diagnostics = {**forward_result, **self._page_debug_info(page, account_id)}
+                    if diagnostics.get("screenshot_path"):
+                        forward_result["screenshot_path"] = diagnostics["screenshot_path"]
+                    return finish(False, "forward_button_not_found", "Bale forward button was not found", "click_forward_button", diagnostics)
+
+                target_result = self._select_forward_target(page, target_name, target_phone)
+                step_results.append(target_result)
+                if target_result["status"] != "success":
+                    diagnostics = {**target_result, **self._page_debug_info(page, account_id)}
+                    if diagnostics.get("screenshot_path"):
+                        target_result["screenshot_path"] = diagnostics["screenshot_path"]
+                    return finish(False, "forward_target_not_found", "Bale forward target was not found", "select_forward_target", diagnostics)
+
+                confirm_result = self._confirm_forward_send(page)
+                step_results.append(confirm_result)
+                if confirm_result["status"] == "failed":
+                    diagnostics = {**confirm_result, **self._page_debug_info(page, account_id)}
+                    if diagnostics.get("screenshot_path"):
+                        confirm_result["screenshot_path"] = diagnostics["screenshot_path"]
+                    return finish(False, "forward_send_button_not_found", "Bale forward send button was not found", "confirm_forward_send", diagnostics)
+
+                self.browser_manager.save_session(account_id)
+                warning = {
+                    "warning_code": "forward_confirmation_not_implemented",
+                    "warning_message": "Forward was triggered, but delivery confirmation is not implemented yet.",
+                    "current_url": _safe_page_url(page),
+                }
+                return finish(True, None, "Bale message forward triggered", None, warning)
+        except Exception as exc:
+            error_code = _browser_error_code(exc)
+            diagnostics = getattr(exc, "diagnostics", {}) or {}
+            self._add_step(step_results, "unexpected_error", "failed", error_code=error_code, error=str(exc))
+            return finish(False, error_code, str(exc), "unexpected_error", diagnostics)
+
     def save_contact_by_phone(
         self,
         page: Any,
@@ -893,6 +1030,270 @@ class BalePlugin:
         if screenshot_path:
             info["screenshot_path"] = screenshot_path
         return info
+
+    def _resolve_forward_source(
+        self,
+        source: dict[str, Any] | None,
+        message_source: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if isinstance(source, dict):
+            return dict(source)
+        if not isinstance(message_source, dict):
+            return {}
+        nested_source = message_source.get("source")
+        if isinstance(nested_source, dict):
+            return dict(nested_source)
+        source_type = str(message_source.get("source_type") or message_source.get("type") or "").strip()
+        source_url = str(
+            message_source.get("url")
+            or message_source.get("source_url")
+            or message_source.get("source_ref")
+            or message_source.get("message_ref_value")
+            or ""
+        ).strip()
+        if source_type == "post_link" or source_url.startswith(("http://", "https://")):
+            return {"type": source_type or "post_link", "url": source_url}
+        return {"type": source_type, "url": source_url}
+
+    def _forward_step(self, page: Any, step: str, status: str, started: float, **details: Any) -> dict[str, Any]:
+        current_url = _safe_page_url(page)
+        return {
+            "step": step,
+            "status": status,
+            "selector": details.pop("selector", ""),
+            "action": details.pop("action", ""),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "page_url": details.pop("page_url", current_url),
+            "current_url": details.pop("current_url", current_url),
+            "error_code": details.pop("error_code", None),
+            "error_message": details.pop("error_message", ""),
+            "screenshot_path": details.pop("screenshot_path", ""),
+            "warning_code": details.pop("warning_code", None),
+            **details,
+        }
+
+    def _open_source_post_link(self, page: Any, source_url: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        before_url = _safe_page_url(page)
+        try:
+            self._goto_with_timeout(page, source_url, timeout_ms=5000, wait_until="domcontentloaded")
+            after_url = _safe_page_url(page)
+            return self._forward_step(
+                page,
+                "open_source_post_link",
+                "success",
+                started,
+                action="navigate",
+                page_url=after_url,
+                current_url=after_url,
+                before_url=before_url,
+                after_url=after_url,
+                source_url=source_url,
+            )
+        except Exception as exc:
+            current_url = _safe_page_url(page)
+            return self._forward_step(
+                page,
+                "open_source_post_link",
+                "failed",
+                started,
+                action="navigate",
+                page_url=current_url,
+                current_url=current_url,
+                before_url=before_url,
+                after_url=current_url,
+                source_url=source_url,
+                error_code="source_post_not_found",
+                error_message=str(exc),
+            )
+
+    def _wait_source_post_visible(self, page: Any) -> dict[str, Any]:
+        started = time.perf_counter()
+        selector = self._first_visible_selector(page, _BALE_SOURCE_POST_SELECTORS, timeout_ms=2500)
+        if not selector:
+            return self._forward_step(
+                page,
+                "wait_source_post_visible",
+                "failed",
+                started,
+                action="wait_visible",
+                error_code="source_post_not_found",
+                error_message="Bale post/message content was not visible",
+                visible_text_sample=_visible_text_sample(page),
+            )
+        return self._forward_step(
+            page,
+            "wait_source_post_visible",
+            "success",
+            started,
+            selector=selector,
+            action="wait_visible",
+        )
+
+    def _click_forward_button(self, page: Any) -> dict[str, Any]:
+        started = time.perf_counter()
+        selector = self._first_visible_selector(page, _BALE_FORWARD_BUTTON_SELECTORS, timeout_ms=2500)
+        if not selector:
+            return self._forward_step(
+                page,
+                "click_forward_button",
+                "failed",
+                started,
+                action="click",
+                error_code="forward_button_not_found",
+                error_message="Bale forward/share button was not visible",
+                visible_text_sample=_visible_text_sample(page),
+            )
+        box = self._selector_box(page, selector)
+        click_result = self._click_selector_short(page, selector, timeout_ms=800)
+        if click_result["status"] != "success":
+            return self._forward_step(
+                page,
+                "click_forward_button",
+                "failed",
+                started,
+                selector=selector,
+                action="click",
+                box=box,
+                error_code="forward_button_not_found",
+                error_message=str(click_result.get("click_error") or click_result.get("dom_click_error") or ""),
+                click_method=click_result.get("click_method", ""),
+            )
+        return self._forward_step(
+            page,
+            "click_forward_button",
+            "success",
+            started,
+            selector=selector,
+            action="click",
+            box=box,
+            click_method=click_result.get("click_method", ""),
+        )
+
+    def _select_forward_target(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
+        started = time.perf_counter()
+        search_input = self._first_visible_selector(page, _BALE_FORWARD_TARGET_SEARCH_SELECTORS, timeout_ms=2000)
+        if not search_input:
+            return self._forward_step(
+                page,
+                "select_forward_target",
+                "failed",
+                started,
+                action="search_select",
+                error_code="forward_target_not_found",
+                error_message="Bale forward target search input was not visible",
+            )
+
+        attempts: list[dict[str, Any]] = []
+        for query in [contact_naming_value, normalized_phone]:
+            query = str(query or "").strip()
+            if not query or any(attempt["query"] == query for attempt in attempts):
+                continue
+            try:
+                self._fill_or_type(page, search_input, query)
+            except Exception as exc:
+                attempts.append({"query": query, "status": "fill_failed", "error": str(exc)})
+                continue
+            candidate = self._find_forward_target_candidate(page, query)
+            if not candidate:
+                attempts.append({"query": query, "status": "not_found"})
+                continue
+            selector = str(candidate.get("selector") or "")
+            box = self._selector_box(page, selector)
+            click_result = self._click_selector_short(page, selector, timeout_ms=800)
+            attempts.append({"query": query, "status": click_result["status"], "selector": selector})
+            if click_result["status"] == "success":
+                return self._forward_step(
+                    page,
+                    "select_forward_target",
+                    "success",
+                    started,
+                    selector=selector,
+                    action="search_select",
+                    query=query,
+                    box=box,
+                    click_method=click_result.get("click_method", ""),
+                    target_search_input_selector=search_input,
+                    target_selection_attempts=attempts,
+                )
+
+        return self._forward_step(
+            page,
+            "select_forward_target",
+            "failed",
+            started,
+            selector=search_input,
+            action="search_select",
+            error_code="forward_target_not_found",
+            error_message="Bale forward target was not found in the forward picker",
+            target_selection_attempts=attempts,
+            visible_text_sample=_visible_text_sample(page),
+        )
+
+    def _confirm_forward_send(self, page: Any) -> dict[str, Any]:
+        started = time.perf_counter()
+        selector = self._first_visible_selector(page, _BALE_FORWARD_SEND_BUTTON_SELECTORS, timeout_ms=2000)
+        if not selector:
+            return self._forward_step(
+                page,
+                "confirm_forward_send",
+                "failed",
+                started,
+                action="click",
+                error_code="forward_send_button_not_found",
+                error_message="Bale forward send/confirm button was not visible",
+            )
+        box = self._selector_box(page, selector)
+        click_result = self._click_selector_short(page, selector, timeout_ms=800)
+        if click_result["status"] != "success":
+            return self._forward_step(
+                page,
+                "confirm_forward_send",
+                "failed",
+                started,
+                selector=selector,
+                action="click",
+                box=box,
+                error_code="forward_send_button_not_found",
+                error_message=str(click_result.get("click_error") or click_result.get("dom_click_error") or ""),
+                click_method=click_result.get("click_method", ""),
+            )
+        return self._forward_step(
+            page,
+            "confirm_forward_send",
+            "assumed_success",
+            started,
+            selector=selector,
+            action="click",
+            box=box,
+            click_method=click_result.get("click_method", ""),
+            warning_code="forward_confirmation_not_implemented",
+            warning_message="Forward was triggered, but delivery confirmation is not implemented yet.",
+        )
+
+    def _find_forward_target_candidate(self, page: Any, query: str) -> dict[str, Any] | None:
+        normalized_query = _normalize_bale_match_text(query)
+        phone_values = _bale_phone_match_values(query)
+        for selector in _BALE_FORWARD_TARGET_RESULT_SELECTORS:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=250)
+                text = str(locator.inner_text(timeout=300) or "")
+            except Exception:
+                continue
+            normalized_text = _normalize_bale_match_text(text)
+            normalized_phone_text = _normalize_bale_phone_text(text)
+            if normalized_query and normalized_query in normalized_text:
+                return {"selector": selector, "text": text, "match_mode": "name"}
+            if any(phone_value and phone_value in normalized_phone_text for phone_value in phone_values):
+                return {"selector": selector, "text": text, "match_mode": "phone"}
+        return None
+
+    def _selector_box(self, page: Any, selector: str) -> dict[str, float] | None:
+        try:
+            return page.locator(selector).first.bounding_box(timeout=200)
+        except Exception:
+            return None
 
     def _return_to_chat_after_contact_save(self, page: Any, contact_naming_value: str, normalized_phone: str) -> dict[str, Any]:
         started = time.perf_counter()
@@ -4416,6 +4817,75 @@ class BalePluginError(RuntimeError):
 def _native_profile_dir(account_id: str) -> Path:
     backend_dir = Path(__file__).resolve().parents[4]
     return backend_dir / "runtime" / "browser_profiles" / account_id
+
+
+_BALE_SOURCE_POST_SELECTORS = [
+    '[data-testid*="message"]',
+    '[data-testid*="post"]',
+    '[aria-label*="message"]',
+    '[aria-label*="Message"]',
+    '[class*="Message"]',
+    '[class*="message"]',
+    '[class*="Post"]',
+    '[class*="post"]',
+    "article",
+]
+
+_BALE_FORWARD_BUTTON_SELECTORS = [
+    '[aria-label="Forward-icon"]',
+    'svg[aria-label="Forward-icon"]',
+    'button:has([aria-label="Forward-icon"])',
+    '[role="button"]:has([aria-label="Forward-icon"])',
+    '[aria-label*="Forward"]',
+    '[title*="Forward"]',
+    '[aria-label*="Share"]',
+    '[title*="Share"]',
+    'button:has-text("Forward")',
+    '[role="button"]:has-text("Forward")',
+    'button:has-text("ÙØ±ÙˆØ§Ø±Ø¯")',
+    '[role="button"]:has-text("ÙØ±ÙˆØ§Ø±Ø¯")',
+]
+
+_BALE_FORWARD_TARGET_SEARCH_SELECTORS = [
+    '.ReactModal__Content input[type="search"]',
+    '.ReactModal__Content input[placeholder*="Search"]',
+    '.ReactModal__Content input[placeholder*="Ø¬Ø³ØªØ¬Ùˆ"]',
+    '.ReactModal__Content [role="searchbox"]',
+    '.ReactModal__Content [role="textbox"]',
+    '[role="dialog"] input[type="search"]',
+    '[role="dialog"] input[placeholder*="Search"]',
+    '[role="dialog"] input[placeholder*="Ø¬Ø³ØªØ¬Ùˆ"]',
+    '[role="dialog"] [role="searchbox"]',
+    '[role="dialog"] [role="textbox"]',
+]
+
+_BALE_FORWARD_TARGET_RESULT_SELECTORS = [
+    '.ReactModal__Content [aria-label="dialog-item"]',
+    '.ReactModal__Content [role="listitem"]',
+    '.ReactModal__Content [role="button"]',
+    '.ReactModal__Content [data-testid*="chat"]',
+    '[role="dialog"] [aria-label="dialog-item"]',
+    '[role="dialog"] [role="listitem"]',
+    '[role="dialog"] [role="button"]',
+    '[role="dialog"] [data-testid*="chat"]',
+]
+
+_BALE_FORWARD_SEND_BUTTON_SELECTORS = [
+    '.ReactModal__Content [data-testid*="send"]',
+    '.ReactModal__Content [aria-label*="Send"]',
+    '.ReactModal__Content [aria-label*="Forward"]',
+    '.ReactModal__Content button:has-text("Send")',
+    '.ReactModal__Content button:has-text("Forward")',
+    '.ReactModal__Content [role="button"]:has-text("Send")',
+    '.ReactModal__Content [role="button"]:has-text("Forward")',
+    '[role="dialog"] [data-testid*="send"]',
+    '[role="dialog"] [aria-label*="Send"]',
+    '[role="dialog"] [aria-label*="Forward"]',
+    '[role="dialog"] button:has-text("Send")',
+    '[role="dialog"] button:has-text("Forward")',
+    '[role="dialog"] [role="button"]:has-text("Send")',
+    '[role="dialog"] [role="button"]:has-text("Forward")',
+]
 
 
 _CHAT_UI_SELECTORS = [
