@@ -17,6 +17,7 @@ import {
   dryRunBulkExecutionQueue,
   dryRunBalePreparation,
   dryRunBaleSchedule,
+  forwardLatestBaleChannelMessage,
   getBaleJobs,
   getBaleMessageConfig,
   getBalePreparation,
@@ -339,6 +340,12 @@ export default function PlatformWorkspace({ platformId }) {
   const [simpleSendResult, setSimpleSendResult] = useState(null);
   const [simpleSendContactResult, setSimpleSendContactResult] = useState(null);
   const [simpleBaleLoginStatus, setSimpleBaleLoginStatus] = useState(null);
+  const [forwardSourceChannelUrl, setForwardSourceChannelUrl] = useState("");
+  const [forwardTargetPhone, setForwardTargetPhone] = useState("989304073331");
+  const [forwardTargetName, setForwardTargetName] = useState("Bale-000001");
+  const [forwardSubmitting, setForwardSubmitting] = useState(false);
+  const [forwardResult, setForwardResult] = useState(null);
+  const [forwardError, setForwardError] = useState("");
   const [baleLatestJob, setBaleLatestJob] = useState(null);
   const [baleJobs, setBaleJobs] = useState([]);
   const [selectedBaleJobId, setSelectedBaleJobId] = useState("");
@@ -953,6 +960,49 @@ export default function PlatformWorkspace({ platformId }) {
     }
   }
 
+  async function forwardLatestChannelMessage() {
+    if (!forwardSourceChannelUrl.trim()) {
+      setForwardError("Source channel URL is required");
+      return;
+    }
+    if (!forwardTargetPhone.trim()) {
+      setForwardError("Target phone is required");
+      return;
+    }
+    const accountId = simpleBaleAccountId() || "bale_09211690533";
+    const payload = {
+      platform: "bale",
+      action: "forward_latest_channel_message",
+      account_id: accountId,
+      source: {
+        type: "channel",
+        channel_url: forwardSourceChannelUrl.trim(),
+        message_selector: {
+          strategy: "latest_visible",
+        },
+      },
+      target: {
+        phone: forwardTargetPhone.trim(),
+        name: forwardTargetName.trim(),
+      },
+      normalized_phone: forwardTargetPhone.trim(),
+      contact_naming_value: forwardTargetName.trim(),
+    };
+    try {
+      setForwardSubmitting(true);
+      setForwardError("");
+      setActionError("");
+      const result = await forwardLatestBaleChannelMessage(payload);
+      setForwardResult(result);
+      setToast(result?.success || result?.ok ? "Forward latest channel message request submitted." : result?.error_message || result?.message || "Forward request completed with errors.");
+      await loadBaleDiagnostics(false);
+    } catch (error) {
+      setForwardError(error.message || "Forward request failed");
+    } finally {
+      setForwardSubmitting(false);
+    }
+  }
+
   async function saveBulkRoute() {
     try {
       await createBulkCampaignRoute(routeCampaignId, bulkRouteForm);
@@ -1248,6 +1298,16 @@ export default function PlatformWorkspace({ platformId }) {
           onCheckSimpleBaleLogin={checkSimpleBaleLogin}
           onRunSimpleTest={() => runSimpleBaleReal(1)}
           onRunSimpleLimited={() => runSimpleBaleReal(Math.min(3, Math.max(1, Number(simpleSendForm.real_limit) || 1)))}
+          forwardSourceChannelUrl={forwardSourceChannelUrl}
+          setForwardSourceChannelUrl={setForwardSourceChannelUrl}
+          forwardTargetPhone={forwardTargetPhone}
+          setForwardTargetPhone={setForwardTargetPhone}
+          forwardTargetName={forwardTargetName}
+          setForwardTargetName={setForwardTargetName}
+          forwardSubmitting={forwardSubmitting}
+          forwardResult={forwardResult}
+          forwardError={forwardError}
+          onForwardLatestChannelMessage={forwardLatestChannelMessage}
         />
       ) : null}
       {activeTab === "schedule" ? (
@@ -1578,6 +1638,16 @@ function CampaignsSection({
   onCheckSimpleBaleLogin,
   onRunSimpleTest,
   onRunSimpleLimited,
+  forwardSourceChannelUrl,
+  setForwardSourceChannelUrl,
+  forwardTargetPhone,
+  setForwardTargetPhone,
+  forwardTargetName,
+  setForwardTargetName,
+  forwardSubmitting,
+  forwardResult,
+  forwardError,
+  onForwardLatestChannelMessage,
 }) {
   return (
     <div>
@@ -1626,6 +1696,18 @@ function CampaignsSection({
         onRunSimpleTest={onRunSimpleTest}
         onRunSimpleLimited={onRunSimpleLimited}
       />
+      <ForwardLatestChannelMessageSection
+        sourceChannelUrl={forwardSourceChannelUrl}
+        setSourceChannelUrl={setForwardSourceChannelUrl}
+        targetPhone={forwardTargetPhone}
+        setTargetPhone={setForwardTargetPhone}
+        targetName={forwardTargetName}
+        setTargetName={setForwardTargetName}
+        submitting={forwardSubmitting}
+        result={forwardResult}
+        error={forwardError}
+        onSubmit={onForwardLatestChannelMessage}
+      />
       <details className="safe-policy-section" style={{ marginTop: 16 }}>
         <summary className="panel-title">جزئیات فنی و تست ارسال از پیام آماده</summary>
         <BaleSendSection
@@ -1639,6 +1721,60 @@ function CampaignsSection({
         />
       </details>
     </div>
+  );
+}
+
+function ForwardLatestChannelMessageSection({
+  sourceChannelUrl,
+  setSourceChannelUrl,
+  targetPhone,
+  setTargetPhone,
+  targetName,
+  setTargetName,
+  submitting,
+  result,
+  error,
+  onSubmit,
+}) {
+  return (
+    <section className="panel" style={{ marginTop: 16 }}>
+      <div className="panel-header">
+        <div>
+          <h3 className="panel-title">Forward Latest Channel Message</h3>
+          <p className="page-copy">Forwards the latest visible message from one Bale source channel to one target contact.</p>
+        </div>
+        <span className="pill">latest_visible</span>
+      </div>
+      <div className="settings-grid" style={{ marginTop: 14 }}>
+        <Field label="Source channel URL">
+          <input
+            value={sourceChannelUrl}
+            placeholder="https://web.bale.ai/..."
+            onChange={(event) => setSourceChannelUrl(event.target.value)}
+          />
+        </Field>
+        <Field label="Target phone">
+          <input value={targetPhone} onChange={(event) => setTargetPhone(event.target.value)} />
+        </Field>
+        <Field label="Target name">
+          <input value={targetName} onChange={(event) => setTargetName(event.target.value)} />
+        </Field>
+        <Field label="Message selector">
+          <input value="latest_visible" readOnly />
+        </Field>
+      </div>
+      {error ? <div className="error-state" style={{ marginTop: 12 }}>{error}</div> : null}
+      {result ? (
+        <div className={result.success || result.ok ? "toast" : "error-state"} style={{ marginTop: 12 }}>
+          {result.success || result.ok ? "Forward latest channel message request submitted." : result.error_message || result.message || "Forward request completed with errors."}
+        </div>
+      ) : null}
+      <div className="modal-actions">
+        <button className="primary-button" onClick={onSubmit} disabled={submitting} type="button">
+          {submitting ? "Forwarding..." : "Forward latest channel message"}
+        </button>
+      </div>
+    </section>
   );
 }
 

@@ -287,6 +287,13 @@ export function sendBaleTestMessage(payload) {
   });
 }
 
+export function forwardLatestBaleChannelMessage(payload) {
+  return request("/automation/platforms/bale/send-test", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function getBaleMessageConfig() {
   return request("/automation/platforms/bale/message-config");
 }
