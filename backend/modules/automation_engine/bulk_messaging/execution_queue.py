@@ -177,7 +177,8 @@ class BulkExecutionQueueStore:
             normalized_phone=str(payload.get("normalized_phone") or ""),
             contact_naming_value=str(payload.get("contact_naming_value") or ""),
             message_source_id=str(payload.get("message_source_id") or ""),
-            scenario_id=str(payload.get("scenario_id") or ""),
+            scenario_id=payload.get("scenario_id") if payload.get("scenario_id") is None else str(payload.get("scenario_id") or ""),
+            action=str(payload.get("action") or "") or None,
             status=status,
             dry_run=bool(payload.get("dry_run", True)),
             planned_for_date=str(payload.get("planned_for_date") or ""),
@@ -187,6 +188,7 @@ class BulkExecutionQueueStore:
             error_message=payload.get("error_message"),
             dry_run_result=payload.get("dry_run_result"),
             execution_result=payload.get("execution_result"),
+            plugin_result=payload.get("plugin_result"),
         )
 
     def _read_json(self, default: Any) -> Any:

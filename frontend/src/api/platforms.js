@@ -261,6 +261,37 @@ export function getBaleJobs(limit = 10) {
   return request(`/automation/platforms/bale/jobs?limit=${encodeURIComponent(limit)}`);
 }
 
+export function getBaleContacts(accountId, status = "") {
+  const params = new URLSearchParams({ account_id: accountId });
+  if (status) params.set("status", status);
+  return request(`/automation/platforms/bale/contacts?${params.toString()}`);
+}
+
+export function bulkAddBaleContacts(payload) {
+  return request("/automation/platforms/bale/contacts/bulk", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getBaleSourceChannel(accountId) {
+  return request(`/automation/platforms/bale/source-channel?account_id=${encodeURIComponent(accountId)}`);
+}
+
+export function saveBaleSourceChannel(payload) {
+  return request("/automation/platforms/bale/source-channel", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function previewLatestBaleChannelMessage(payload) {
+  return request("/automation/platforms/bale/forward-latest/preview", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function openBaleAccount(accountId) {
   return request("/automation/platforms/bale/open-account", {
     method: "POST",
@@ -281,13 +312,6 @@ export function checkBaleLogin(accountId) {
 }
 
 export function sendBaleTestMessage(payload) {
-  return request("/automation/platforms/bale/send-test", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export function forwardLatestBaleChannelMessage(payload) {
   return request("/automation/platforms/bale/send-test", {
     method: "POST",
     body: JSON.stringify(payload),

@@ -4,6 +4,7 @@ import { ApiError } from "../api/client";
 import {
   assignBaleProfileGroup,
   assignBulkCampaign,
+  bulkAddBaleContacts,
   checkAdsPowerHealth,
   checkBaleLogin,
   createAccountGroup,
@@ -17,10 +18,11 @@ import {
   dryRunBulkExecutionQueue,
   dryRunBalePreparation,
   dryRunBaleSchedule,
-  forwardLatestBaleChannelMessage,
+  getBaleContacts,
   getBaleJobs,
   getBaleMessageConfig,
   getBalePreparation,
+  getBaleSourceChannel,
   getLatestBaleJob,
   getAdsPowerConfig,
   getBulkExecutionQueueSummary,
@@ -41,7 +43,9 @@ import {
   openBaleAccount,
   openBaleLogin,
   planBulkCampaign,
+  previewLatestBaleChannelMessage,
   runBaleExecutionQueue,
+  saveBaleSourceChannel,
   saveBaleMessageConfig,
   saveBalePreparation,
   saveAdsPowerConfig,
@@ -59,6 +63,16 @@ import { useLogs } from "../hooks/useLogs";
 import { useTasks } from "../hooks/useTasks";
 
 const today = new Date().toISOString().slice(0, 10);
+
+function normalizeBaleSourceChannelUid(value) {
+  const raw = String(value || "").trim();
+  try {
+    const parsed = new URL(raw);
+    return parsed.searchParams.get("uid") || parsed.pathname.split("/").filter(Boolean).pop() || "";
+  } catch {
+    return raw;
+  }
+}
 
 const defaultSimpleSendForm = {
   platform_id: "bale",
@@ -340,16 +354,18 @@ export default function PlatformWorkspace({ platformId }) {
   const [simpleSendResult, setSimpleSendResult] = useState(null);
   const [simpleSendContactResult, setSimpleSendContactResult] = useState(null);
   const [simpleBaleLoginStatus, setSimpleBaleLoginStatus] = useState(null);
-  const [forwardSourceChannelUrl, setForwardSourceChannelUrl] = useState("");
-  const [forwardTargetPhone, setForwardTargetPhone] = useState("989304073331");
-  const [forwardTargetName, setForwardTargetName] = useState("Bale-000001");
-  const [forwardSubmitting, setForwardSubmitting] = useState(false);
-  const [forwardResult, setForwardResult] = useState(null);
-  const [forwardError, setForwardError] = useState("");
   const [baleLatestJob, setBaleLatestJob] = useState(null);
   const [baleJobs, setBaleJobs] = useState([]);
   const [selectedBaleJobId, setSelectedBaleJobId] = useState("");
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const [baleSourceChannelUrl, setBaleSourceChannelUrl] = useState("");
+  const [savedBaleSourceChannel, setSavedBaleSourceChannel] = useState(null);
+  const [baleContactsInput, setBaleContactsInput] = useState("");
+  const [baleContacts, setBaleContacts] = useState([]);
+  const [baleContactsResult, setBaleContactsResult] = useState(null);
+  const [baleForwardPreviewResult, setBaleForwardPreviewResult] = useState(null);
+  const [baleForwardPanelLoading, setBaleForwardPanelLoading] = useState("");
+  const [baleForwardPanelError, setBaleForwardPanelError] = useState("");
   const [assignmentForm, setAssignmentForm] = useState({
     planned_for_date: today,
     max_contacts_per_account: "",
@@ -391,6 +407,15 @@ export default function PlatformWorkspace({ platformId }) {
     }
   }
 
+  const platformAccounts = useMemo(
+    () => platformData?.accounts ?? accounts.filter((account) => samePlatform(account, platform.id)),
+    [accounts, platform.id, platformData]
+  );
+  const balePhaseOneAccountId = useMemo(() => {
+    const baleAccounts = platformAccounts.filter((account) => !account.platform_id || account.platform_id === "bale" || account.platform === "bale");
+    return simpleSendForm.account_id || baleAccounts[0]?.account_id || "bale_09211690533";
+  }, [platformAccounts, simpleSendForm.account_id]);
+
   useEffect(() => {
     let ignore = false;
     loadPlatformData(ignore);
@@ -409,6 +434,15 @@ export default function PlatformWorkspace({ platformId }) {
       ignore = true;
     };
   }, [platform.id]);
+
+  useEffect(() => {
+    if (platform.id !== "bale" || !balePhaseOneAccountId) return;
+    let ignore = false;
+    loadBaleForwardPhaseOne(ignore);
+    return () => {
+      ignore = true;
+    };
+  }, [platform.id, balePhaseOneAccountId]);
 
   useEffect(() => {
     if (platform.id !== "bale") return;
@@ -447,10 +481,6 @@ export default function PlatformWorkspace({ platformId }) {
     };
   }, [platform.id]);
 
-  const platformAccounts = useMemo(
-    () => platformData?.accounts ?? accounts.filter((account) => samePlatform(account, platform.id)),
-    [accounts, platform.id, platformData]
-  );
   const platformTasks = useMemo(
     () => platformData?.tasks ?? tasks.filter((task) => samePlatform(task, platform.id)),
     [tasks, platform.id, platformData]
@@ -459,7 +489,6 @@ export default function PlatformWorkspace({ platformId }) {
     () => platformData?.logs ?? logs.filter((log) => samePlatform(log, platform.id)),
     [logs, platform.id, platformData]
   );
-
   const totalSent = platformLogs.filter((log) => String(log.status || "").toLowerCase() === "sent").length;
   const sentToday = platformLogs.filter((log) => String(log.created_at || log.timestamp || "").startsWith(today)).length;
   const platformActiveAccounts = platformAccounts.filter((account) => account.status === "active" || account.active).length;
@@ -478,6 +507,80 @@ export default function PlatformWorkspace({ platformId }) {
       setSelectedBaleJobId((current) => current || latest?.job_id || recentJobs[0]?.job_id || "");
     } catch (error) {
       if (!ignore) setActionError(error.message);
+    }
+  }
+
+  async function loadBaleForwardPhaseOne(ignore = false) {
+    try {
+      setBaleForwardPanelError("");
+      const [sourceChannel, contacts] = await Promise.all([
+        getBaleSourceChannel(balePhaseOneAccountId),
+        getBaleContacts(balePhaseOneAccountId),
+      ]);
+      if (ignore) return;
+      setSavedBaleSourceChannel(sourceChannel || null);
+      setBaleSourceChannelUrl(sourceChannel?.source_channel_url || "");
+      setBaleContacts(Array.isArray(contacts) ? contacts : []);
+    } catch (error) {
+      if (!ignore) setBaleForwardPanelError(error.message);
+    }
+  }
+
+  async function saveBaleForwardSourceChannel() {
+    const sourceUrl = baleSourceChannelUrl.trim();
+    if (!sourceUrl) {
+      setBaleForwardPanelError("آدرس کانال منبع الزامی است");
+      return;
+    }
+    try {
+      setBaleForwardPanelLoading("source");
+      setBaleForwardPanelError("");
+      await saveBaleSourceChannel({ account_id: balePhaseOneAccountId, source_channel_url: sourceUrl });
+      const reloaded = await getBaleSourceChannel(balePhaseOneAccountId);
+      const submittedUid = normalizeBaleSourceChannelUid(sourceUrl);
+      if (!reloaded?.source_channel_uid || reloaded.source_channel_uid !== submittedUid) {
+        throw new Error("Saved source channel did not match the submitted value");
+      }
+      setSavedBaleSourceChannel(reloaded || null);
+      setBaleSourceChannelUrl(reloaded?.source_channel_url || sourceUrl);
+    } catch (error) {
+      setBaleForwardPanelError(error.message);
+    } finally {
+      setBaleForwardPanelLoading("");
+    }
+  }
+
+  async function addBaleForwardContacts() {
+    const phones = baleContactsInput.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    if (phones.length === 0) {
+      setBaleForwardPanelError("حداقل یک شماره وارد کنید");
+      return;
+    }
+    try {
+      setBaleForwardPanelLoading("contacts");
+      setBaleForwardPanelError("");
+      const result = await bulkAddBaleContacts({ account_id: balePhaseOneAccountId, phones });
+      setBaleContactsResult(result);
+      const contacts = await getBaleContacts(balePhaseOneAccountId);
+      setBaleContacts(Array.isArray(contacts) ? contacts : []);
+    } catch (error) {
+      setBaleForwardPanelError(error.message);
+    } finally {
+      setBaleForwardPanelLoading("");
+    }
+  }
+
+  async function previewBaleForwardLatestMessage() {
+    try {
+      setBaleForwardPanelLoading("preview");
+      setBaleForwardPanelError("");
+      const result = await previewLatestBaleChannelMessage({ account_id: balePhaseOneAccountId });
+      setBaleForwardPreviewResult(result);
+    } catch (error) {
+      setBaleForwardPanelError(error.message);
+    } finally {
+      await loadBaleDiagnostics(false);
+      setBaleForwardPanelLoading("");
     }
   }
 
@@ -960,49 +1063,6 @@ export default function PlatformWorkspace({ platformId }) {
     }
   }
 
-  async function forwardLatestChannelMessage() {
-    if (!forwardSourceChannelUrl.trim()) {
-      setForwardError("Source channel URL is required");
-      return;
-    }
-    if (!forwardTargetPhone.trim()) {
-      setForwardError("Target phone is required");
-      return;
-    }
-    const accountId = simpleBaleAccountId() || "bale_09211690533";
-    const payload = {
-      platform: "bale",
-      action: "forward_latest_channel_message",
-      account_id: accountId,
-      source: {
-        type: "channel",
-        channel_url: forwardSourceChannelUrl.trim(),
-        message_selector: {
-          strategy: "latest_visible",
-        },
-      },
-      target: {
-        phone: forwardTargetPhone.trim(),
-        name: forwardTargetName.trim(),
-      },
-      normalized_phone: forwardTargetPhone.trim(),
-      contact_naming_value: forwardTargetName.trim(),
-    };
-    try {
-      setForwardSubmitting(true);
-      setForwardError("");
-      setActionError("");
-      const result = await forwardLatestBaleChannelMessage(payload);
-      setForwardResult(result);
-      setToast(result?.success || result?.ok ? "Forward latest channel message request submitted." : result?.error_message || result?.message || "Forward request completed with errors.");
-      await loadBaleDiagnostics(false);
-    } catch (error) {
-      setForwardError(error.message || "Forward request failed");
-    } finally {
-      setForwardSubmitting(false);
-    }
-  }
-
   async function saveBulkRoute() {
     try {
       await createBulkCampaignRoute(routeCampaignId, bulkRouteForm);
@@ -1298,16 +1358,20 @@ export default function PlatformWorkspace({ platformId }) {
           onCheckSimpleBaleLogin={checkSimpleBaleLogin}
           onRunSimpleTest={() => runSimpleBaleReal(1)}
           onRunSimpleLimited={() => runSimpleBaleReal(Math.min(3, Math.max(1, Number(simpleSendForm.real_limit) || 1)))}
-          forwardSourceChannelUrl={forwardSourceChannelUrl}
-          setForwardSourceChannelUrl={setForwardSourceChannelUrl}
-          forwardTargetPhone={forwardTargetPhone}
-          setForwardTargetPhone={setForwardTargetPhone}
-          forwardTargetName={forwardTargetName}
-          setForwardTargetName={setForwardTargetName}
-          forwardSubmitting={forwardSubmitting}
-          forwardResult={forwardResult}
-          forwardError={forwardError}
-          onForwardLatestChannelMessage={forwardLatestChannelMessage}
+          baleForwardAccountId={balePhaseOneAccountId}
+          baleSourceChannelUrl={baleSourceChannelUrl}
+          setBaleSourceChannelUrl={setBaleSourceChannelUrl}
+          savedBaleSourceChannel={savedBaleSourceChannel}
+          onSaveBaleSourceChannel={saveBaleForwardSourceChannel}
+          baleContactsInput={baleContactsInput}
+          setBaleContactsInput={setBaleContactsInput}
+          baleContacts={baleContacts}
+          baleContactsResult={baleContactsResult}
+          onAddBaleContacts={addBaleForwardContacts}
+          baleForwardPreviewResult={baleForwardPreviewResult}
+          onPreviewBaleLatestMessage={previewBaleForwardLatestMessage}
+          baleForwardPanelLoading={baleForwardPanelLoading}
+          baleForwardPanelError={baleForwardPanelError}
         />
       ) : null}
       {activeTab === "schedule" ? (
@@ -1638,16 +1702,20 @@ function CampaignsSection({
   onCheckSimpleBaleLogin,
   onRunSimpleTest,
   onRunSimpleLimited,
-  forwardSourceChannelUrl,
-  setForwardSourceChannelUrl,
-  forwardTargetPhone,
-  setForwardTargetPhone,
-  forwardTargetName,
-  setForwardTargetName,
-  forwardSubmitting,
-  forwardResult,
-  forwardError,
-  onForwardLatestChannelMessage,
+  baleForwardAccountId,
+  baleSourceChannelUrl,
+  setBaleSourceChannelUrl,
+  savedBaleSourceChannel,
+  onSaveBaleSourceChannel,
+  baleContactsInput,
+  setBaleContactsInput,
+  baleContacts,
+  baleContactsResult,
+  onAddBaleContacts,
+  baleForwardPreviewResult,
+  onPreviewBaleLatestMessage,
+  baleForwardPanelLoading,
+  baleForwardPanelError,
 }) {
   return (
     <div>
@@ -1695,18 +1763,20 @@ function CampaignsSection({
         onCheckSimpleBaleLogin={onCheckSimpleBaleLogin}
         onRunSimpleTest={onRunSimpleTest}
         onRunSimpleLimited={onRunSimpleLimited}
-      />
-      <ForwardLatestChannelMessageSection
-        sourceChannelUrl={forwardSourceChannelUrl}
-        setSourceChannelUrl={setForwardSourceChannelUrl}
-        targetPhone={forwardTargetPhone}
-        setTargetPhone={setForwardTargetPhone}
-        targetName={forwardTargetName}
-        setTargetName={setForwardTargetName}
-        submitting={forwardSubmitting}
-        result={forwardResult}
-        error={forwardError}
-        onSubmit={onForwardLatestChannelMessage}
+        baleForwardAccountId={baleForwardAccountId}
+        baleSourceChannelUrl={baleSourceChannelUrl}
+        setBaleSourceChannelUrl={setBaleSourceChannelUrl}
+        savedBaleSourceChannel={savedBaleSourceChannel}
+        onSaveBaleSourceChannel={onSaveBaleSourceChannel}
+        baleContactsInput={baleContactsInput}
+        setBaleContactsInput={setBaleContactsInput}
+        baleContacts={baleContacts}
+        baleContactsResult={baleContactsResult}
+        onAddBaleContacts={onAddBaleContacts}
+        baleForwardPreviewResult={baleForwardPreviewResult}
+        onPreviewBaleLatestMessage={onPreviewBaleLatestMessage}
+        baleForwardPanelLoading={baleForwardPanelLoading}
+        baleForwardPanelError={baleForwardPanelError}
       />
       <details className="safe-policy-section" style={{ marginTop: 16 }}>
         <summary className="panel-title">جزئیات فنی و تست ارسال از پیام آماده</summary>
@@ -1721,60 +1791,6 @@ function CampaignsSection({
         />
       </details>
     </div>
-  );
-}
-
-function ForwardLatestChannelMessageSection({
-  sourceChannelUrl,
-  setSourceChannelUrl,
-  targetPhone,
-  setTargetPhone,
-  targetName,
-  setTargetName,
-  submitting,
-  result,
-  error,
-  onSubmit,
-}) {
-  return (
-    <section className="panel" style={{ marginTop: 16 }}>
-      <div className="panel-header">
-        <div>
-          <h3 className="panel-title">Forward Latest Channel Message</h3>
-          <p className="page-copy">Forwards the latest visible message from one Bale source channel to one target contact.</p>
-        </div>
-        <span className="pill">latest_visible</span>
-      </div>
-      <div className="settings-grid" style={{ marginTop: 14 }}>
-        <Field label="Source channel URL">
-          <input
-            value={sourceChannelUrl}
-            placeholder="https://web.bale.ai/..."
-            onChange={(event) => setSourceChannelUrl(event.target.value)}
-          />
-        </Field>
-        <Field label="Target phone">
-          <input value={targetPhone} onChange={(event) => setTargetPhone(event.target.value)} />
-        </Field>
-        <Field label="Target name">
-          <input value={targetName} onChange={(event) => setTargetName(event.target.value)} />
-        </Field>
-        <Field label="Message selector">
-          <input value="latest_visible" readOnly />
-        </Field>
-      </div>
-      {error ? <div className="error-state" style={{ marginTop: 12 }}>{error}</div> : null}
-      {result ? (
-        <div className={result.success || result.ok ? "toast" : "error-state"} style={{ marginTop: 12 }}>
-          {result.success || result.ok ? "Forward latest channel message request submitted." : result.error_message || result.message || "Forward request completed with errors."}
-        </div>
-      ) : null}
-      <div className="modal-actions">
-        <button className="primary-button" onClick={onSubmit} disabled={submitting} type="button">
-          {submitting ? "Forwarding..." : "Forward latest channel message"}
-        </button>
-      </div>
-    </section>
   );
 }
 
@@ -1803,7 +1819,7 @@ function BaleSendSection({ accounts, config, setConfig, onSave, onDryRun, onCont
   );
 }
 
-function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts, simpleSendForm, setSimpleSendForm, simpleSendResult, simpleSendContactResult, simpleBaleLoginStatus, onAddManualContacts, onPrepareSimpleSend, onPreviewSimpleSend, onOpenSimpleBaleLogin, onCheckSimpleBaleLogin, onRunSimpleTest, onRunSimpleLimited }) {
+function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups, planResult, assignmentForm, setAssignmentForm, assignmentResult, queueResult, queueJobs, realRunResult, realRunForm, setRealRunForm, accounts, onCreateCampaign, onEditCampaign, onCreateSource, onEditSource, onCreateContactList, onEditContactList, onAddRoute, onPlan, onAssign, onCreateQueue, onDryRunQueue, onRunBaleReal, importForm, setImportForm, onImportContacts, importResult, sampleImportedContacts, simpleSendForm, setSimpleSendForm, simpleSendResult, simpleSendContactResult, simpleBaleLoginStatus, onAddManualContacts, onPrepareSimpleSend, onPreviewSimpleSend, onOpenSimpleBaleLogin, onCheckSimpleBaleLogin, onRunSimpleTest, onRunSimpleLimited, baleForwardAccountId, baleSourceChannelUrl, setBaleSourceChannelUrl, savedBaleSourceChannel, onSaveBaleSourceChannel, baleContactsInput, setBaleContactsInput, baleContacts, baleContactsResult, onAddBaleContacts, baleForwardPreviewResult, onPreviewBaleLatestMessage, baleForwardPanelLoading, baleForwardPanelError }) {
   return (
     <section className="panel" style={{ marginTop: 16 }}>
       <div className="panel-header">
@@ -1829,6 +1845,22 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
         onCheckLogin={onCheckSimpleBaleLogin}
         onRunTest={onRunSimpleTest}
         onRunLimited={onRunSimpleLimited}
+      />
+      <BaleForwardPhaseOnePanel
+        accountId={baleForwardAccountId}
+        sourceChannelUrl={baleSourceChannelUrl}
+        setSourceChannelUrl={setBaleSourceChannelUrl}
+        savedSourceChannel={savedBaleSourceChannel}
+        onSaveSourceChannel={onSaveBaleSourceChannel}
+        contactsInput={baleContactsInput}
+        setContactsInput={setBaleContactsInput}
+        contacts={baleContacts}
+        contactsResult={baleContactsResult}
+        onAddContacts={onAddBaleContacts}
+        previewResult={baleForwardPreviewResult}
+        onPreviewLatestMessage={onPreviewBaleLatestMessage}
+        loading={baleForwardPanelLoading}
+        error={baleForwardPanelError}
       />
 
       <details className="safe-policy-section" style={{ marginTop: 16 }}>
@@ -1960,6 +1992,118 @@ function BulkMessagingSection({ campaigns, sources, contactLists, accountGroups,
       <BulkExecutionQueueSection form={assignmentForm} campaigns={campaigns} result={queueResult} jobs={queueJobs} realRunResult={realRunResult} realRunForm={realRunForm} setRealRunForm={setRealRunForm} accounts={accounts} onCreateQueue={onCreateQueue} onDryRunQueue={onDryRunQueue} onRunBaleReal={onRunBaleReal} />
       <div className="empty-state" style={{ marginTop: 12 }}>الگوی نام مخاطب: {"Bale-GHAB-{seq:06d} -> Bale-GHAB-000001"}</div>
       </details>
+    </section>
+  );
+}
+
+function BaleForwardPhaseOnePanel({
+  accountId,
+  sourceChannelUrl,
+  setSourceChannelUrl,
+  savedSourceChannel,
+  onSaveSourceChannel,
+  contactsInput,
+  setContactsInput,
+  contacts,
+  contactsResult,
+  onAddContacts,
+  previewResult,
+  onPreviewLatestMessage,
+  loading,
+  error,
+}) {
+  return (
+    <section className="safe-policy-section" style={{ marginTop: 16 }}>
+      <div className="panel-header">
+        <div>
+          <h3 className="panel-title">ارسال آخرین پست کانال</h3>
+          <p className="page-copy">فاز ۱: ذخیره مخاطب، تنظیم کانال منبع و پیش‌نمایش آخرین پیام. ارسال انجام نمی‌شود.</p>
+        </div>
+        <span className="pill">{accountId}</span>
+      </div>
+
+      {error ? <div className="error-state">{error}</div> : null}
+
+      <section className="wizard-step">
+        <div className="panel-header"><h4 className="panel-title">کانال منبع</h4><span className="pill">ذخیره تنظیمات</span></div>
+        <div className="settings-grid">
+          <Field label="آدرس کانال منبع">
+            <input
+              value={sourceChannelUrl}
+              placeholder="https://web.bale.ai/..."
+              onChange={(event) => setSourceChannelUrl(event.target.value)}
+            />
+          </Field>
+          <ReadOnlyValue label="مقدار ذخیره‌شده" value={savedSourceChannel?.source_channel_url || ""} />
+        </div>
+        <div className="modal-actions">
+          <button className="primary-button" onClick={onSaveSourceChannel} disabled={loading === "source"} type="button">
+            {loading === "source" ? "در حال ذخیره..." : "ذخیره کانال منبع"}
+          </button>
+        </div>
+      </section>
+
+      <section className="wizard-step">
+        <div className="panel-header"><h4 className="panel-title">بانک مخاطبان</h4><span className="pill">{contacts.length} مخاطب</span></div>
+        <Field label="شماره‌ها، هر خط یک شماره">
+          <textarea
+            value={contactsInput}
+            placeholder={"09304073331\n09121234567"}
+            onChange={(event) => setContactsInput(event.target.value)}
+          />
+        </Field>
+        <div className="modal-actions">
+          <button className="primary-button" onClick={onAddContacts} disabled={loading === "contacts"} type="button">
+            {loading === "contacts" ? "در حال افزودن..." : "افزودن مخاطبان"}
+          </button>
+        </div>
+        {contactsResult ? (
+          <section className="grid metrics">
+            <div><span>ایجاد شده</span><strong>{contactsResult.created_count || 0}</strong></div>
+            <div><span>موجود</span><strong>{contactsResult.existing_count || 0}</strong></div>
+            <div><span>نامعتبر</span><strong>{contactsResult.invalid_count || 0}</strong></div>
+          </section>
+        ) : null}
+        <div className="table-scroll">
+          <table className="table rtl-table wide-table">
+            <thead><tr><th>نام نمایشی</th><th>شماره نرمال</th><th>وضعیت</th></tr></thead>
+            <tbody>{contacts.map((contact) => (
+              <tr key={contact.id}>
+                <td>{contact.display_name}</td>
+                <td>{contact.phone_normalized}</td>
+                <td><Pill value={contact.status} /></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+        {contacts.length === 0 ? <div className="empty-state">هنوز مخاطبی برای این اکانت ذخیره نشده است.</div> : null}
+      </section>
+
+      <section className="wizard-step">
+        <div className="panel-header"><h4 className="panel-title">پیش‌نمایش آخرین پیام</h4><span className="pill">بدون ارسال</span></div>
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={onPreviewLatestMessage} disabled={loading === "preview"} type="button">
+            {loading === "preview" ? "در حال پیش‌نمایش..." : "پیش‌نمایش آخرین پیام"}
+          </button>
+        </div>
+        {previewResult ? (
+          <div className={previewResult.success ? "plan-preview" : "error-state"}>
+            <div className="settings-grid">
+              <ReadOnlyValue label="message_found" value={String(Boolean(previewResult.message_found))} />
+              <ReadOnlyValue label="has_image" value={String(Boolean(previewResult.has_image))} />
+              <ReadOnlyValue label="has_video" value={String(Boolean(previewResult.has_video))} />
+              <ReadOnlyValue label="has_file" value={String(Boolean(previewResult.has_file))} />
+              <ReadOnlyValue label="error_code" value={previewResult.error_code || ""} />
+            </div>
+            {previewResult.text_preview ? <pre style={{ direction: "rtl", whiteSpace: "pre-wrap" }}>{previewResult.text_preview}</pre> : null}
+            {!previewResult.success ? (
+              <pre style={{ direction: "ltr", textAlign: "left", whiteSpace: "pre-wrap", maxHeight: 260, overflow: "auto" }}>
+                {JSON.stringify(previewResult, null, 2)}
+              </pre>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
     </section>
   );
 }

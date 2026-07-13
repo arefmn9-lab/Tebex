@@ -22,7 +22,8 @@ class BulkExecutionJob:
     normalized_phone: str
     contact_naming_value: str
     message_source_id: str
-    scenario_id: str
+    scenario_id: str | None
+    action: str | None = None
     status: str = "pending"
     dry_run: bool = True
     planned_for_date: str = ""
@@ -32,6 +33,7 @@ class BulkExecutionJob:
     error_message: str | None = None
     dry_run_result: dict[str, Any] | None = None
     execution_result: dict[str, Any] | None = None
+    plugin_result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

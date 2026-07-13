@@ -1,23 +1,24 @@
-import { Activity, ClipboardList, LayoutDashboard, ScrollText, SendHorizonal, Users } from "lucide-react";
-import { platforms } from "../data/platforms";
+import { Activity, BriefcaseBusiness, ClipboardList, LayoutDashboard, ScrollText, Settings, Users } from "lucide-react";
 
 const navItems = [
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "tasks", label: "Tasks", icon: ClipboardList },
-  { id: "accounts", label: "Accounts", icon: Users },
-  { id: "logs", label: "Logs", icon: ScrollText }
+  { id: "dashboard", label: "داشبورد", icon: LayoutDashboard },
+  { id: "accounts", label: "اکانت‌ها", icon: Users },
+  { id: "jobs", label: "صف عملیات", icon: ClipboardList },
+  { id: "campaigns", label: "کمپین‌ها", icon: BriefcaseBusiness },
+  { id: "logs", label: "لاگ عملیات", icon: ScrollText },
+  { id: "settings", label: "تنظیمات", icon: Settings },
 ];
 
 export default function Sidebar({ activePage, onNavigate }) {
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" dir="rtl">
       <div className="brand">
         <div className="brand-mark">
           <Activity size={20} />
         </div>
         <div>
           <p className="brand-title">ClinicOS</p>
-          <p className="brand-subtitle">Automation Platform</p>
+          <p className="brand-subtitle">Commercial Queue</p>
         </div>
       </div>
 
@@ -36,33 +37,6 @@ export default function Sidebar({ activePage, onNavigate }) {
             </button>
           );
         })}
-
-        <div className="nav-section" dir="rtl">
-          <button
-            className={`nav-button ${activePage === "messaging" ? "active" : ""}`}
-            onClick={() => onNavigate("messaging")}
-            type="button"
-          >
-            <SendHorizonal size={18} />
-            <span>ارسال پیام</span>
-          </button>
-          <div className="platform-nav">
-            {platforms.map((platform) => {
-              const Icon = platform.icon;
-              return (
-                <button
-                  className={`nav-button platform-nav-button ${activePage === `platform:${platform.id}` ? "active" : ""}`}
-                  key={platform.id}
-                  onClick={() => onNavigate(`platform:${platform.id}`)}
-                  type="button"
-                >
-                  <Icon size={16} />
-                  <span>{platform.name}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
       </nav>
     </aside>
   );

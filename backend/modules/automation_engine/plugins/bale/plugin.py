@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from contextlib import contextmanager
 from copy import deepcopy
@@ -12,9 +13,9 @@ from uuid import uuid4
 from modules.automation_engine.browser import actions_browser
 from modules.automation_engine.browser.browser_manager import BrowserManager, resolve_system_browser_executable
 from modules.automation_engine.browser.providers import get_provider
-from modules.automation_engine.scenario_runner import ScenarioRunner
 
-from .account_store import bale_account_store
+from .account_store import bale_account_store, normalize_source_channel_uid
+from .contact_store import BaleContactError, bale_contact_store
 from . import selectors
 
 
@@ -25,6 +26,7 @@ class BalePlugin:
 
     def __init__(self, browser_manager: BrowserManager | None = None) -> None:
         self.browser_manager = browser_manager or actions_browser.browser_manager
+        self.contact_store = bale_contact_store
         self._logs: list[dict[str, Any]] = []
         self.scenario_dir = Path(__file__).resolve().parent / "scenarios"
 
@@ -192,6 +194,112 @@ class BalePlugin:
                 "message": "Bale login check failed",
                 "error_code": _browser_error_code(exc),
                 "error": str(exc),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+
+    def preview_latest_channel_message(
+        self,
+        account_id: str,
+        source_channel_url: str,
+        provider_mode: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        last_successful_step = "validate_input"
+        effective_provider = provider_mode or "native_chrome"
+        browser_meta = self._browser_failure_meta(account_id, effective_provider)
+        if not str(source_channel_url or "").strip():
+            return {
+                "success": False,
+                "ok": False,
+                "account_id": account_id,
+                "action": "preview_latest_channel_message",
+                "source_channel_url": source_channel_url,
+                "error_code": "source_channel_not_configured",
+                "error_message": "Bale source channel URL is not configured",
+                "failed_step": "load_source_channel",
+                "last_successful_step": None,
+                "diagnostics": {},
+                **browser_meta,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+
+        page = None
+        try:
+            with self._page_session(account_id, provider_mode=provider_mode or "native_chrome") as (page, session_meta):
+                browser_meta = session_meta
+                self._goto_with_timeout(page, str(source_channel_url).strip(), timeout_ms=15000, wait_until="load")
+                last_successful_step = "open_source_channel"
+                _safe_wait_for_timeout(page, 1500)
+                preview = self._extract_latest_channel_message_preview(page)
+                diagnostics = {
+                    "page_url": _safe_page_url(page),
+                    "page_title": _safe_page_title(page),
+                    "channel_view_visible": bool(preview.get("channel_view_visible")),
+                    "message_selector_used": preview.get("message_selector_used") or "",
+                    "latest_message_visible": bool(preview.get("latest_message_visible")),
+                    "candidate_count": int(preview.get("candidate_count") or 0),
+                    "visible_text_sample": _visible_text_sample(page),
+                }
+                if not preview.get("message_found"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return {
+                        "success": False,
+                        "ok": False,
+                        "account_id": account_id,
+                        "action": "preview_latest_channel_message",
+                        "source_channel_url": source_channel_url,
+                        "message_found": False,
+                        "error_code": "latest_channel_message_not_found",
+                        "error_message": "Latest channel message could not be identified",
+                        "failed_step": "locate_latest_channel_message",
+                        "last_successful_step": last_successful_step,
+                        "current_url": diagnostics["page_url"],
+                        "page_url": diagnostics["page_url"],
+                        "page_title": diagnostics["page_title"],
+                        "screenshot_path": screenshot_path,
+                        "diagnostics": diagnostics,
+                        **browser_meta,
+                        "duration_ms": int((time.perf_counter() - started) * 1000),
+                    }
+
+                return {
+                    "success": True,
+                    "ok": True,
+                    "account_id": account_id,
+                    "action": "preview_latest_channel_message",
+                    "source_channel_url": source_channel_url,
+                    "message_found": True,
+                    "text_preview": str(preview.get("text_preview") or ""),
+                    "has_text": bool(preview.get("has_text")),
+                    "has_image": bool(preview.get("has_image")),
+                    "has_video": bool(preview.get("has_video")),
+                    "has_file": bool(preview.get("has_file")),
+                    "message_dom_id": preview.get("message_dom_id"),
+                    "message_timestamp_text": preview.get("message_timestamp_text"),
+                    "candidate_count": int(preview.get("candidate_count") or 0),
+                    "diagnostics": diagnostics,
+                    **browser_meta,
+                    "duration_ms": int((time.perf_counter() - started) * 1000),
+                }
+        except Exception as exc:
+            diagnostics = self._page_debug_info(page, account_id) if page is not None else {}
+            return {
+                "success": False,
+                "ok": False,
+                "account_id": account_id,
+                "action": "preview_latest_channel_message",
+                "source_channel_url": source_channel_url,
+                "message_found": False,
+                "error_code": _browser_error_code(exc),
+                "error_message": str(exc),
+                "failed_step": "preview_latest_channel_message",
+                "last_successful_step": last_successful_step,
+                "current_url": diagnostics.get("current_url") or "",
+                "page_url": diagnostics.get("page_url") or "",
+                "page_title": diagnostics.get("page_title") or "",
+                "screenshot_path": diagnostics.get("screenshot_path"),
+                "diagnostics": diagnostics,
+                **browser_meta,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             }
 
@@ -497,148 +605,1658 @@ class BalePlugin:
             self._add_step(step_results, "unexpected_error", "failed", error_code=error_code, error=str(exc))
             return finish(False, error_code, str(exc), "unexpected_error", diagnostics)
 
-    def forward_latest_channel_message(
+    def save_bale_contact(
         self,
         account_id: str,
-        payload: dict[str, Any],
+        phone: str,
+        provider_mode: str | None = None,
+        runtime_session: Any | None = None,
+        close_session_when_done: bool = True,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        action = "save_bale_contact"
+        step_results: list[dict[str, Any]] = []
+        last_successful_step: str | None = None
+        browser_meta = self._browser_failure_meta(account_id, provider_mode or "native_chrome")
+
+        def finish(
+            success: bool,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "success": success,
+                "ok": success,
+                "action": action,
+                "account_id": account_id,
+                "phone": phone,
+                "failed_step": failed_step,
+                "last_successful_step": last_successful_step,
+                "error_code": error_code,
+                "error_message": error_message,
+                "step_results": step_results,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                **browser_meta,
+            }
+            if extra:
+                payload.update(extra)
+            return payload
+
+        try:
+            contact, created = self.contact_store.get_or_create_bale_contact(account_id, phone)
+            normalized_phone = str(contact.get("phone_normalized") or "")
+            display_name = str(contact.get("display_name") or "")
+            last_successful_step = "resolve_contact_name"
+            self._add_step(
+                step_results,
+                "resolve_contact_name",
+                "success",
+                phone_normalized=normalized_phone,
+                display_name=display_name,
+                contact_store_status="created" if created else "existing",
+                contact_id=contact.get("id"),
+                sequence_number=contact.get("sequence_number"),
+            )
+        except BaleContactError as exc:
+            self._add_step(step_results, "normalize_phone", "failed", error_code=exc.error_code, phone=phone)
+            return finish(False, exc.error_code, str(exc), "normalize_phone")
+
+        page = None
+        try:
+            with self._runtime_or_page_session(account_id, provider_mode=provider_mode or "native_chrome", runtime_session=runtime_session) as (page, session_meta):
+                browser_meta = session_meta
+                contact_result = self.save_contact_by_phone(
+                    page,
+                    normalized_phone=normalized_phone,
+                    contact_naming_value=display_name,
+                    account_id=account_id,
+                )
+                contact_steps = contact_result.get("contact_steps") if isinstance(contact_result.get("contact_steps"), list) else []
+                step_results.extend(contact_steps)
+                contact_status = str(contact_result.get("contact_save_status") or "failed")
+                success = contact_status in {"saved", "already_exists"}
+                if success:
+                    last_successful_step = "verify_result"
+                    self._add_step(
+                        step_results,
+                        "verify_result",
+                        "success",
+                        contact_save_status=contact_status,
+                        current_url=_safe_page_url(page),
+                    )
+                    self.browser_manager.save_session(account_id)
+                    return finish(
+                        True,
+                        extra={
+                            "phone_normalized": normalized_phone,
+                            "display_name": display_name,
+                            "contact_id": contact.get("id"),
+                            "sequence_number": contact.get("sequence_number"),
+                            "contact_store_status": "created" if created else "existing",
+                            "contact_save_status": contact_status,
+                            "current_url": _safe_page_url(page),
+                            "page_url": _safe_page_url(page),
+                            "page_title": _safe_page_title(page),
+                        },
+                    )
+
+                failed_step = str(contact_result.get("failed_step") or "save_contact_in_bale")
+                error_code = str(contact_result.get("error_code") or "contact_save_failed")
+                error_message = str(contact_result.get("user_message") or contact_result.get("message") or "Bale contact save failed")
+                diagnostics = self._page_debug_info(page, account_id)
+                return finish(
+                    False,
+                    error_code,
+                    error_message,
+                    failed_step,
+                    {
+                        "phone_normalized": normalized_phone,
+                        "display_name": display_name,
+                        "contact_id": contact.get("id"),
+                        "sequence_number": contact.get("sequence_number"),
+                        "contact_store_status": "created" if created else "existing",
+                        "contact_save_status": contact_status,
+                        "contact_save_result": contact_result,
+                        **diagnostics,
+                    },
+                )
+        except Exception as exc:
+            diagnostics = self._page_debug_info(page, account_id) if page is not None else {}
+            return finish(
+                False,
+                _browser_error_code(exc),
+                str(exc),
+                "save_bale_contact",
+                diagnostics,
+            )
+
+    def open_bale_source_channel(
+        self,
+        account_id: str,
+        source_channel_uid: str,
         provider_mode: str | None = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        action = "forward_latest_channel_message"
-        context_result = self._build_forward_latest_channel_message_context(payload)
-        context = context_result.get("context") or {}
-        source_channel_url = str(context.get("channel_url") or context_result.get("source_channel_url") or "")
-        message_selector = context.get("message_selector") if isinstance(context.get("message_selector"), dict) else {"strategy": "latest_visible"}
-        contact = (context.get("contacts") or [{}])[0] if isinstance(context.get("contacts"), list) else {}
+        action = "open_bale_source_channel"
+        source_channel_uid = str(source_channel_uid or "").strip()
+        requested_channel_url = ""
+        readiness_attempts: list[dict[str, Any]] = []
+        last_successful_step: str | None = None
+        browser_meta = self._browser_failure_meta(account_id, provider_mode or "native_chrome")
 
-        def finish(extra: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "ok": bool(extra.get("success")),
-                "success": bool(extra.get("success")),
+        def finish(
+            success: bool,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "success": success,
+                "ok": success,
                 "action": action,
                 "account_id": account_id,
-                "source_channel_url": source_channel_url,
-                "message_selector": message_selector,
-                "target_phone": str(contact.get("phone") or ""),
-                "target_name": str(contact.get("name") or ""),
+                "source_channel_uid": source_channel_uid,
+                "requested_channel_url": requested_channel_url,
+                "final_page_url": "",
+                "target_channel_panel_visible": False,
+                "target_channel_panel_selector": "",
+                "target_channel_header_text": "",
+                "target_channel_header_selector": "",
+                "message_stream_visible": False,
+                "message_stream_selector": "",
+                "center_panel_visible_text_sample": "",
+                "full_page_visible_text_sample": "",
+                "readiness_attempts": readiness_attempts,
+                "readiness_duration_ms": int((time.perf_counter() - started) * 1000),
+                "failed_step": failed_step,
+                "last_successful_step": last_successful_step,
+                "error_code": error_code,
+                "error_message": error_message,
+                "step_results": readiness_attempts,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
-                **extra,
+                "screenshot_path": "",
+                **browser_meta,
             }
+            if extra:
+                payload.update(extra)
+            return payload
 
-        if not context_result.get("success"):
-            return finish(
+        if not _valid_bale_channel_uid(source_channel_uid):
+            readiness_attempts.append(
                 {
-                    "success": False,
-                    "failed_step": "validate_input",
-                    "error_code": context_result.get("error_code") or "invalid_input",
-                    "error_message": context_result.get("error_message") or "Invalid forward input",
-                    "step_results": [],
-                    "current_url": "",
+                    "step": "validate_source_channel_uid",
+                    "status": "failed",
+                    "error_code": "invalid_source_channel_uid",
+                    "source_channel_uid": source_channel_uid,
                 }
             )
+            return finish(
+                False,
+                "invalid_source_channel_uid",
+                "source_channel_uid must contain only letters, numbers, underscore, or dash",
+                "validate_source_channel_uid",
+            )
 
-        scenario_path = Path(__file__).resolve().parents[2] / "scenarios" / "bale" / "forward_latest_channel_message.json"
+        requested_channel_url = f"{self.web_url}/chat?uid={source_channel_uid}"
+        readiness_attempts.append(
+            {
+                "step": "validate_source_channel_uid",
+                "status": "success",
+                "source_channel_uid": source_channel_uid,
+                "requested_channel_url": requested_channel_url,
+            }
+        )
+        last_successful_step = "validate_source_channel_uid"
+
+        page = None
         try:
-            with self._page_session(account_id, provider_mode) as (page, session_meta):
-                runner = ScenarioRunner(page, scenario_path, context)
-                result = runner.run()
-                if result.get("success"):
-                    self.browser_manager.save_session(account_id)
-                    return finish(
-                        {
-                            "success": True,
-                            "forward_triggered": True,
-                            "step_results": result.get("step_results") or [],
-                            "current_url": result.get("current_url") or _safe_page_url(page),
-                            **session_meta,
-                        }
-                    )
-                return finish(
+            with self._page_session(account_id, provider_mode=provider_mode or "native_chrome") as (page, session_meta):
+                browser_meta = session_meta
+                self._goto_with_timeout(page, requested_channel_url, timeout_ms=15000, wait_until="load")
+                last_successful_step = "navigate_source_channel"
+                readiness_attempts.append(
                     {
-                        "success": False,
-                        "forward_triggered": False,
-                        "failed_step": result.get("failed_step") or "scenario_runner",
-                        "error_code": result.get("error_code") or "scenario_step_failed",
-                        "error_message": result.get("error_message") or "Scenario step failed",
-                        "step_results": result.get("step_results") or [],
-                        "screenshot_path": result.get("screenshot_path") or "",
-                        "current_url": result.get("current_url") or _safe_page_url(page),
-                        **session_meta,
+                        "step": "navigate_source_channel",
+                        "status": "success",
+                        "requested_channel_url": requested_channel_url,
+                        "final_page_url": _safe_page_url(page),
                     }
                 )
+                readiness_started = time.perf_counter()
+                latest_readiness: dict[str, Any] = {}
+                for attempt_index in range(1, 11):
+                    latest_readiness = self._source_channel_readiness(page)
+                    attempt = {
+                        "step": "wait_source_channel_ready",
+                        "status": "success" if latest_readiness.get("ready") else "pending",
+                        "attempt": attempt_index,
+                        "final_page_url": _safe_page_url(page),
+                        "target_channel_panel_visible": bool(latest_readiness.get("target_channel_panel_visible")),
+                        "target_channel_panel_selector": str(latest_readiness.get("target_channel_panel_selector") or ""),
+                        "target_channel_header_text": str(latest_readiness.get("target_channel_header_text") or ""),
+                        "target_channel_header_selector": str(latest_readiness.get("target_channel_header_selector") or ""),
+                        "message_stream_visible": bool(latest_readiness.get("message_stream_visible")),
+                        "message_stream_selector": str(latest_readiness.get("message_stream_selector") or ""),
+                    }
+                    readiness_attempts.append(attempt)
+                    if latest_readiness.get("ready"):
+                        last_successful_step = "wait_source_channel_ready"
+                        self.browser_manager.save_session(account_id)
+                        return finish(
+                            True,
+                            extra={
+                                **latest_readiness,
+                                "final_page_url": _safe_page_url(page),
+                                "full_page_visible_text_sample": _visible_text_sample(page),
+                                "readiness_duration_ms": int((time.perf_counter() - readiness_started) * 1000),
+                            },
+                        )
+                    _safe_wait_for_timeout(page, 500)
+
+                screenshot_path = _save_login_debug_screenshot(page, account_id)
+                return finish(
+                    False,
+                    "source_channel_not_ready",
+                    "Bale source channel center panel and message stream were not detected",
+                    "wait_source_channel_ready",
+                    {
+                        **latest_readiness,
+                        "final_page_url": _safe_page_url(page),
+                        "full_page_visible_text_sample": _visible_text_sample(page),
+                        "readiness_duration_ms": int((time.perf_counter() - readiness_started) * 1000),
+                        "screenshot_path": screenshot_path,
+                    },
+                )
         except Exception as exc:
+            diagnostics = self._page_debug_info(page, account_id) if page is not None else {}
             return finish(
+                False,
+                _browser_error_code(exc),
+                str(exc),
+                "open_bale_source_channel",
                 {
-                    "success": False,
-                    "forward_triggered": False,
-                    "failed_step": "scenario_runner",
-                    "error_code": _browser_error_code(exc),
-                    "error_message": str(exc),
-                    "step_results": [],
-                    "current_url": "",
-                    **self._browser_failure_meta(account_id, provider_mode or "native_chrome"),
-                }
+                    "final_page_url": diagnostics.get("page_url") or diagnostics.get("current_url") or "",
+                    "full_page_visible_text_sample": diagnostics.get("visible_text_sample") or "",
+                    "screenshot_path": diagnostics.get("screenshot_path") or "",
+                },
             )
 
-    def _build_forward_latest_channel_message_context(self, payload: dict[str, Any]) -> dict[str, Any]:
-        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
-        target = payload.get("target") if isinstance(payload.get("target"), dict) else {}
-        source_type = str(source.get("type") or "channel")
-        channel_url = str(source.get("channel_url") or "").strip()
-        if not channel_url:
-            return {
-                "success": False,
-                "source_channel_url": "",
-                "error_code": "missing_channel_url",
-                "error_message": "source.channel_url is required",
-            }
+    def locate_latest_channel_message(
+        self,
+        account_id: str,
+        source_channel_uid: str,
+        provider_mode: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        action = "locate_latest_channel_message"
+        source_channel_uid = str(source_channel_uid or "").strip()
+        requested_channel_url = ""
+        step_results: list[dict[str, Any]] = []
+        last_successful_step: str | None = None
+        browser_meta = self._browser_failure_meta(account_id, provider_mode or "native_chrome")
 
-        selector_payload = source.get("message_selector") if isinstance(source.get("message_selector"), dict) else {}
-        strategy = str(selector_payload.get("strategy") or "latest_visible").strip() or "latest_visible"
-        if source_type == "channel_latest":
-            source_type = "channel"
-            strategy = "latest_visible"
-        if strategy != "latest_visible":
-            return {
-                "success": False,
-                "source_channel_url": channel_url,
-                "error_code": "unsupported_message_selector",
-                "error_message": f"Unsupported message selector strategy: {strategy}",
+        def finish(
+            success: bool,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "success": success,
+                "ok": success,
+                "action": action,
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "requested_channel_url": requested_channel_url,
+                "final_page_url": "",
+                "message_found": False,
+                "candidate_count": 0,
+                "message_selector_used": "",
+                "candidate_debug": [],
+                "text_preview": "",
+                "has_text": False,
+                "has_image": False,
+                "has_video": False,
+                "has_file": False,
+                "message_dom_id": None,
+                "message_timestamp_text": None,
+                "failed_step": failed_step,
+                "last_successful_step": last_successful_step,
+                "error_code": error_code,
+                "error_message": error_message,
+                "screenshot_path": "",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "step_results": step_results,
+                **browser_meta,
             }
+            if extra:
+                payload.update(extra)
+            return payload
 
-        phone = str(payload.get("normalized_phone") or target.get("phone") or "").strip()
-        if not phone:
-            return {
-                "success": False,
-                "source_channel_url": channel_url,
-                "error_code": "missing_target_phone",
-                "error_message": "normalized_phone or target.phone is required",
+        if not _valid_bale_channel_uid(source_channel_uid):
+            self._add_step(step_results, "validate_source_channel_uid", "failed", error_code="invalid_source_channel_uid", source_channel_uid=source_channel_uid)
+            return finish(
+                False,
+                "invalid_source_channel_uid",
+                "source_channel_uid must contain only letters, numbers, underscore, or dash",
+                "validate_source_channel_uid",
+            )
+
+        requested_channel_url = f"{self.web_url}/chat?uid={source_channel_uid}"
+        self._add_step(step_results, "validate_source_channel_uid", "success", source_channel_uid=source_channel_uid, requested_channel_url=requested_channel_url)
+        last_successful_step = "validate_source_channel_uid"
+        page = None
+        try:
+            with self._page_session(account_id, provider_mode=provider_mode or "native_chrome") as (page, session_meta):
+                browser_meta = session_meta
+                self._goto_with_timeout(page, requested_channel_url, timeout_ms=15000, wait_until="load")
+                stale_picker_state = self._forward_picker_state(page)
+                if stale_picker_state.get("forward_picker_visible"):
+                    self._press_key(page, "Escape")
+                    _safe_wait_for_timeout(page, 300)
+                last_successful_step = "navigate_source_channel"
+                self._add_step(step_results, "navigate_source_channel", "success", requested_channel_url=requested_channel_url, final_page_url=_safe_page_url(page))
+
+                readiness: dict[str, Any] = {}
+                for attempt_index in range(1, 11):
+                    readiness = self._source_channel_readiness(page)
+                    ready = bool(readiness.get("ready"))
+                    self._add_step(
+                        step_results,
+                        "wait_source_channel_ready",
+                        "success" if ready else "pending",
+                        attempt=attempt_index,
+                        final_page_url=_safe_page_url(page),
+                        target_channel_panel_visible=bool(readiness.get("target_channel_panel_visible")),
+                        target_channel_header_selector=str(readiness.get("target_channel_header_selector") or ""),
+                        message_stream_visible=bool(readiness.get("message_stream_visible")),
+                        message_stream_selector=str(readiness.get("message_stream_selector") or ""),
+                    )
+                    if ready:
+                        last_successful_step = "wait_source_channel_ready"
+                        break
+                    _safe_wait_for_timeout(page, 500)
+                if not readiness.get("ready"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "source_channel_not_ready",
+                        "Bale source channel message stream was not detected",
+                        "wait_source_channel_ready",
+                        {
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                            **readiness,
+                        },
+                    )
+
+                latest = self._locate_latest_channel_message_in_stream(page)
+                self._add_step(
+                    step_results,
+                    "locate_latest_channel_message",
+                    "success" if latest.get("message_found") else "failed",
+                    candidate_count=int(latest.get("candidate_count") or 0),
+                    message_selector_used=str(latest.get("message_selector_used") or ""),
+                )
+                if not latest.get("message_found"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "latest_channel_message_not_found",
+                        "No real message container was found inside the Bale source channel message stream",
+                        "locate_latest_channel_message",
+                        {
+                            **latest,
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                        },
+                    )
+
+                last_successful_step = "locate_latest_channel_message"
+                self.browser_manager.save_session(account_id)
+                return finish(
+                    True,
+                    extra={
+                        **latest,
+                        "final_page_url": _safe_page_url(page),
+                    },
+                )
+        except Exception as exc:
+            diagnostics = self._page_debug_info(page, account_id) if page is not None else {}
+            return finish(
+                False,
+                _browser_error_code(exc),
+                str(exc),
+                "locate_latest_channel_message",
+                {
+                    "final_page_url": diagnostics.get("page_url") or diagnostics.get("current_url") or "",
+                    "screenshot_path": diagnostics.get("screenshot_path") or "",
+                },
+            )
+
+    def open_message_forward(
+        self,
+        account_id: str,
+        source_channel_uid: str,
+        provider_mode: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        action = "open_message_forward"
+        source_channel_uid = str(source_channel_uid or "").strip()
+        requested_channel_url = ""
+        step_results: list[dict[str, Any]] = []
+        click_attempts: list[dict[str, Any]] = []
+        candidate_debug: list[dict[str, Any]] = []
+        recipient_candidate_debug: list[dict[str, Any]] = []
+        last_successful_step: str | None = None
+        browser_meta = self._browser_failure_meta(account_id, provider_mode or "native_chrome")
+
+        def finish(
+            success: bool,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "success": success,
+                "ok": success,
+                "action": action,
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "requested_channel_url": requested_channel_url,
+                "final_page_url": "",
+                "latest_message_selector": "",
+                "latest_message_text_preview": "",
+                "latest_message_html_summary": "",
+                "message_menu_opened": False,
+                "message_menu_selector": "",
+                "forward_option_found": False,
+                "forward_option_selector": "",
+                "forward_picker_visible": False,
+                "forward_picker_selector": "",
+                "candidate_debug": candidate_debug,
+                "click_attempts": click_attempts,
+                "visible_menu_text": "",
+                "failed_step": failed_step,
+                "last_successful_step": last_successful_step,
+                "error_code": error_code,
+                "error_message": error_message,
+                "screenshot_path": "",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "step_results": step_results,
+                **browser_meta,
             }
-        name = str(payload.get("contact_naming_value") or target.get("name") or phone).strip()
-        return {
-            "success": True,
-            "source_channel_url": channel_url,
-            "context": {
-                "channel_url": channel_url,
-                "message_selector": {"strategy": "latest_visible"},
-                "contacts": [
+            if extra:
+                payload.update(extra)
+            return payload
+
+        if not _valid_bale_channel_uid(source_channel_uid):
+            self._add_step(step_results, "validate_source_channel_uid", "failed", error_code="invalid_source_channel_uid", source_channel_uid=source_channel_uid)
+            return finish(
+                False,
+                "invalid_source_channel_uid",
+                "source_channel_uid must contain only letters, numbers, underscore, or dash",
+                "validate_source_channel_uid",
+            )
+
+        requested_channel_url = f"{self.web_url}/chat?uid={source_channel_uid}"
+        self._add_step(step_results, "validate_source_channel_uid", "success", source_channel_uid=source_channel_uid, requested_channel_url=requested_channel_url)
+        last_successful_step = "validate_source_channel_uid"
+        page = None
+
+        try:
+            with self._page_session(account_id, provider_mode=provider_mode or "native_chrome") as (page, session_meta):
+                browser_meta = session_meta
+                self._goto_with_timeout(page, requested_channel_url, timeout_ms=15000, wait_until="load")
+                last_successful_step = "navigate_source_channel"
+                self._add_step(step_results, "navigate_source_channel", "success", requested_channel_url=requested_channel_url, final_page_url=_safe_page_url(page))
+
+                readiness: dict[str, Any] = {}
+                for attempt_index in range(1, 11):
+                    readiness = self._source_channel_readiness(page)
+                    ready = bool(readiness.get("ready"))
+                    self._add_step(
+                        step_results,
+                        "wait_source_channel_ready",
+                        "success" if ready else "pending",
+                        attempt=attempt_index,
+                        final_page_url=_safe_page_url(page),
+                        target_channel_panel_visible=bool(readiness.get("target_channel_panel_visible")),
+                        message_stream_visible=bool(readiness.get("message_stream_visible")),
+                        message_stream_selector=str(readiness.get("message_stream_selector") or ""),
+                    )
+                    if ready:
+                        last_successful_step = "wait_source_channel_ready"
+                        break
+                    _safe_wait_for_timeout(page, 500)
+
+                if not readiness.get("ready"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "source_channel_not_ready",
+                        "Bale source channel message stream was not detected",
+                        "wait_source_channel_ready",
+                        {
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                            **readiness,
+                        },
+                    )
+
+                latest = self._resolve_latest_forward_message_target(page)
+                candidate_debug = latest.get("candidate_debug") if isinstance(latest.get("candidate_debug"), list) else []
+                self._add_step(
+                    step_results,
+                    "locate_latest_channel_message",
+                    "success" if latest.get("message_found") else "failed",
+                    candidate_count=int(latest.get("candidate_count") or 0),
+                    latest_message_selector=str(latest.get("latest_message_selector") or ""),
+                )
+                if not latest.get("message_found"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "latest_message_not_found",
+                        "No latest real message was found inside the Bale source channel stream",
+                        "locate_latest_channel_message",
+                        {
+                            **latest,
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                        },
+                    )
+
+                last_successful_step = "locate_latest_channel_message"
+                latest_selector = str(latest.get("latest_message_selector") or "")
+                latest_text = str(latest.get("latest_message_text_preview") or latest.get("text_preview") or "")
+                locator = page.locator(latest_selector).first
+                try:
+                    locator.scroll_into_view_if_needed(timeout=1000)
+                except Exception:
+                    pass
+                try:
+                    locator.hover(timeout=1000)
+                except Exception as hover_error:
+                    click_attempts.append({"step": "hover_latest_message", "status": "failed", "selector": latest_selector, "error": str(hover_error)})
+                else:
+                    click_attempts.append({"step": "hover_latest_message", "status": "success", "selector": latest_selector})
+
+                menu_state = self._message_forward_menu_candidates(page, latest_selector)
+                candidate_debug.extend(menu_state.get("candidate_debug") if isinstance(menu_state.get("candidate_debug"), list) else [])
+                menu_selector = str(menu_state.get("message_menu_selector") or "")
+                self._add_step(
+                    step_results,
+                    "discover_message_menu",
+                    "success" if menu_selector else "failed",
+                    message_menu_selector=menu_selector,
+                    attempted_selectors=menu_state.get("attempted_selectors") or [],
+                )
+                if not menu_selector:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "message_menu_not_found",
+                        "No message context menu control was found inside the latest message",
+                        "discover_message_menu",
+                        {
+                            **latest,
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                            "selector_attempts": menu_state.get("attempted_selectors") or [],
+                        },
+                    )
+
+                menu_click = self._click_selector_short(page, menu_selector, timeout_ms=1000)
+                menu_click["step"] = "open_message_menu"
+                click_attempts.append(menu_click)
+                menu_opened = menu_click.get("status") == "success"
+                self._add_step(step_results, "open_message_menu", "success" if menu_opened else "failed", click_result=menu_click)
+                if not menu_opened:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "message_menu_open_failed",
+                        "Latest message context menu control could not be clicked",
+                        "open_message_menu",
+                        {
+                            **latest,
+                            "message_menu_selector": menu_selector,
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                        },
+                    )
+
+                last_successful_step = "open_message_menu"
+                _safe_wait_for_timeout(page, 300)
+                forward_state = self._forward_option_candidates(page)
+                candidate_debug.extend(forward_state.get("candidate_debug") if isinstance(forward_state.get("candidate_debug"), list) else [])
+                forward_selector = str(forward_state.get("forward_option_selector") or "")
+                self._add_step(
+                    step_results,
+                    "discover_forward_option",
+                    "success" if forward_selector else "failed",
+                    forward_option_selector=forward_selector,
+                    visible_menu_text=str(forward_state.get("visible_menu_text") or ""),
+                )
+                if not forward_selector:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "forward_option_not_found",
+                        "Forward option was not found in the opened message menu",
+                        "discover_forward_option",
+                        {
+                            **latest,
+                            "message_menu_opened": True,
+                            "message_menu_selector": menu_selector,
+                            "visible_menu_text": str(forward_state.get("visible_menu_text") or ""),
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                        },
+                    )
+
+                forward_click = self._click_selector_short(page, forward_selector, timeout_ms=1000)
+                forward_click["step"] = "click_forward_option"
+                click_attempts.append(forward_click)
+                forward_clicked = forward_click.get("status") == "success"
+                self._add_step(step_results, "click_forward_option", "success" if forward_clicked else "failed", click_result=forward_click)
+                if not forward_clicked:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "forward_option_not_found",
+                        "Forward option could not be clicked",
+                        "click_forward_option",
+                        {
+                            **latest,
+                            "message_menu_opened": True,
+                            "message_menu_selector": menu_selector,
+                            "forward_option_found": True,
+                            "forward_option_selector": forward_selector,
+                            "visible_menu_text": str(forward_state.get("visible_menu_text") or ""),
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                        },
+                    )
+
+                last_successful_step = "click_forward_option"
+                _safe_wait_for_timeout(page, 500)
+                picker_state = self._forward_picker_state(page)
+                picker_visible = bool(picker_state.get("forward_picker_visible"))
+                picker_selector = str(picker_state.get("forward_picker_selector") or "")
+                self._add_step(step_results, "verify_forward_picker", "success" if picker_visible else "failed", forward_picker_selector=picker_selector)
+                if not picker_visible:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(
+                        False,
+                        "forward_picker_not_visible",
+                        "Forward recipient picker was not visible after clicking Forward",
+                        "verify_forward_picker",
+                        {
+                            **latest,
+                            "message_menu_opened": True,
+                            "message_menu_selector": menu_selector,
+                            "forward_option_found": True,
+                            "forward_option_selector": forward_selector,
+                            "forward_picker_selector": picker_selector,
+                            "visible_menu_text": str(forward_state.get("visible_menu_text") or ""),
+                            "final_page_url": _safe_page_url(page),
+                            "screenshot_path": screenshot_path,
+                        },
+                    )
+
+                last_successful_step = "verify_forward_picker"
+                self.browser_manager.save_session(account_id)
+                return finish(
+                    True,
+                    extra={
+                        **latest,
+                        "latest_message_text_preview": latest_text,
+                        "message_menu_opened": True,
+                        "message_menu_selector": menu_selector,
+                        "forward_option_found": True,
+                        "forward_option_selector": forward_selector,
+                        "forward_picker_visible": True,
+                        "forward_picker_selector": picker_selector,
+                        "visible_menu_text": str(forward_state.get("visible_menu_text") or ""),
+                        "final_page_url": _safe_page_url(page),
+                    },
+                )
+        except Exception as exc:
+            diagnostics = self._page_debug_info(page, account_id) if page is not None else {}
+            return finish(
+                False,
+                _browser_error_code(exc),
+                str(exc),
+                "open_message_forward",
+                {
+                    "final_page_url": diagnostics.get("page_url") or diagnostics.get("current_url") or "",
+                    "screenshot_path": diagnostics.get("screenshot_path") or "",
+                },
+            )
+
+    def forward_message_to_contact(
+        self,
+        account_id: str,
+        source_channel_uid: str,
+        display_name: str,
+        dry_run: bool = False,
+        selection_only: bool = False,
+        provider_mode: str | None = None,
+        runtime_session: Any | None = None,
+        close_session_when_done: bool = True,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        action = "forward_message_to_contact"
+        source_channel_uid = str(source_channel_uid or "").strip()
+        display_name = str(display_name or "").strip()
+        requested_channel_url = ""
+        step_results: list[dict[str, Any]] = []
+        click_attempts: list[dict[str, Any]] = []
+        candidate_debug: list[dict[str, Any]] = []
+        recipient_candidate_debug: list[dict[str, Any]] = []
+        destructive_clicks_attempted = 0
+        confirm_click_count = 0
+        click_classifications: list[dict[str, Any]] = []
+        clicks_before_search = 0
+        preselected_count_initial = 0
+        preselected_names_initial: list[Any] = []
+        reset_attempted = False
+        escape_pressed = False
+        picker_closed_after_escape = False
+        page_reloaded = False
+        channel_verified_after_reload = False
+        picker_reopened = False
+        selected_count_after_reset = 0
+        selected_names_after_reset: list[Any] = []
+        reset_cycle_count = 0
+        last_successful_step: str | None = None
+        browser_meta = self._browser_failure_meta(account_id, provider_mode or "native_chrome")
+
+        def finish(
+            success: bool,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "success": success,
+                "ok": success,
+                "action": action,
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "display_name": display_name,
+                "dry_run": bool(dry_run),
+                "selection_only": bool(selection_only),
+                "destructive_clicks_attempted": destructive_clicks_attempted,
+                "clicks_before_search": clicks_before_search,
+                "recipient_click_count": 0,
+                "recipient_picker_visible": False,
+                "recipient_search_selector": "",
+                "searched_value": display_name,
+                "exact_recipient_found": False,
+                "recipient_result_selector": "",
+                "target_row_selector": "",
+                "target_row_text": "",
+                "target_click_selector": "",
+                "target_click_bounding_box": None,
+                "target_click_point": None,
+                "element_from_point_tag": "",
+                "element_from_point_text": "",
+                "element_from_point_row_name": "",
+                "overlapping_recipient_rows": [],
+                "selected_names_immediately_after_click": [],
+                "selected_names_after_500ms": [],
+                "sahar_selected_immediately": False,
+                "sahar_selected_after_500ms": False,
+                "dom_mutations_after_click": {},
+                "recipient_selected": False,
+                "confirm_button_selector": "",
+                "confirm_clicked": False,
+                "confirm_click_count": confirm_click_count,
+                "final_forwarded_recipient_count": 0,
+                "forward_verified": False,
+                "success_toast_text": "",
+                "verified_forwarded_recipient_count": 0,
+                "verified_forward_recipient_count": 0,
+                "diagnostics_consistent": False,
+                "diagnostics_consistency_errors": [],
+                "candidate_debug": candidate_debug,
+                "recipient_candidate_debug": recipient_candidate_debug,
+                "click_classifications": click_classifications,
+                "preselected_count": 0,
+                "preselected_names": [],
+                "preselected_count_initial": preselected_count_initial,
+                "preselected_names_initial": preselected_names_initial,
+                "reset_attempted": reset_attempted,
+                "escape_pressed": escape_pressed,
+                "picker_closed_after_escape": picker_closed_after_escape,
+                "page_reloaded": page_reloaded,
+                "channel_verified_after_reload": channel_verified_after_reload,
+                "picker_reopened": picker_reopened,
+                "selected_count_after_reset": selected_count_after_reset,
+                "selected_names_after_reset": selected_names_after_reset,
+                "reset_cycle_count": reset_cycle_count,
+                "cleared_preselected_count": 0,
+                "search_input_selector": "",
+                "search_input_value": "",
+                "result_set_stable": False,
+                "visible_result_count": 0,
+                "visible_result_names": [],
+                "exact_match_count": 0,
+                "selected_count_before_target": 0,
+                "selected_count_after_target": 0,
+                "selected_names_after_target": [],
+                "selected_count_before_confirm": 0,
+                "selected_names_before_confirm": [],
+                "requested_source_channel_uid": source_channel_uid,
+                "configured_source_channel_uid": source_channel_uid,
+                "effective_source_channel_uid": source_channel_uid,
+                "source_channel_value_origin": "request",
+                "final_channel_url": "",
+                "channel_uid_verified": False,
+                "selected_message_preview": "",
+                "selected_message_data_date": None,
+                "selected_message_signature": "",
+                "picker_outer_html_excerpt": "",
+                "modal_root_selector": "",
+                "modal_root_outer_html_excerpt": "",
+                "picker_bounding_box": None,
+                "picker_search_inputs": [],
+                "visible_buttons": [],
+                "visible_rows": [],
+                "selected_row_candidates": [],
+                "selected_chip_candidates": [],
+                "selected_names_before_search": [],
+                "selected_count_before_search": 0,
+                "sahar_selected": False,
+                "rejected_selected_candidates": [],
+                "rejected_candidate_reasons": [],
+                "remove_control_candidates": [],
+                "destructive_recipient_clicks": destructive_clicks_attempted,
+                "click_attempts": click_attempts,
+                "failed_step": failed_step,
+                "last_successful_step": last_successful_step,
+                "error_code": error_code,
+                "error_message": error_message,
+                "screenshot_path": "",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "step_results": step_results,
+                **browser_meta,
+            }
+            if extra:
+                payload.update(extra)
+            self._normalize_forward_message_to_contact_diagnostics(payload)
+            return payload
+
+        if not str(account_id or "").strip():
+            self._add_step(step_results, "validate_inputs", "failed", error_code="invalid_account_id")
+            return finish(False, "invalid_account_id", "account_id is required", "validate_inputs")
+        if not _valid_bale_channel_uid(source_channel_uid):
+            self._add_step(step_results, "validate_inputs", "failed", error_code="invalid_source_channel_uid")
+            return finish(False, "invalid_source_channel_uid", "source_channel_uid must contain only letters, numbers, underscore, or dash", "validate_inputs")
+        if not display_name:
+            self._add_step(step_results, "validate_inputs", "failed", error_code="invalid_display_name")
+            return finish(False, "invalid_display_name", "display_name is required", "validate_inputs")
+
+        requested_channel_url = f"{self.web_url}/chat?uid={source_channel_uid}"
+        self._add_step(step_results, "validate_inputs", "success", requested_channel_url=requested_channel_url)
+        last_successful_step = "validate_inputs"
+        page = None
+
+        try:
+            with self._runtime_or_page_session(account_id, provider_mode=provider_mode or "native_chrome", runtime_session=runtime_session) as (page, session_meta):
+                browser_meta = session_meta
+                self._goto_with_timeout(page, requested_channel_url, timeout_ms=15000, wait_until="load")
+                last_successful_step = "navigate_source_channel"
+                self._add_step(step_results, "navigate_source_channel", "success", requested_channel_url=requested_channel_url, final_page_url=_safe_page_url(page))
+                if f"uid={source_channel_uid}" not in _safe_page_url(page):
+                    return finish(False, "channel_navigation_not_verified", "Opened channel URL did not verify the requested uid", "navigate_source_channel", {"final_page_url": _safe_page_url(page), "final_channel_url": _safe_page_url(page)})
+
+                readiness: dict[str, Any] = {}
+                for attempt_index in range(1, 11):
+                    readiness = self._source_channel_readiness(page)
+                    ready = bool(readiness.get("ready"))
+                    self._add_step(step_results, "wait_source_channel_ready", "success" if ready else "pending", attempt=attempt_index, message_stream_selector=str(readiness.get("message_stream_selector") or ""))
+                    if ready:
+                        last_successful_step = "wait_source_channel_ready"
+                        break
+                    _safe_wait_for_timeout(page, 500)
+                if not readiness.get("ready"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "source_channel_not_ready", "Bale source channel message stream was not detected", "wait_source_channel_ready", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **readiness})
+
+                latest = self._resolve_latest_forward_message_target(page)
+                candidate_debug = latest.get("candidate_debug") if isinstance(latest.get("candidate_debug"), list) else []
+                self._add_step(
+                    step_results,
+                    "locate_latest_channel_message",
+                    "success" if latest.get("message_found") else "failed",
+                    latest_message_selector=str(latest.get("latest_message_selector") or ""),
+                    selected_message_preview=str(latest.get("latest_message_text_preview") or ""),
+                    selected_message_data_date=latest.get("latest_message_data_date"),
+                    selected_message_signature=str(latest.get("latest_message_signature") or ""),
+                )
+                if not latest.get("message_found"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "latest_message_not_found", "No latest real message was found inside the Bale source channel stream", "locate_latest_channel_message", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **latest})
+
+                last_successful_step = "locate_latest_channel_message"
+                latest_selector = str(latest.get("latest_message_selector") or "")
+                locator = page.locator(latest_selector).first
+                try:
+                    locator.scroll_into_view_if_needed(timeout=1000)
+                    locator.hover(timeout=1000)
+                    click_attempts.append({"step": "hover_latest_message", "status": "success", "selector": latest_selector})
+                except Exception as hover_error:
+                    click_attempts.append({"step": "hover_latest_message", "status": "failed", "selector": latest_selector, "error": str(hover_error)})
+
+                menu_state = self._message_forward_menu_candidates(page, latest_selector)
+                candidate_debug.extend(menu_state.get("candidate_debug") if isinstance(menu_state.get("candidate_debug"), list) else [])
+                menu_selector = str(menu_state.get("message_menu_selector") or "")
+                self._add_step(step_results, "discover_message_menu", "success" if menu_selector else "failed", message_menu_selector=menu_selector)
+                if not menu_selector:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "message_menu_not_found", "No message context menu control was found inside the latest message", "discover_message_menu", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+                menu_click = self._click_selector_short(page, menu_selector, timeout_ms=1000)
+                menu_click["step"] = "open_message_menu"
+                click_attempts.append(menu_click)
+                if menu_click.get("status") != "success":
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "message_menu_open_failed", "Latest message context menu control could not be clicked", "open_message_menu", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+
+                last_successful_step = "open_message_menu"
+                _safe_wait_for_timeout(page, 300)
+                direct_picker_state = self._forward_picker_state(page)
+                if direct_picker_state.get("forward_picker_visible"):
+                    forward_selector = menu_selector
+                    self._add_step(step_results, "discover_forward_option", "success", forward_option_selector=forward_selector, direct_forward_picker=True)
+                else:
+                    forward_state = self._forward_option_candidates(page)
+                    candidate_debug.extend(forward_state.get("candidate_debug") if isinstance(forward_state.get("candidate_debug"), list) else [])
+                    forward_selector = str(forward_state.get("forward_option_selector") or "")
+                    self._add_step(step_results, "discover_forward_option", "success" if forward_selector else "failed", forward_option_selector=forward_selector)
+                    if not forward_selector:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_option_not_found", "Forward option was not found in the opened message menu", "discover_forward_option", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), "visible_menu_text": str(forward_state.get("visible_menu_text") or "")})
+                    forward_click = self._click_selector_short(page, forward_selector, timeout_ms=1000)
+                    forward_click["step"] = "click_forward_option"
+                    click_attempts.append(forward_click)
+                    if forward_click.get("status") != "success":
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_option_not_found", "Forward option could not be clicked", "click_forward_option", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+
+                last_successful_step = "click_forward_option"
+                _safe_wait_for_timeout(page, 500)
+                picker_state = self._forward_picker_state(page)
+                picker_visible = bool(picker_state.get("forward_picker_visible"))
+                self._add_step(step_results, "verify_forward_picker", "success" if picker_visible else "failed", forward_picker_selector=str(picker_state.get("forward_picker_selector") or ""))
+                if not picker_visible:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "recipient_picker_not_visible", "Forward recipient picker was not visible after clicking Forward", "verify_forward_picker", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page)})
+
+                last_successful_step = "verify_forward_picker"
+                picker_forensics = self._forward_picker_forensics(page, display_name)
+                if dry_run:
+                    if destructive_clicks_attempted:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "dry_run_safety_violation", "Dry-run attempted a destructive click", "dry_run_forensic_inspection", {"screenshot_path": screenshot_path, **picker_forensics})
+                    self._add_step(step_results, "dry_run_forensic_inspection", "success", destructive_clicks_attempted=0)
+                    return finish(True, extra={
+                        "recipient_picker_visible": True,
+                        "forward_verified": False,
+                        "confirm_clicked": False,
+                        "final_page_url": _safe_page_url(page),
+                        "final_channel_url": _safe_page_url(page),
+                        "channel_uid_verified": True,
+                        **picker_forensics,
+                    })
+                preselected_state = self._forward_selected_recipients_state(page)
+                preselected_count = int(preselected_state.get("selected_count") or 0)
+                preselected_names = preselected_state.get("selected_names") if isinstance(preselected_state.get("selected_names"), list) else []
+                preselected_count_initial = preselected_count
+                preselected_names_initial = list(preselected_names)
+                self._add_step(step_results, "inspect_preselected_recipients", "success" if preselected_count == 0 else "pending", selected_count=preselected_count, selected_names=preselected_names)
+                if preselected_count:
+                    if reset_cycle_count >= 1:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "reset_cycle_limit_reached", "Forward recipient reset cycle limit was reached", "inspect_preselected_recipients", {"recipient_picker_visible": True, "preselected_count": preselected_count, "preselected_names": preselected_names, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **picker_forensics})
+                    reset_attempted = True
+                    reset_cycle_count += 1
+                    self._press_key(page, "Escape")
+                    escape_pressed = True
+                    _safe_wait_for_timeout(page, 300)
+                    closed_state = self._forward_picker_state(page)
+                    picker_closed_after_escape = not bool(closed_state.get("forward_picker_visible"))
+                    self._add_step(step_results, "close_preselected_forward_picker", "success" if picker_closed_after_escape else "failed", preselected_count=preselected_count, preselected_names=preselected_names, escape_pressed=True, picker_closed_after_escape=picker_closed_after_escape)
+                    if not picker_closed_after_escape:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_picker_close_failed", "Forward picker did not close after Escape", "close_preselected_forward_picker", {"recipient_picker_visible": True, "preselected_count": preselected_count, "preselected_names": preselected_names, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **picker_forensics})
+
+                    try:
+                        self._goto_with_timeout(page, requested_channel_url, timeout_ms=15000, wait_until="load")
+                        page_reloaded = True
+                    except Exception as reload_error:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "channel_reload_failed", str(reload_error), "reload_source_channel_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+                    channel_verified_after_reload = f"uid={source_channel_uid}" in _safe_page_url(page)
+                    self._add_step(step_results, "reload_source_channel_after_forward_reset", "success" if channel_verified_after_reload else "failed", requested_channel_url=requested_channel_url, final_page_url=_safe_page_url(page), channel_verified_after_reload=channel_verified_after_reload)
+                    if not channel_verified_after_reload:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "channel_reload_failed", "Reloaded channel URL did not verify the requested uid", "reload_source_channel_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+
+                    reset_readiness: dict[str, Any] = {}
+                    for attempt_index in range(1, 11):
+                        reset_readiness = self._source_channel_readiness(page)
+                        ready = bool(reset_readiness.get("ready"))
+                        self._add_step(step_results, "wait_source_channel_ready_after_forward_reset", "success" if ready else "pending", attempt=attempt_index, message_stream_selector=str(reset_readiness.get("message_stream_selector") or ""))
+                        if ready:
+                            break
+                        _safe_wait_for_timeout(page, 500)
+                    if not reset_readiness.get("ready"):
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "channel_reload_failed", "Bale source channel message stream was not detected after reset reload", "wait_source_channel_ready_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **reset_readiness})
+
+                    latest_after_reset = self._resolve_latest_forward_message_target(page)
+                    reset_latest_selector = str(latest_after_reset.get("latest_message_selector") or "")
+                    self._add_step(
+                        step_results,
+                        "locate_latest_channel_message_after_forward_reset",
+                        "success" if latest_after_reset.get("message_found") else "failed",
+                        latest_message_selector=reset_latest_selector,
+                        selected_message_preview=str(latest_after_reset.get("latest_message_text_preview") or ""),
+                        selected_message_data_date=latest_after_reset.get("latest_message_data_date"),
+                        selected_message_signature=str(latest_after_reset.get("latest_message_signature") or ""),
+                    )
+                    if not latest_after_reset.get("message_found"):
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_picker_reopen_failed", "No latest real message was found after reset reload", "locate_latest_channel_message_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **latest_after_reset})
+                    latest_selector = reset_latest_selector
+                    locator = page.locator(latest_selector).first
+                    try:
+                        locator.scroll_into_view_if_needed(timeout=1000)
+                        locator.hover(timeout=1000)
+                        click_attempts.append({"step": "hover_latest_message_after_forward_reset", "status": "success", "selector": latest_selector})
+                    except Exception as hover_error:
+                        click_attempts.append({"step": "hover_latest_message_after_forward_reset", "status": "failed", "selector": latest_selector, "error": str(hover_error)})
+
+                    menu_state = self._message_forward_menu_candidates(page, latest_selector)
+                    candidate_debug.extend(menu_state.get("candidate_debug") if isinstance(menu_state.get("candidate_debug"), list) else [])
+                    menu_selector = str(menu_state.get("message_menu_selector") or "")
+                    self._add_step(step_results, "discover_message_menu_after_forward_reset", "success" if menu_selector else "failed", message_menu_selector=menu_selector)
+                    if not menu_selector:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_picker_reopen_failed", "No message context menu control was found after reset reload", "discover_message_menu_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+                    menu_click = self._click_selector_short(page, menu_selector, timeout_ms=1000)
+                    menu_click["step"] = "open_message_menu_after_forward_reset"
+                    click_attempts.append(menu_click)
+                    if menu_click.get("status") != "success":
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_picker_reopen_failed", "Latest message context menu control could not be clicked after reset reload", "open_message_menu_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+
+                    _safe_wait_for_timeout(page, 300)
+                    direct_picker_state = self._forward_picker_state(page)
+                    if direct_picker_state.get("forward_picker_visible"):
+                        forward_selector = menu_selector
+                        self._add_step(step_results, "discover_forward_option_after_forward_reset", "success", forward_option_selector=forward_selector, direct_forward_picker=True)
+                    else:
+                        forward_state = self._forward_option_candidates(page)
+                        candidate_debug.extend(forward_state.get("candidate_debug") if isinstance(forward_state.get("candidate_debug"), list) else [])
+                        forward_selector = str(forward_state.get("forward_option_selector") or "")
+                        self._add_step(step_results, "discover_forward_option_after_forward_reset", "success" if forward_selector else "failed", forward_option_selector=forward_selector)
+                        if not forward_selector:
+                            screenshot_path = _save_login_debug_screenshot(page, account_id)
+                            return finish(False, "forward_picker_reopen_failed", "Forward option was not found after reset reload", "discover_forward_option_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), "visible_menu_text": str(forward_state.get("visible_menu_text") or "")})
+                        forward_click = self._click_selector_short(page, forward_selector, timeout_ms=1000)
+                        forward_click["step"] = "click_forward_option_after_forward_reset"
+                        click_attempts.append(forward_click)
+                        if forward_click.get("status") != "success":
+                            screenshot_path = _save_login_debug_screenshot(page, account_id)
+                            return finish(False, "forward_picker_reopen_failed", "Forward option could not be clicked after reset reload", "click_forward_option_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+
+                    _safe_wait_for_timeout(page, 500)
+                    picker_state = self._forward_picker_state(page)
+                    picker_visible = bool(picker_state.get("forward_picker_visible"))
+                    picker_reopened = picker_visible
+                    self._add_step(step_results, "verify_forward_picker_after_forward_reset", "success" if picker_visible else "failed", forward_picker_selector=str(picker_state.get("forward_picker_selector") or ""), picker_reopened=picker_reopened)
+                    if not picker_visible:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "forward_picker_reopen_failed", "Forward recipient picker was not visible after reset reopen", "verify_forward_picker_after_forward_reset", {"screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page)})
+
+                    picker_forensics = self._forward_picker_forensics(page, display_name)
+                    reset_selected_state = self._forward_selected_recipients_state(page)
+                    selected_count_after_reset = int(reset_selected_state.get("selected_count") or 0)
+                    selected_names_after_reset = reset_selected_state.get("selected_names") if isinstance(reset_selected_state.get("selected_names"), list) else []
+                    self._add_step(step_results, "inspect_preselected_recipients_after_forward_reset", "success" if selected_count_after_reset == 0 else "failed", selected_count=selected_count_after_reset, selected_names=selected_names_after_reset)
+                    if selected_count_after_reset != 0:
+                        screenshot_path = _save_login_debug_screenshot(page, account_id)
+                        return finish(False, "stale_forward_recipient_state", "Forward picker still contained preselected recipients after the reset cycle", "inspect_preselected_recipients_after_forward_reset", {"recipient_picker_visible": True, "preselected_count": preselected_count, "preselected_names": preselected_names, "selected_count_after_reset": selected_count_after_reset, "selected_names_after_reset": selected_names_after_reset, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **picker_forensics})
+
+                search_state = self._forward_recipient_search_state(page)
+                candidate_debug.extend(search_state.get("candidate_debug") if isinstance(search_state.get("candidate_debug"), list) else [])
+                search_selector = str(search_state.get("recipient_search_selector") or "")
+                self._add_step(step_results, "inspect_recipient_search_input", "success" if search_selector else "failed", recipient_search_selector=search_selector, selector_attempts=search_state.get("selector_attempts") or [])
+                if not search_selector:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "recipient_search_input_not_found", "Recipient picker search input was not found", "inspect_recipient_search_input", {"recipient_picker_visible": True, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "selector_attempts": search_state.get("selector_attempts") or []})
+                if clicks_before_search:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "click_before_search_detected", "Recipient picker click was detected before search fill", "inspect_recipient_search_input", {"recipient_picker_visible": True, "clicks_before_search": clicks_before_search, "screenshot_path": screenshot_path})
+
+                page.locator(search_selector).first.fill(display_name, timeout=min(self.default_timeout_ms, 1500))
+                search_input_value = self._forward_search_input_value(page, search_selector)
+                if search_input_value != display_name:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "search_value_not_verified", "Recipient search input value did not match the exact display name", "search_recipient", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page)})
+                _safe_wait_for_timeout(page, 500)
+                last_successful_step = "search_recipient"
+                self._add_step(step_results, "search_recipient", "success", recipient_search_selector=search_selector, searched_value=display_name, search_input_value=search_input_value, clicks_before_search=clicks_before_search)
+
+                stability_state = self._forward_recipient_results_stability(page, display_name)
+                if not stability_state.get("result_set_stable"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "recipient_results_not_stable", "Recipient results did not remain stable for the required interval", "inspect_recipient_results", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **stability_state})
+
+                recipient_state = stability_state
+                candidates = recipient_state.get("recipient_candidates") if isinstance(recipient_state.get("recipient_candidates"), list) else []
+                candidate_debug.extend(candidates)
+                recipient_candidate_debug = candidates
+                exact_matches = [item for item in candidates if isinstance(item, dict) and item.get("exact_match")]
+                visible_result_count = int(recipient_state.get("visible_result_count") or len(candidates))
+                visible_result_names = recipient_state.get("visible_result_names") if isinstance(recipient_state.get("visible_result_names"), list) else [str(item.get("row_name") or item.get("text") or "") for item in candidates if isinstance(item, dict)]
+                self._add_step(step_results, "inspect_recipient_results", "success" if len(exact_matches) == 1 and visible_result_count == 1 else "failed", exact_match_count=len(exact_matches), candidate_count=len(candidates), visible_result_count=visible_result_count, visible_result_names=visible_result_names)
+                if not exact_matches:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "recipient_not_found", "No exact recipient match was found", "inspect_recipient_results", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "exact_match_count": 0, "visible_result_count": visible_result_count, "visible_result_names": visible_result_names, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+                if visible_result_count != 1:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "recipient_results_not_unique", "Recipient search did not reduce the picker to exactly one visible result", "inspect_recipient_results", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "exact_recipient_found": len(exact_matches) == 1, "exact_match_count": len(exact_matches), "visible_result_count": visible_result_count, "visible_result_names": visible_result_names, "target_row_name": str(exact_matches[0].get("row_name") or exact_matches[0].get("exact_text") or "") if exact_matches else "", "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), "recipient_candidates": candidates})
+                if len(exact_matches) != 1:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "exact_recipient_not_only_result", "The single visible result was not exactly the requested recipient", "inspect_recipient_results", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "exact_recipient_found": False, "exact_match_count": len(exact_matches), "visible_result_count": visible_result_count, "visible_result_names": visible_result_names, "target_row_name": visible_result_names[0] if visible_result_names else "", "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), "recipient_candidates": candidates})
+                if str(exact_matches[0].get("row_name") or exact_matches[0].get("exact_text") or "").strip() != display_name:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "exact_recipient_not_only_result", "The single visible result was not exactly the requested recipient", "inspect_recipient_results", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "exact_match_count": len(exact_matches), "visible_result_count": visible_result_count, "visible_result_names": visible_result_names, "target_row_name": str(exact_matches[0].get("row_name") or exact_matches[0].get("exact_text") or ""), "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), "recipient_candidates": candidates})
+
+                selected_before_target_state = self._forward_selected_recipients_state(page)
+                selected_count_before_target = int(selected_before_target_state.get("selected_count") or 0)
+                self._add_step(step_results, "verify_no_recipient_selected_before_target", "success" if selected_count_before_target == 0 else "failed", selected_count=selected_count_before_target, selected_names=selected_before_target_state.get("selected_names") or [])
+                if selected_count_before_target != 0:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "multiple_recipients_selected", "Recipient picker was not clean before selecting the target recipient", "verify_no_recipient_selected_before_target", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "selected_count_before_target": selected_count_before_target, "selected_names_before_confirm": selected_before_target_state.get("selected_names") or [], "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+
+                recipient_selector = str(exact_matches[0].get("click_selector") or exact_matches[0].get("selector") or "")
+                if not recipient_selector.startswith('[data-clinicos-recipient-result='):
+                    return finish(False, "destructive_click_blocked", "Recipient click selector was not classified as exact_recipient_select", "select_exact_recipient", {"recipient_result_selector": recipient_selector})
+                click_diagnostic = self._forward_recipient_click_diagnostic(page, recipient_selector, display_name)
+                if not click_diagnostic.get("click_safe"):
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "destructive_click_blocked", "Recipient click target was not proven to belong exclusively to the exact target row", "select_exact_recipient", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), "recipient_candidates": candidates, **click_diagnostic})
+                click_classifications.append({"category": "exact_recipient_select", "selector": recipient_selector, "status": "allowed"})
+                destructive_clicks_attempted += 1
+                select_click = self._click_selector_short(page, recipient_selector, timeout_ms=1000)
+                select_click["step"] = "select_exact_recipient"
+                click_attempts.append(select_click)
+                self._add_step(step_results, "select_exact_recipient", "success" if select_click.get("status") == "success" else "failed", recipient_result_selector=recipient_selector, click_result=select_click)
+                if select_click.get("status") != "success":
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "recipient_select_failed", "Exact recipient match could not be selected", "select_exact_recipient", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "exact_recipient_found": True, "recipient_result_selector": recipient_selector, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+
+                last_successful_step = "select_exact_recipient"
+                if selection_only:
+                    immediate_state = self._forward_selected_recipients_state(page)
+                    immediate_snapshot = self._forward_modal_selection_snapshot(page, display_name)
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    _safe_wait_for_timeout(page, 500)
+                    delayed_state = self._forward_selected_recipients_state(page)
+                    delayed_snapshot = self._forward_modal_selection_snapshot(page, display_name)
+                    selected_names_immediate = immediate_state.get("selected_names") if isinstance(immediate_state.get("selected_names"), list) else []
+                    selected_names_delayed = delayed_state.get("selected_names") if isinstance(delayed_state.get("selected_names"), list) else []
+                    selection_only_ok = selected_names_delayed == [display_name]
+                    self._add_step(step_results, "selection_only_snapshot", "success" if selection_only_ok else "failed", selected_names_immediately_after_click=selected_names_immediate, selected_names_after_500ms=selected_names_delayed)
+                    selection_only_extra = {
+                        "recipient_picker_visible": True,
+                        "recipient_search_selector": search_selector,
+                        "search_input_selector": search_selector,
+                        "search_input_value": search_input_value,
+                        "clicks_before_search": clicks_before_search,
+                        "result_set_stable": True,
+                        "visible_result_count": visible_result_count,
+                        "visible_result_names": visible_result_names,
+                        "exact_recipient_found": True,
+                        "exact_match_count": len(exact_matches),
+                        "recipient_result_selector": recipient_selector,
+                        "recipient_selected": bool(selected_names_delayed),
+                        "recipient_click_count": 1,
+                        "confirm_clicked": False,
+                        "confirm_click_count": 0,
+                        "final_forwarded_recipient_count": 0,
+                        "forward_verified": False,
+                        "verified_forward_recipient_count": 0,
+                        "selected_count_before_target": selected_count_before_target,
+                        "selected_names_immediately_after_click": selected_names_immediate,
+                        "selected_names_after_click": selected_names_delayed,
+                        "selected_names_after_500ms": selected_names_delayed,
+                        "selected_count_immediately_after_click": int(immediate_state.get("selected_count") or 0),
+                        "selected_count_after_500ms": int(delayed_state.get("selected_count") or 0),
+                        "selected_count_after_target": int(delayed_state.get("selected_count") or 0),
+                        "selected_names_after_target": selected_names_delayed,
+                        "bale_target_selected": any(str(name).strip() == display_name for name in selected_names_delayed),
+                        "sahar_selected": any(str(name).strip().lower() == "sahar" for name in selected_names_delayed),
+                        "sahar_selected_immediately": any(str(name).strip().lower() == "sahar" for name in selected_names_immediate),
+                        "sahar_selected_after_500ms": any(str(name).strip().lower() == "sahar" for name in selected_names_delayed),
+                        "screenshot_path": screenshot_path,
+                        "final_page_url": _safe_page_url(page),
+                        "recipient_candidates": candidates,
+                        "dom_mutations_after_click": {"immediate": immediate_snapshot, "after_500ms": delayed_snapshot},
+                        **click_diagnostic,
+                    }
+                    if not selection_only_ok:
+                        return finish(False, "unexpected_selected_recipient", "Selection-only diagnostic did not produce exactly the requested recipient", "selection_only_snapshot", selection_only_extra)
+                    return finish(True, extra=selection_only_extra)
+                _safe_wait_for_timeout(page, 300)
+                selected_after_target_state = self._forward_selected_recipients_state(page)
+                selected_count_after_target = int(selected_after_target_state.get("selected_count") or 0)
+                selected_names_after_target = selected_after_target_state.get("selected_names") if isinstance(selected_after_target_state.get("selected_names"), list) else []
+                target_selected = selected_count_after_target == 1 and selected_names_after_target == [display_name]
+                self._add_step(step_results, "verify_target_recipient_selected", "success" if target_selected else "failed", selected_count=selected_count_after_target, selected_names=selected_names_after_target)
+                if not target_selected:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    error_code = "multiple_recipients_selected" if selected_count_after_target > 1 else "unexpected_selected_recipient"
+                    return finish(False, error_code, "Selected recipient did not resolve to exactly the requested target", "verify_target_recipient_selected", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": bool(selected_count_after_target), "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+
+                confirm_state = self._forward_confirm_button_state(page)
+                candidate_debug.extend(confirm_state.get("candidate_debug") if isinstance(confirm_state.get("candidate_debug"), list) else [])
+                confirm_selector = str(confirm_state.get("confirm_button_selector") or "")
+                self._add_step(step_results, "inspect_forward_confirm_button", "success" if confirm_selector else "failed", confirm_button_selector=confirm_selector)
+                if not confirm_selector:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "forward_confirm_button_not_found", "Forward confirmation button was not found or enabled", "inspect_forward_confirm_button", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": True, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+
+                before_confirm_state = self._forward_selected_recipients_state(page)
+                selected_count_before_confirm = int(before_confirm_state.get("selected_count") or 0)
+                selected_names_before_confirm = before_confirm_state.get("selected_names") if isinstance(before_confirm_state.get("selected_names"), list) else []
+                confirm_safe = selected_count_before_confirm == 1 and selected_names_before_confirm == [display_name]
+                self._add_step(step_results, "verify_target_recipient_before_confirm", "success" if confirm_safe else "failed", selected_count=selected_count_before_confirm, selected_names=selected_names_before_confirm)
+                if not confirm_safe:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    if selected_count_before_confirm > 1:
+                        error_code = "multiple_recipients_selected"
+                    elif selected_count_before_confirm == 1:
+                        error_code = "wrong_recipient_selected"
+                    else:
+                        error_code = "target_selection_not_verified"
+                    return finish(False, error_code, "Forward confirmation blocked because the selected recipient set was not exactly the requested target", "verify_target_recipient_before_confirm", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": bool(selected_count_before_confirm), "confirm_button_selector": confirm_selector, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "selected_count_before_confirm": selected_count_before_confirm, "selected_names_before_confirm": selected_names_before_confirm, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+
+                if not confirm_selector.startswith('[data-clinicos-forward-confirm='):
+                    return finish(False, "destructive_click_blocked", "Confirm click selector was not classified as forward_confirm", "click_forward_confirm", {"confirm_button_selector": confirm_selector})
+                click_classifications.append({"category": "forward_confirm", "selector": confirm_selector, "status": "allowed"})
+                destructive_clicks_attempted += 1
+                confirm_click_count += 1
+                if confirm_click_count > 1:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "destructive_click_blocked", "Forward confirmation click count exceeded one", "click_forward_confirm", {"screenshot_path": screenshot_path, "confirm_button_selector": confirm_selector})
+                confirm_click = self._click_selector_short(page, confirm_selector, timeout_ms=1000)
+                confirm_click["step"] = "click_forward_confirm"
+                click_attempts.append(confirm_click)
+                self._add_step(step_results, "click_forward_confirm", "success" if confirm_click.get("status") == "success" else "failed", confirm_button_selector=confirm_selector, click_result=confirm_click)
+                if confirm_click.get("status") != "success":
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "forward_confirm_failed", "Forward confirmation button could not be clicked", "click_forward_confirm", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": True, "confirm_button_selector": confirm_selector, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "selected_count_before_confirm": selected_count_before_confirm, "selected_names_before_confirm": selected_names_before_confirm, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
+
+                last_successful_step = "click_forward_confirm"
+                _safe_wait_for_timeout(page, 800)
+                verify_state = self._forward_success_state(page)
+                verified_forward_recipient_count = int(verify_state.get("verified_forward_recipient_count") or 0)
+                if verified_forward_recipient_count > 1:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "unexpected_forward_recipient_count", "Forward success text reported more than one recipient", "verify_forward_success", {"recipient_picker_visible": bool(verify_state.get("recipient_picker_visible", True)), "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": True, "confirm_button_selector": confirm_selector, "confirm_clicked": True, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "selected_count_before_confirm": selected_count_before_confirm, "selected_names_before_confirm": selected_names_before_confirm, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates, **verify_state})
+                verified = bool(verify_state.get("forward_verified"))
+                self._add_step(step_results, "verify_forward_success", "success" if verified else "failed", verification_method=str(verify_state.get("verification_method") or ""))
+                if not verified:
+                    screenshot_path = _save_login_debug_screenshot(page, account_id)
+                    return finish(False, "forward_not_verified", "Forward was not verified after confirmation", "verify_forward_success", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": True, "confirm_button_selector": confirm_selector, "confirm_clicked": True, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "selected_count_before_confirm": selected_count_before_confirm, "selected_names_before_confirm": selected_names_before_confirm, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates, **verify_state})
+
+                last_successful_step = "verify_forward_success"
+                self.browser_manager.save_session(account_id)
+                return finish(True, extra={"recipient_picker_visible": bool(verify_state.get("recipient_picker_visible", False)), "recipient_search_selector": search_selector, "search_input_selector": search_selector, "search_input_value": search_input_value, "clicks_before_search": clicks_before_search, "result_set_stable": True, "visible_result_count": visible_result_count, "visible_result_names": visible_result_names, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": True, "recipient_click_count": 1, "confirm_button_selector": confirm_selector, "confirm_clicked": True, "forward_verified": True, "final_forwarded_recipient_count": verified_forward_recipient_count, "preselected_count": preselected_count, "preselected_names": preselected_names, "cleared_preselected_count": 0, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "selected_names_after_click": selected_names_after_target, "sahar_selected": any(str(name).strip().lower() == "sahar" for name in selected_names_after_target), "selected_count_before_confirm": selected_count_before_confirm, "selected_names_before_confirm": selected_names_before_confirm, "final_page_url": _safe_page_url(page), "recipient_candidates": candidates, **click_diagnostic, **verify_state})
+        except Exception as exc:
+            diagnostics = self._page_debug_info(page, account_id) if page is not None else {}
+            return finish(False, _browser_error_code(exc), str(exc), "forward_message_to_contact", {"final_page_url": diagnostics.get("page_url") or diagnostics.get("current_url") or "", "screenshot_path": diagnostics.get("screenshot_path") or ""})
+
+    def forward_latest_channel_message(
+        self,
+        account_id: str,
+        phone: str,
+        source_channel_uid: str | None = None,
+        display_name: str | None = None,
+        recipient_id: str | None = None,
+        job_id: str | None = None,
+        campaign_id: str | None = None,
+        idempotency_key: str | None = None,
+        dry_run: bool = False,
+        provider_mode: str | None = None,
+        execution_plan: Any | None = None,
+        runtime_session: Any | None = None,
+        close_session_when_done: bool = True,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        action = "forward_latest_channel_message"
+        step_results: list[dict[str, Any]] = []
+        last_successful_step: str | None = None
+        account_id = str(account_id or "").strip()
+        requested_source_channel_uid = str(source_channel_uid or "").strip()
+        configured_source_channel_uid = ""
+        effective_source_channel_uid = ""
+        phone_input = phone
+        resolved_display_name = str(display_name or "").strip()
+        resolved_recipient_id = str(recipient_id or "").strip()
+        contact_reused = False
+        contact_created = False
+
+        def finish(
+            success: bool,
+            error_code: str | None = None,
+            error_message: str | None = None,
+            failed_step: str | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "success": success,
+                "ok": success,
+                "action": action,
+                "scenario_id": None,
+                "job_id": job_id,
+                "campaign_id": campaign_id,
+                "account_id": account_id,
+                "recipient_id": resolved_recipient_id,
+                "idempotency_key": idempotency_key,
+                "phone": phone_input,
+                "display_name": resolved_display_name,
+                "requested_source_channel_uid": requested_source_channel_uid,
+                "configured_source_channel_uid": configured_source_channel_uid,
+                "effective_source_channel_uid": effective_source_channel_uid,
+                "channel_uid_verified": False,
+                "contact_reused": contact_reused,
+                "contact_created": contact_created,
+                "selected_message_data_date": None,
+                "selected_message_preview": "",
+                "selected_message_signature": "",
+                "exact_match_count": 0,
+                "selected_names_before_confirm": [],
+                "confirm_click_count": 0,
+                "success_toast_text": "",
+                "verified_forwarded_recipient_count": 0,
+                "final_forwarded_recipient_count": 0,
+                "forward_verified": False,
+                "diagnostics_consistent": False,
+                "diagnostics_consistency_errors": [],
+                "failed_step": failed_step,
+                "last_successful_step": last_successful_step,
+                "error_code": error_code,
+                "error_message": error_message,
+                "screenshot_path": "",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+                "step_results": step_results,
+                "dry_run": bool(dry_run),
+            }
+            if extra:
+                payload.update(extra)
+            return payload
+
+        if isinstance(phone, (list, tuple, set)) or isinstance(display_name, (list, tuple, set)) or isinstance(account_id, (list, tuple, set)):
+            self._add_step(step_results, "validate_request", "failed", error_code="single_recipient_required")
+            return finish(False, "single_recipient_required", "One delivery job targets exactly one recipient through exactly one account", "validate_request")
+        phone_text = str(phone or "").strip()
+        if not account_id:
+            self._add_step(step_results, "validate_request", "failed", error_code="invalid_account_id")
+            return finish(False, "invalid_account_id", "account_id is required", "validate_request")
+        if not phone_text or any(separator in phone_text for separator in [",", ";", "\n", "\r", "|"]):
+            self._add_step(step_results, "validate_request", "failed", error_code="single_phone_required")
+            return finish(False, "single_phone_required", "Exactly one phone number is required", "validate_request")
+        if resolved_display_name and any(separator in resolved_display_name for separator in [",", ";", "\n", "\r", "|"]):
+            self._add_step(step_results, "validate_request", "failed", error_code="single_display_name_required")
+            return finish(False, "single_display_name_required", "Exactly one display name is allowed", "validate_request")
+        if not bale_account_store.get_account(account_id):
+            self._add_step(step_results, "validate_request", "failed", error_code="account_not_found", account_id=account_id)
+            return finish(False, "account_not_found", f"Bale account not found: {account_id}", "validate_request")
+        self._add_step(step_results, "validate_request", "success", account_id=account_id, phone=phone_text)
+        last_successful_step = "validate_request"
+
+        configured = bale_account_store.get_source_channel(account_id) or {}
+        configured_source_channel_uid = str(configured.get("source_channel_uid") or "")
+        try:
+            effective_source_channel_uid = normalize_source_channel_uid(requested_source_channel_uid or configured_source_channel_uid or configured.get("source_channel_url") or "")
+        except ValueError as exc:
+            self._add_step(step_results, "resolve_source_channel", "failed", error_code="source_channel_not_configured")
+            return finish(False, "source_channel_not_configured", str(exc), "resolve_source_channel")
+        requested_source_channel_uid = normalize_source_channel_uid(requested_source_channel_uid) if requested_source_channel_uid else ""
+        self._add_step(
+            step_results,
+            "resolve_source_channel",
+            "success",
+            requested_source_channel_uid=requested_source_channel_uid,
+            configured_source_channel_uid=configured_source_channel_uid,
+            effective_source_channel_uid=effective_source_channel_uid,
+        )
+        last_successful_step = "resolve_source_channel"
+
+        try:
+            resolved_contact, preexisting_contact = self.contact_store.get_or_create_bale_contact(account_id, phone_text)
+        except BaleContactError as exc:
+            self._add_step(step_results, "save_or_resolve_contact", "failed", error_code=exc.error_code, phone=phone_text)
+            return finish(False, exc.error_code, str(exc), "save_or_resolve_contact")
+
+        resolved_display_name = str(resolved_contact.get("display_name") or resolved_display_name).strip()
+        resolved_recipient_id = resolved_recipient_id or str(resolved_contact.get("id") or "")
+        contact_created = bool(preexisting_contact)
+        contact_reused = not bool(preexisting_contact)
+        if not preexisting_contact:
+            contact_result = {
+                "success": True,
+                "ok": True,
+                "action": "save_bale_contact",
+                "account_id": account_id,
+                "phone": phone_text,
+                "phone_normalized": str(resolved_contact.get("phone_normalized") or ""),
+                "display_name": resolved_display_name,
+                "contact_id": resolved_recipient_id,
+                "sequence_number": resolved_contact.get("sequence_number"),
+                "contact_store_status": "existing",
+                "contact_save_status": "already_exists",
+                "failed_step": None,
+                "last_successful_step": "resolve_contact_name",
+                "error_code": None,
+                "error_message": None,
+                "step_results": [
                     {
-                        "id": "target",
-                        "phone": phone,
-                        "name": name,
-                        "username": "",
+                        "step": "resolve_contact_name",
+                        "status": "success",
+                        "phone_normalized": str(resolved_contact.get("phone_normalized") or ""),
+                        "display_name": resolved_display_name,
+                        "contact_store_status": "existing",
+                        "contact_id": resolved_recipient_id,
+                        "sequence_number": resolved_contact.get("sequence_number"),
                     }
                 ],
-                "contact": {
-                    "id": "target",
-                    "phone": phone,
-                    "name": name,
-                    "username": "",
-                },
-                "method": "phone",
-                "phone_name": "phone",
-            },
+            }
+        else:
+            contact_result = self.save_bale_contact(
+                account_id,
+                phone_text,
+                provider_mode=provider_mode or "native_chrome",
+                runtime_session=runtime_session,
+                close_session_when_done=close_session_when_done,
+            )
+        step_results.append({"step": "save_or_resolve_contact", "status": "success" if contact_result.get("success") else "failed", "action_result": contact_result})
+        if not contact_result.get("success"):
+            return finish(
+                False,
+                str(contact_result.get("error_code") or "contact_save_failed"),
+                str(contact_result.get("error_message") or "Bale contact save failed"),
+                "save_or_resolve_contact",
+                {"screenshot_path": contact_result.get("screenshot_path") or "", "contact_result": contact_result},
+            )
+        resolved_display_name = str(contact_result.get("display_name") or resolved_display_name).strip()
+        resolved_recipient_id = resolved_recipient_id or str(contact_result.get("contact_id") or "")
+        last_successful_step = "save_or_resolve_contact"
+
+        forward_result = self.forward_message_to_contact(
+            account_id=account_id,
+            source_channel_uid=effective_source_channel_uid,
+            display_name=resolved_display_name,
+            dry_run=dry_run,
+            provider_mode=provider_mode or "native_chrome",
+            runtime_session=runtime_session,
+            close_session_when_done=close_session_when_done,
+        )
+        self._normalize_forward_message_to_contact_diagnostics(forward_result)
+        forward_steps = forward_result.get("step_results") if isinstance(forward_result.get("step_results"), list) else []
+        forward_extra = {
+            "channel_uid_verified": bool(forward_result.get("channel_uid_verified")),
+            "selected_message_data_date": forward_result.get("selected_message_data_date"),
+            "selected_message_preview": str(forward_result.get("selected_message_preview") or ""),
+            "selected_message_signature": str(forward_result.get("selected_message_signature") or ""),
+            "exact_match_count": int(forward_result.get("exact_match_count") or 0),
+            "selected_names_before_confirm": forward_result.get("selected_names_before_confirm") if isinstance(forward_result.get("selected_names_before_confirm"), list) else [],
+            "confirm_click_count": int(forward_result.get("confirm_click_count") or 0),
+            "success_toast_text": str(forward_result.get("success_toast_text") or ""),
+            "verified_forwarded_recipient_count": int(forward_result.get("verified_forwarded_recipient_count") or 0),
+            "final_forwarded_recipient_count": int(forward_result.get("final_forwarded_recipient_count") or 0),
+            "forward_verified": bool(forward_result.get("forward_verified")),
+            "diagnostics_consistent": bool(forward_result.get("diagnostics_consistent")),
+            "diagnostics_consistency_errors": forward_result.get("diagnostics_consistency_errors") if isinstance(forward_result.get("diagnostics_consistency_errors"), list) else [],
+            "screenshot_path": forward_result.get("screenshot_path") or "",
+            "forward_result": forward_result,
         }
+        step_results.append({"step": "open_source_channel", "status": "success" if any(step.get("step") == "wait_source_channel_ready" and step.get("status") == "success" for step in forward_steps if isinstance(step, dict)) else "failed" if not forward_result.get("success") and forward_result.get("failed_step") in {"navigate_source_channel", "wait_source_channel_ready"} else "success"})
+        if not forward_result.get("success") and forward_result.get("failed_step") in {"navigate_source_channel", "wait_source_channel_ready"}:
+            return finish(False, str(forward_result.get("error_code") or "source_channel_open_failed"), str(forward_result.get("error_message") or "Bale source channel verification failed"), "open_source_channel", forward_extra)
+        last_successful_step = "open_source_channel"
+
+        public_step_map = [
+            ("locate_latest_message", {"locate_latest_channel_message"}),
+            ("open_forward_picker", {"discover_message_menu", "open_message_menu", "discover_forward_option", "click_forward_option", "verify_forward_picker"}),
+            ("select_recipient", {"inspect_preselected_recipients", "inspect_preselected_recipients_after_forward_reset", "inspect_recipient_search_input", "search_recipient", "inspect_recipient_results", "verify_no_recipient_selected_before_target", "select_exact_recipient", "selection_only_snapshot", "verify_target_recipient_selected"}),
+            ("confirm_forward", {"inspect_forward_confirm_button", "verify_target_recipient_before_confirm", "click_forward_confirm"}),
+            ("verify_forward", {"verify_forward_success", "dry_run_forensic_inspection"}),
+        ]
+        failed_internal_step = str(forward_result.get("failed_step") or "")
+        failed_public_step = ""
+        for public_step, internal_names in public_step_map:
+            if dry_run and forward_result.get("success") and public_step in {"select_recipient", "confirm_forward", "verify_forward"}:
+                status = "skipped"
+                step_results.append({"step": public_step, "status": "skipped", "reason": "dry_run_no_recipient_selection_or_confirm"})
+            else:
+                status = "success" if any(isinstance(step, dict) and step.get("step") in internal_names and step.get("status") in {"success", "assumed_success"} for step in forward_steps) else "failed" if not forward_result.get("success") and str(forward_result.get("failed_step") or "") in internal_names else "pending"
+                step_results.append({"step": public_step, "status": status})
+            if status == "failed":
+                failed_public_step = public_step
+                return finish(False, str(forward_result.get("error_code") or "forward_failed"), str(forward_result.get("error_message") or "Bale forward failed"), public_step, forward_extra)
+            if status == "success":
+                last_successful_step = public_step
+            if failed_internal_step in internal_names and not failed_public_step:
+                failed_public_step = public_step
+
+        success = bool(forward_result.get("success"))
+        if success and not dry_run and int(forward_result.get("verified_forwarded_recipient_count") or 0) != 1:
+            success = False
+            failed_public_step = "verify_forward"
+            step_results.append({"step": "verify_forward_single_recipient_count", "status": "failed", "verified_forwarded_recipient_count": int(forward_result.get("verified_forwarded_recipient_count") or 0)})
+        if success and dry_run:
+            forward_extra.update(
+                {
+                    "diagnostics_consistent": True,
+                    "diagnostics_consistency_errors": [],
+                    "forward_verified": False,
+                    "confirm_click_count": 0,
+                    "verified_forwarded_recipient_count": 0,
+                    "final_forwarded_recipient_count": 0,
+                }
+            )
+        final_extra = {
+            "phone": str(contact_result.get("phone_normalized") or phone_text),
+            "display_name": resolved_display_name,
+            "recipient_id": resolved_recipient_id,
+            "contact_result": contact_result,
+            **forward_extra,
+        }
+        step_results.append({"step": "persist_result", "status": "success"})
+        last_successful_step = "persist_result"
+        return finish(
+            success,
+            None if success else str(forward_result.get("error_code") or "forward_failed"),
+            None if success else str(forward_result.get("error_message") or "Bale forward failed"),
+            None if success else (failed_public_step or str(forward_result.get("failed_step") or "verify_forward")),
+            final_extra,
+        )
+
+    def _normalize_forward_message_to_contact_diagnostics(self, payload: dict[str, Any]) -> None:
+        target = str(payload.get("display_name") or "").strip()
+        effective_uid = str(payload.get("effective_source_channel_uid") or payload.get("source_channel_uid") or "").strip()
+        steps = payload.get("step_results") if isinstance(payload.get("step_results"), list) else []
+
+        if not payload.get("channel_uid_verified"):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                if step.get("step") in {"navigate_source_channel", "reload_source_channel_after_forward_reset"} and step.get("status") == "success":
+                    final_url = str(step.get("final_page_url") or "")
+                    if effective_uid and f"uid={effective_uid}" in final_url:
+                        payload["channel_uid_verified"] = True
+                        break
+            if not payload.get("channel_uid_verified"):
+                final_url = str(payload.get("final_page_url") or payload.get("final_channel_url") or "")
+                if effective_uid and f"uid={effective_uid}" in final_url:
+                    payload["channel_uid_verified"] = True
+
+        latest_step = None
+        for step in steps:
+            if isinstance(step, dict) and step.get("step") in {"locate_latest_channel_message", "locate_latest_channel_message_after_forward_reset"} and step.get("status") == "success":
+                latest_step = step
+        if latest_step:
+            if not payload.get("selected_message_preview"):
+                payload["selected_message_preview"] = str(latest_step.get("selected_message_preview") or latest_step.get("latest_message_text_preview") or "")
+            if payload.get("selected_message_data_date") is None:
+                payload["selected_message_data_date"] = latest_step.get("selected_message_data_date")
+            if not payload.get("selected_message_signature"):
+                payload["selected_message_signature"] = str(latest_step.get("selected_message_signature") or "")
+
+        selected_before_confirm = payload.get("selected_names_before_confirm") if isinstance(payload.get("selected_names_before_confirm"), list) else []
+        selected_single_target = len(selected_before_confirm) == 1 and str(selected_before_confirm[0]).strip() == target
+        toast = str(payload.get("success_toast_text") or "")
+        multi_toast = bool(re.search(r"(?:\b[2-9]\b|[۲-۹٢-٩]|two|three|four|five|six|seven|eight|nine|دو|سه|چند)\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)", toast, re.IGNORECASE))
+        single_toast = bool(target and target in toast) or bool(re.search(r"(?:\b1\b|[۱١]|one|یک)\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)", toast, re.IGNORECASE))
+        canonical_count = 0
+        if multi_toast:
+            canonical_count = 2
+        elif bool(payload.get("forward_verified")) and selected_single_target and single_toast:
+            canonical_count = 1
+        payload["verified_forwarded_recipient_count"] = canonical_count
+        payload["verified_forward_recipient_count"] = canonical_count
+        payload["final_forwarded_recipient_count"] = canonical_count
+        payload["destructive_click_classifications"] = payload.get("click_classifications") if isinstance(payload.get("click_classifications"), list) else []
+
+        consistency_errors: list[str] = []
+        if payload.get("success") is True and payload.get("forward_verified") is not True:
+            consistency_errors.append("success_without_forward_verified")
+        if payload.get("forward_verified") is True and int(payload.get("confirm_click_count") or 0) != 1:
+            consistency_errors.append("forward_verified_without_single_confirm_click")
+        if payload.get("forward_verified") is True and canonical_count != 1:
+            consistency_errors.append("forward_verified_without_single_verified_recipient_count")
+        if payload.get("success") is True and payload.get("channel_uid_verified") is not True:
+            consistency_errors.append("success_without_channel_uid_verified")
+        if payload.get("success") is True and not selected_single_target:
+            consistency_errors.append("success_without_single_selected_recipient_before_confirm")
+        payload["diagnostics_consistency_errors"] = consistency_errors
+        payload["diagnostics_consistent"] = len(consistency_errors) == 0
 
     def save_contact_by_phone(
         self,
@@ -918,6 +2536,79 @@ class BalePlugin:
         )
 
     @contextmanager
+    def _runtime_or_page_session(self, account_id: str, provider_mode: str | None = None, runtime_session: Any | None = None) -> Any:
+        if runtime_session is not None:
+            page = getattr(runtime_session, "page", None)
+            if page is None and isinstance(runtime_session, dict):
+                page = runtime_session.get("page")
+            profile_path = getattr(runtime_session, "profile_path", "") if not isinstance(runtime_session, dict) else runtime_session.get("profile_path", "")
+            session_id = getattr(runtime_session, "session_id", "") if not isinstance(runtime_session, dict) else runtime_session.get("session_id", "")
+            yield (
+                page,
+                {
+                    "provider_mode": provider_mode or "native_chrome",
+                    "browser_reused": True,
+                    "session_reused": True,
+                    "session_id": session_id,
+                    "profile_dir": str(profile_path or ""),
+                    "browser_path": getattr(self.browser_manager, "last_browser_path", None),
+                },
+            )
+            return
+        with self._page_session(account_id, provider_mode=provider_mode) as session:
+            yield session
+
+    def create_reusable_runtime_session(self, account_id: str, provider_mode: str | None = None, profile_path: str | None = None) -> dict[str, Any]:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise BalePluginError("unknown_error", "Playwright is not installed or not importable") from exc
+
+        browser_path = resolve_system_browser_executable()
+        self.browser_manager.last_browser_path = browser_path
+        if not browser_path:
+            raise BalePluginError("browser_start_timeout", "No system Chrome/Edge found")
+
+        profile_dir = Path(profile_path) if profile_path else _native_profile_dir(account_id)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        playwright = sync_playwright().start()
+        context = None
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                executable_path=browser_path,
+                headless=False,
+                args=[],
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            return {
+                "playwright": playwright,
+                "context": context,
+                "page": page,
+                "profile_path": str(profile_dir),
+                "provider_mode": provider_mode or "native_chrome",
+                "browser_path": browser_path,
+            }
+        except Exception:
+            if context is not None:
+                context.close()
+            playwright.stop()
+            raise
+
+    def close_reusable_runtime_session(self, runtime_session: Any) -> dict[str, Any]:
+        metadata = getattr(runtime_session, "metadata", {}) or {}
+        context = getattr(runtime_session, "context", None)
+        playwright = metadata.get("playwright") if isinstance(metadata, dict) else None
+        try:
+            if context is not None:
+                context.close()
+            if playwright is not None:
+                playwright.stop()
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error_code": "session_close_failed", "message": str(exc)}
+
+    @contextmanager
     def _page_session(self, account_id: str, provider_mode: str | None = None) -> Any:
         account = bale_account_store.get_account(account_id) or {}
         effective_provider = str(provider_mode or account.get("browser_provider") or "native_chrome")
@@ -1065,6 +2756,1587 @@ class BalePlugin:
             "install_prompt_selector": install_prompt or "",
             "visible_text_sample": visible_text_sample,
             "login_detector_reason": detector_reason,
+        }
+
+    def classify_authentication_state(self, page: Any, timeout_ms: int = 3000) -> dict[str, Any]:
+        login = self._detect_login_state(page, timeout_ms=timeout_ms)
+        visible_text = _visible_text_sample(page, limit=1200)
+        text_lower = visible_text.lower()
+        page_url = _safe_page_url(page)
+        normalized_url = page_url.lower()
+        install_prompt = bool(login.get("install_prompt_detected"))
+        contacts_ui_available = bool(self._contacts_ui_visible(page))
+        strong_chat_evidence = bool(
+            login.get("chat_list_visible")
+            or login.get("message_input_detected")
+            or login.get("search_input_detected")
+            or login.get("search_icon_visible")
+            or contacts_ui_available
+        )
+        login_url_visible = "/login" in normalized_url
+        login_ui_visible = bool(login.get("login_page_detected") or login.get("login_form_visible") or (login_url_visible and not strong_chat_evidence))
+        chat_shell_visible = bool(strong_chat_evidence and not install_prompt and not login_ui_visible)
+        evidence: list[str] = []
+        if install_prompt:
+            evidence.append("install_help_prompt_visible")
+        if login_ui_visible:
+            evidence.append("login_ui_visible")
+        if chat_shell_visible:
+            evidence.append("chat_shell_visible")
+        if contacts_ui_available:
+            evidence.append("contacts_ui_available")
+
+        if "qr" in text_lower or "بارکد" in visible_text or "کیوآر" in visible_text:
+            auth_state = "qr_login_required"
+            error_code = "authentication_required"
+        elif "کد" in visible_text and ("تایید" in visible_text or "تأیید" in visible_text or "verification" in text_lower):
+            auth_state = "verification_code_required"
+            error_code = "authentication_required"
+        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["مسدود", "محدود"]):
+            auth_state = "account_restricted"
+            error_code = "account_restricted"
+        elif install_prompt:
+            auth_state = "install_help_prompt"
+            error_code = None
+        elif chat_shell_visible:
+            auth_state = "authenticated"
+            error_code = None
+        elif login_ui_visible:
+            auth_state = "login_required"
+            error_code = "authentication_required"
+        elif not page_url or "loading" in text_lower:
+            auth_state = "loading"
+            error_code = None
+        else:
+            auth_state = "unknown_auth_state"
+            error_code = "unknown_auth_state"
+
+        authenticated = auth_state == "authenticated"
+        return {
+            "auth_state": auth_state,
+            "authenticated": authenticated,
+            "login_ui_visible": login_ui_visible,
+            "chat_shell_visible": chat_shell_visible,
+            "contacts_ui_available": contacts_ui_available,
+            "page_url": page_url,
+            "error_code": error_code,
+            "detection_evidence": evidence,
+            "diagnostics_consistent": bool(
+                (authenticated and chat_shell_visible and not login_ui_visible)
+                or (not authenticated and auth_state != "authenticated")
+            ),
+            "login_check": {
+                key: login.get(key)
+                for key in [
+                    "matched_selector",
+                    "error_code",
+                    "login_detector_reason",
+                    "install_prompt_detected",
+                    "logged_in_ui_detected",
+                    "login_page_detected",
+                    "chat_list_visible",
+                    "search_icon_visible",
+                    "tabs_visible",
+                    "side_menu_visible",
+                ]
+            },
+        }
+
+    def _extract_latest_channel_message_preview(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const selectors = [
+            "div[data-testid*='message']",
+            "div[class*='Message']",
+            "div[class*='message']",
+            "article",
+            "[role='listitem']"
+          ];
+          const seen = new Set();
+          const candidates = [];
+          const rejectText = (text) => {
+            const normalized = String(text || "").replace(/\\s+/g, " ").trim();
+            if (!normalized) return false;
+            const lower = normalized.toLowerCase();
+            const uiWords = ["search", "contacts", "settings", "install", "forward", "reply"];
+            if (uiWords.some((word) => lower === word)) return true;
+            if (/^\\d{1,2}:\\d{2}$/.test(normalized)) return true;
+            if (/^(today|yesterday)$/i.test(normalized)) return true;
+            return false;
+          };
+          for (const selector of selectors) {
+            for (const node of Array.from(document.querySelectorAll(selector))) {
+              if (seen.has(node)) continue;
+              seen.add(node);
+              const rect = node.getBoundingClientRect();
+              const style = window.getComputedStyle(node);
+              if (!rect || rect.width < 40 || rect.height < 20) continue;
+              if (style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) continue;
+              if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) continue;
+              const text = String(node.innerText || node.textContent || "").replace(/\\s+/g, " ").trim();
+              const hasImage = Boolean(node.querySelector("img, [class*='image'], [class*='photo']"));
+              const hasVideo = Boolean(node.querySelector("video, [class*='video']"));
+              const hasFile = Boolean(node.querySelector("a[download], [class*='file'], [class*='document']"));
+              if (!text && !hasImage && !hasVideo && !hasFile) continue;
+              if (rejectText(text)) continue;
+              const timestampNode = node.querySelector("time, [datetime], [class*='time'], [class*='Time']");
+              candidates.push({
+                selector,
+                text,
+                hasImage,
+                hasVideo,
+                hasFile,
+                id: node.id || null,
+                timestampText: timestampNode ? String(timestampNode.innerText || timestampNode.textContent || timestampNode.getAttribute("datetime") || "").trim() : null,
+                top: rect.top,
+                bottom: rect.bottom,
+              });
+            }
+          }
+          candidates.sort((a, b) => a.bottom - b.bottom);
+          const latest = candidates[candidates.length - 1] || null;
+          return {
+            marker: "clinicos_bale_channel_preview",
+            channel_view_visible: candidates.length > 0 || /bale\\.ai/i.test(location.href),
+            message_selector_used: latest ? latest.selector : selectors.join(", "),
+            latest_message_visible: Boolean(latest),
+            candidate_count: candidates.length,
+            latest,
+          };
+        }
+        """
+        raw = page.evaluate(script)
+        if not isinstance(raw, dict):
+            raw = {}
+        latest = raw.get("latest") if isinstance(raw.get("latest"), dict) else None
+        text_preview = str(latest.get("text") or "")[:1000] if latest else ""
+        return {
+            "message_found": bool(latest),
+            "text_preview": text_preview,
+            "has_text": bool(text_preview),
+            "has_image": bool(latest and latest.get("hasImage")),
+            "has_video": bool(latest and latest.get("hasVideo")),
+            "has_file": bool(latest and latest.get("hasFile")),
+            "message_dom_id": latest.get("id") if latest else None,
+            "message_timestamp_text": latest.get("timestampText") if latest else None,
+            "candidate_count": int(raw.get("candidate_count") or 0),
+            "channel_view_visible": bool(raw.get("channel_view_visible")),
+            "message_selector_used": str(raw.get("message_selector_used") or ""),
+            "latest_message_visible": bool(raw.get("latest_message_visible")),
+        }
+
+    def _source_channel_readiness(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+          };
+          const selectorOf = (node, fallback) => {
+            if (!node) return "";
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            for (const attr of ["data-testid", "role", "aria-label"]) {
+              const value = node.getAttribute(attr);
+              if (value) return `${node.tagName.toLowerCase()}[${attr}="${value.replace(/"/g, "\\\\\\"")}"]`;
+            }
+            return fallback;
+          };
+          const panelSelectors = [
+            ".main-section-container",
+            "#message_list_scroller_id",
+            "[data-testid*='conversation']",
+            "[data-testid*='chat-panel']",
+            "[class*='ChatPanel']",
+            "[class*='Conversation']",
+            "main",
+            "[role='main']"
+          ];
+          const panelCandidates = [];
+          for (const selector of panelSelectors) {
+            for (const node of Array.from(document.querySelectorAll(selector))) {
+              if (!visible(node)) continue;
+              const box = boxOf(node);
+              const sidebarLike = node.id === "sidebar_wrapper" || box.x > window.innerWidth * 0.58 || box.w < 500;
+              const conversationLike = box.w > Math.max(500, window.innerWidth * 0.45) && box.h > 280;
+              if (!conversationLike || sidebarLike) continue;
+              const panelNode = node.id === "message_list_scroller_id" ? (node.closest(".main-section-container") || node.parentElement || node) : node;
+              panelCandidates.push({node: panelNode, selector, box: boxOf(panelNode), text: textOf(panelNode)});
+            }
+          }
+          panelCandidates.sort((a, b) => (b.box.w * b.box.h) - (a.box.w * a.box.h));
+          const panel = panelCandidates[0] || null;
+          const panelNode = panel ? panel.node : null;
+          const headerSelectors = [
+            "[aria-label='ChatAppBar']",
+            "[data-testid*='chat-header']",
+            "[data-testid*='conversation-header']",
+            "[class*='ChatAppBar']",
+            "[class*='Header']",
+            "header",
+            "[role='heading']"
+          ];
+          let header = null;
+          let headerSelector = "";
+          if (panelNode) {
+            for (const selector of headerSelectors) {
+              header = Array.from(panelNode.querySelectorAll(selector)).find(visible);
+              if (header) {
+                headerSelector = selectorOf(header, selector);
+                break;
+              }
+            }
+          }
+          const streamSelectors = [
+            "#message_list_scroller_id",
+            "[data-testid*='message-list']",
+            "[data-testid*='messages']",
+            "[class*='MessageList']",
+            "[class*='message-list']",
+            "[class*='Messages']",
+            "[role='list']"
+          ];
+          let stream = null;
+          let streamSelector = "";
+          if (panelNode) {
+            for (const selector of streamSelectors) {
+              const nodes = Array.from(panelNode.querySelectorAll(selector)).filter((node) => {
+                if (!visible(node)) return false;
+                const box = boxOf(node);
+                return box.h > 120 && box.w > 250;
+              });
+              if (nodes.length) {
+                stream = nodes[nodes.length - 1];
+                streamSelector = selectorOf(stream, selector);
+                break;
+              }
+            }
+            if (!stream) {
+              const messageLike = Array.from(panelNode.querySelectorAll("[data-testid*='message'], [class*='message'], [class*='Message'], article")).filter(visible);
+              if (messageLike.length >= 1) {
+                stream = messageLike[messageLike.length - 1].parentElement;
+                streamSelector = selectorOf(stream, "message-parent");
+              }
+            }
+          }
+          const headerText = textOf(header).slice(0, 500);
+          const panelText = textOf(panelNode).slice(0, 1000);
+          const ready = Boolean(panelNode && header && headerText && stream);
+          return {
+            marker: "clinicos_bale_source_channel_readiness",
+            ready,
+            target_channel_panel_visible: Boolean(panelNode),
+            target_channel_panel_selector: panel ? selectorOf(panelNode, panel.selector) : "",
+            target_channel_header_text: headerText,
+            target_channel_header_selector: headerSelector,
+            message_stream_visible: Boolean(stream),
+            message_stream_selector: streamSelector,
+            center_panel_visible_text_sample: panelText,
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "ready": bool(raw.get("ready")),
+            "target_channel_panel_visible": bool(raw.get("target_channel_panel_visible")),
+            "target_channel_panel_selector": str(raw.get("target_channel_panel_selector") or ""),
+            "target_channel_header_text": str(raw.get("target_channel_header_text") or ""),
+            "target_channel_header_selector": str(raw.get("target_channel_header_selector") or ""),
+            "message_stream_visible": bool(raw.get("message_stream_visible")),
+            "message_stream_selector": str(raw.get("message_stream_selector") or ""),
+            "center_panel_visible_text_sample": str(raw.get("center_panel_visible_text_sample") or ""),
+        }
+
+    def _locate_latest_channel_message_in_stream(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const streamSelector = "#message_list_scroller_id";
+          const stream = document.querySelector(streamSelector);
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+          };
+          const selectorOf = (node, fallback) => {
+            if (!node) return "";
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const isDateRow = (text, node) => {
+            const cls = String(node.className || "");
+            if (/Wqgb2D|date|Date/i.test(cls)) return true;
+            if (/^(امروز|دیروز|پریروز)$/.test(text)) return true;
+            if (/^\\d{1,2}\\s+\\S+$/.test(text) && text.length < 32) return true;
+            return false;
+          };
+          const isServiceRow = (text, node) => {
+            const cls = String(node.className || "");
+            if (/service|system/i.test(cls)) return true;
+            const serviceMarkers = ["عضو شد", "خارج شد", "پیام سنجاق", "created", "joined", "left", "pinned"];
+            return serviceMarkers.some((marker) => text.toLowerCase().includes(marker.toLowerCase())) && text.length < 180;
+          };
+          const debug = [];
+          if (!stream) {
+            return {marker: "clinicos_bale_latest_channel_message", message_found: false, candidate_count: 0, message_selector_used: streamSelector, candidate_debug: [{status: "rejected", reason: "message_stream_missing", selector: streamSelector}]};
+          }
+          const messageSelector = '[aria-label="message-item"], .message-item';
+          const rawNodes = Array.from(stream.querySelectorAll(messageSelector));
+          const accepted = [];
+          rawNodes.forEach((node, index) => {
+            const text = textOf(node);
+            const hasImage = Boolean(node.querySelector("img"));
+            const hasVideo = Boolean(node.querySelector("video"));
+            const hasFile = Boolean(node.querySelector("a[download], [class*='file'], [class*='document'], [class*='File'], [class*='Document']"));
+            const visibleNode = visible(node);
+            let reason = "";
+            if (!stream.contains(node)) reason = "outside_message_stream";
+            else if (!visibleNode && !text && !hasImage && !hasVideo && !hasFile) reason = "empty_or_invisible";
+            else if (!text && !hasImage && !hasVideo && !hasFile) reason = "empty_container";
+            else if (isDateRow(text, node)) reason = "date_row";
+            else if (isServiceRow(text, node)) reason = "service_row";
+            const item = {
+              index,
+              selector: selectorOf(node, messageSelector),
+              text: text.slice(0, 300),
+              hasImage,
+              hasVideo,
+              hasFile,
+              visible: visibleNode,
+              box: visibleNode ? boxOf(node) : null,
+              status: reason ? "rejected" : "accepted",
+              reason,
+              domId: node.id || null,
+              timestampText: ""
+            };
+            const timeNode = node.querySelector("time, [datetime], [class*='time'], [class*='Time']");
+            if (timeNode) item.timestampText = String(timeNode.innerText || timeNode.textContent || timeNode.getAttribute("datetime") || "").trim();
+            debug.push(item);
+            if (!reason) accepted.push({node, item});
+          });
+          const latest = accepted.length ? accepted[accepted.length - 1] : null;
+          const latestItem = latest ? latest.item : null;
+          return {
+            marker: "clinicos_bale_latest_channel_message",
+            message_found: Boolean(latestItem),
+            candidate_count: accepted.length,
+            message_selector_used: messageSelector,
+            candidate_debug: debug.slice(-30),
+            text_preview: latestItem ? latestItem.text : "",
+            has_text: Boolean(latestItem && latestItem.text),
+            has_image: Boolean(latestItem && latestItem.hasImage),
+            has_video: Boolean(latestItem && latestItem.hasVideo),
+            has_file: Boolean(latestItem && latestItem.hasFile),
+            message_dom_id: latestItem ? latestItem.domId : null,
+            message_timestamp_text: latestItem ? latestItem.timestampText || null : null
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "message_found": bool(raw.get("message_found")),
+            "candidate_count": int(raw.get("candidate_count") or 0),
+            "message_selector_used": str(raw.get("message_selector_used") or ""),
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+            "text_preview": str(raw.get("text_preview") or ""),
+            "has_text": bool(raw.get("has_text")),
+            "has_image": bool(raw.get("has_image")),
+            "has_video": bool(raw.get("has_video")),
+            "has_file": bool(raw.get("has_file")),
+            "message_dom_id": raw.get("message_dom_id"),
+            "message_timestamp_text": raw.get("message_timestamp_text"),
+        }
+
+    def _resolve_latest_forward_message_target(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const streamSelector = "#message_list_scroller_id";
+          const stream = document.querySelector(streamSelector);
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+          };
+          const isDateRow = (text, node) => /date|Date/i.test(String(node.className || "")) || (/^\\d{1,2}\\s+\\S+$/.test(text) && text.length < 32);
+          const isServiceRow = (text, node) => {
+            const cls = String(node.className || "");
+            if (/service|system/i.test(cls)) return true;
+            return ["created", "joined", "left", "pinned"].some((marker) => text.toLowerCase().includes(marker)) && text.length < 180;
+          };
+          const debug = [];
+          if (!stream) {
+            return {marker: "clinicos_bale_forward_latest_message_target", message_found: false, candidate_count: 0, message_selector_used: streamSelector, candidate_debug: [{status: "rejected", reason: "message_stream_missing", selector: streamSelector}]};
+          }
+          stream.querySelectorAll("[data-clinicos-latest-channel-message]").forEach((node) => node.removeAttribute("data-clinicos-latest-channel-message"));
+          const messageSelector = '[aria-label="message-item"], .message-item';
+          const rawNodes = Array.from(stream.querySelectorAll(messageSelector));
+          const accepted = [];
+          rawNodes.forEach((node, index) => {
+            const text = textOf(node);
+            const hasImage = Boolean(node.querySelector("img"));
+            const hasVideo = Boolean(node.querySelector("video"));
+            const hasFile = Boolean(node.querySelector("a[download], [class*='file'], [class*='document'], [class*='File'], [class*='Document']"));
+            const html = String(node.outerHTML || "");
+            const isLocalDraftOrUpload = node.getAttribute("data-date") === "0"
+              || Boolean(node.querySelector('[data-testid*="upload"], [data-test-id*="upload"], [class*="upload"], [class*="Upload"], [data-testid*="loading"], [data-test-id*="loading"]'))
+              || /loading-wrapper-uploading|CancelableLoading|uploading/i.test(html);
+            let reason = "";
+            const visibleNode = visible(node);
+            if (!stream.contains(node)) reason = "outside_message_stream";
+            else if (isLocalDraftOrUpload) reason = "stale_or_uploading_message_panel";
+            else if (!visibleNode && !text && !hasImage && !hasVideo && !hasFile) reason = "empty_or_invisible";
+            else if (!text && !hasImage && !hasVideo && !hasFile) reason = "empty_container";
+            else if (isDateRow(text, node)) reason = "date_row";
+            else if (isServiceRow(text, node)) reason = "service_row";
+            const item = {
+              index,
+              text: text.slice(0, 300),
+              hasImage,
+              hasVideo,
+              hasFile,
+              visible: visibleNode,
+              box: visibleNode ? boxOf(node) : null,
+              status: reason ? "rejected" : "accepted",
+              reason,
+              domId: node.id || null,
+              dataDate: node.getAttribute("data-date") || "",
+              className: String(node.className || "").slice(0, 200),
+              htmlSummary: html.replace(/\\s+/g, " ").slice(0, 1200),
+              timestampText: ""
+            };
+            const timeNode = node.querySelector("time, [datetime], [class*='time'], [class*='Time']");
+            if (timeNode) item.timestampText = String(timeNode.innerText || timeNode.textContent || timeNode.getAttribute("datetime") || "").trim();
+            debug.push(item);
+            if (!reason) accepted.push({node, item});
+          });
+          const latest = accepted.length ? accepted[accepted.length - 1] : null;
+          if (!latest) {
+            return {marker: "clinicos_bale_forward_latest_message_target", message_found: false, candidate_count: 0, message_selector_used: messageSelector, candidate_debug: debug.slice(-30)};
+          }
+          latest.node.setAttribute("data-clinicos-latest-channel-message", "true");
+          const selector = `${streamSelector} [data-clinicos-latest-channel-message="true"]`;
+          return {
+            marker: "clinicos_bale_forward_latest_message_target",
+            message_found: true,
+            candidate_count: accepted.length,
+            message_selector_used: messageSelector,
+            latest_message_selector: selector,
+            latest_message_text_preview: latest.item.text,
+            latest_message_data_date: latest.item.dataDate || null,
+            latest_message_signature: `${latest.item.dataDate || ""}|${latest.item.domId || ""}|${latest.item.text || ""}`.slice(0, 500),
+            latest_message_html_summary: latest.item.htmlSummary,
+            has_text: Boolean(latest.item.text),
+            has_image: Boolean(latest.item.hasImage),
+            has_video: Boolean(latest.item.hasVideo),
+            has_file: Boolean(latest.item.hasFile),
+            message_dom_id: latest.item.domId,
+            message_timestamp_text: latest.item.timestampText || null,
+            candidate_debug: debug.slice(-30)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "message_found": bool(raw.get("message_found")),
+            "candidate_count": int(raw.get("candidate_count") or 0),
+            "message_selector_used": str(raw.get("message_selector_used") or ""),
+            "latest_message_selector": str(raw.get("latest_message_selector") or ""),
+            "latest_message_text_preview": str(raw.get("latest_message_text_preview") or ""),
+            "latest_message_data_date": raw.get("latest_message_data_date"),
+            "latest_message_signature": str(raw.get("latest_message_signature") or ""),
+            "latest_message_html_summary": str(raw.get("latest_message_html_summary") or ""),
+            "has_text": bool(raw.get("has_text")),
+            "has_image": bool(raw.get("has_image")),
+            "has_video": bool(raw.get("has_video")),
+            "has_file": bool(raw.get("has_file")),
+            "message_dom_id": raw.get("message_dom_id"),
+            "message_timestamp_text": raw.get("message_timestamp_text"),
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+        }
+
+    def _message_forward_menu_candidates(self, page: Any, latest_message_selector: str) -> dict[str, Any]:
+        script = """
+        (latestSelector) => {
+          const latest = document.querySelector(latestSelector);
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+          };
+          const attempted = [
+            '[aria-label="بیشتر"]',
+            '[aria-label*="بیشتر"]',
+            '[aria-label*="More"]',
+            '[title*="Forward"]',
+            '[title*="بیشتر"]',
+            '[role="button"]',
+            'button',
+            'svg'
+          ];
+          const debug = [];
+          if (!latest) {
+            return {marker: "clinicos_bale_message_menu_candidates", message_menu_selector: "", attempted_selectors: attempted, candidate_debug: [{status: "rejected", reason: "latest_message_missing", latestSelector}]};
+          }
+          latest.querySelectorAll("[data-clinicos-message-menu-candidate]").forEach((node) => node.removeAttribute("data-clinicos-message-menu-candidate"));
+          const roots = [latest, latest.parentElement, latest.closest('[aria-label="message-item"]'), latest.closest('.message-item')].filter(Boolean);
+          const seen = new Set();
+          let selected = null;
+          for (const selector of attempted) {
+            for (const root of roots) {
+              for (const node of Array.from(root.querySelectorAll(selector))) {
+                if (seen.has(node)) continue;
+                seen.add(node);
+                const aria = node.getAttribute("aria-label") || "";
+                const title = node.getAttribute("title") || "";
+                const role = node.getAttribute("role") || "";
+                const testid = node.getAttribute("data-testid") || "";
+                const text = textOf(node);
+                const box = visible(node) ? boxOf(node) : null;
+                const label = `${aria} ${title} ${role} ${testid} ${text}`.trim();
+                const looksLikeMenu = /بیشتر|More|more|menu|Menu|options|Options|ellipsis|Forward/i.test(label) || node.tagName === "SVG";
+                const item = {
+                  selector,
+                  text: text.slice(0, 120),
+                  aria_label: aria,
+                  title,
+                  role,
+                  data_testid: testid,
+                  className: String(node.className || "").slice(0, 160),
+                  visible: Boolean(box),
+                  box,
+                  status: looksLikeMenu && box ? "candidate" : "observed"
+                };
+                debug.push(item);
+                if (!selected && looksLikeMenu && box) {
+                  const clickTarget = node.closest('button, [role="button"], [aria-label], [title]') || node;
+                  clickTarget.setAttribute("data-clinicos-message-menu-candidate", "0");
+                  selected = clickTarget;
+                }
+              }
+            }
+          }
+          return {
+            marker: "clinicos_bale_message_menu_candidates",
+            message_menu_selector: selected ? '[data-clinicos-message-menu-candidate="0"]' : "",
+            attempted_selectors: attempted,
+            candidate_debug: debug.slice(0, 80)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script, latest_message_selector)
+        except TypeError:
+            try:
+                raw = page.evaluate(script)
+            except Exception:
+                raw = {}
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "message_menu_selector": str(raw.get("message_menu_selector") or ""),
+            "attempted_selectors": raw.get("attempted_selectors") if isinstance(raw.get("attempted_selectors"), list) else [],
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+        }
+
+    def _forward_option_candidates(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
+          };
+          document.querySelectorAll("[data-clinicos-forward-option]").forEach((node) => node.removeAttribute("data-clinicos-forward-option"));
+          const nodes = Array.from(document.querySelectorAll('[role="menuitem"], [role="button"], button, li, div, span'));
+          const labels = [/^Forward$/i, /فوروارد/, /ارسال\\s*به/, /^ارسال$/];
+          const debug = [];
+          let selected = null;
+          for (const node of nodes) {
+            if (!visible(node)) continue;
+            const text = textOf(node);
+            const aria = node.getAttribute("aria-label") || "";
+            const title = node.getAttribute("title") || "";
+            const label = `${text} ${aria} ${title}`.trim();
+            const isForward = labels.some((pattern) => pattern.test(label));
+            if (!text && !aria && !title) continue;
+            const item = {
+              text: text.slice(0, 160),
+              aria_label: aria,
+              title,
+              role: node.getAttribute("role") || "",
+              className: String(node.className || "").slice(0, 160),
+              box: boxOf(node),
+              status: isForward ? "candidate" : "observed"
+            };
+            debug.push(item);
+            if (!selected && isForward) {
+              selected = node.closest('button, [role="menuitem"], [role="button"]') || node;
+              selected.setAttribute("data-clinicos-forward-option", "0");
+            }
+          }
+          const visibleMenuText = debug.map((item) => item.text || item.aria_label || item.title).filter(Boolean).slice(0, 20).join(" | ");
+          return {
+            marker: "clinicos_bale_forward_option_candidates",
+            forward_option_selector: selected ? '[data-clinicos-forward-option="0"]' : "",
+            visible_menu_text: visibleMenuText.slice(0, 1000),
+            candidate_debug: debug.slice(0, 80)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "forward_option_selector": str(raw.get("forward_option_selector") or ""),
+            "visible_menu_text": str(raw.get("visible_menu_text") or ""),
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+        }
+
+    def _forward_picker_state(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const role = node.getAttribute("role");
+            if (role) return `[role="${role.replace(/"/g, "\\\\\\"")}"]`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const pickerSelectors = [
+            '[role="dialog"]',
+            '[class*="Modal"]',
+            '[class*="modal"]',
+            '[class*="Forward"]',
+            'input[type="search"]',
+            'input[placeholder*="Search"]',
+            'input[placeholder*="جست"]'
+          ];
+          const scopedPickerSelectors = ['div.anWA5J'];
+          const debug = [];
+          let selected = null;
+          for (const selector of scopedPickerSelectors) {
+            for (const node of Array.from(document.querySelectorAll(selector))) {
+              if (!visible(node)) continue;
+              const text = textOf(node);
+              const search = Array.from(node.querySelectorAll('input[type="search"], input, [role="searchbox"], [role="textbox"], [contenteditable="true"]')).find(visible);
+              if (!search) {
+                debug.push({selector, text: text.slice(0, 200), placeholder: "", has_search_input: false, status: "observed"});
+                continue;
+              }
+              const placeholder = search.getAttribute("placeholder") || "";
+              const label = `${text} ${placeholder} ${node.getAttribute("aria-label") || ""}`;
+              const pickerLike = /Forward|forward|فوروارد|ارسال|Search|search|جست|انتخاب/.test(label) || selector.includes("input");
+              debug.push({selector, text: text.slice(0, 200), placeholder, status: pickerLike ? "candidate" : "observed"});
+              if (!selected && pickerLike) selected = node.closest('[role="dialog"], [class*="Modal"], [class*="modal"]') || node;
+            }
+          }
+          return {
+            marker: "clinicos_bale_forward_picker_state",
+            forward_picker_visible: Boolean(selected),
+            forward_picker_selector: selected ? selectorFor(selected, '[role="dialog"]') : "",
+            candidate_debug: debug.slice(0, 40)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "forward_picker_visible": bool(raw.get("forward_picker_visible")),
+            "forward_picker_selector": str(raw.get("forward_picker_selector") or ""),
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+        }
+
+    def _forward_recipient_search_state(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const marker = node.getAttribute("data-clinicos-recipient-search");
+            if (marker) return `[data-clinicos-recipient-search="${marker}"]`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const placeholder = node.getAttribute("placeholder");
+            if (placeholder) return `${node.tagName.toLowerCase()}[placeholder="${placeholder.replace(/"/g, "\\\\\\"")}"]`;
+            const role = node.getAttribute("role");
+            if (role) return `${node.tagName.toLowerCase()}[role="${role}"]`;
+            return fallback;
+          };
+          const picker = Array.from(document.querySelectorAll('div.anWA5J')).find(visible);
+          const selectorAttempts = [
+            'div.anWA5J input[type="search"]',
+            'div.anWA5J input',
+            'div.anWA5J [role="searchbox"]',
+            'div.anWA5J [role="textbox"]',
+            'div.anWA5J [contenteditable="true"]'
+          ];
+          const debug = [];
+          let selected = null;
+          for (const selector of selectorAttempts) {
+            for (const node of Array.from(document.querySelectorAll(selector))) {
+              if (!visible(node)) continue;
+              if (picker && !picker.contains(node)) continue;
+              const item = {
+                selector,
+                tag: node.tagName.toLowerCase(),
+                role: node.getAttribute("role") || "",
+                aria_label: node.getAttribute("aria-label") || "",
+                placeholder: node.getAttribute("placeholder") || "",
+                className: String(node.className || "").slice(0, 120),
+                enabled: !node.disabled && node.getAttribute("aria-disabled") !== "true",
+                editable: Boolean(node.isContentEditable || ("readOnly" in node ? !node.readOnly : true)),
+                status: "candidate"
+              };
+              debug.push(item);
+              if (!selected && item.enabled && item.editable) selected = node;
+            }
+          }
+          if (selected) selected.setAttribute("data-clinicos-recipient-search", "0");
+          return {
+            marker: "clinicos_bale_forward_recipient_search_state",
+            recipient_picker_visible: Boolean(picker),
+            recipient_search_selector: selected ? selectorFor(selected, '[data-clinicos-recipient-search="0"]') : "",
+            selector_attempts: selectorAttempts,
+            candidate_debug: debug.slice(0, 40)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "recipient_picker_visible": bool(raw.get("recipient_picker_visible")),
+            "recipient_search_selector": str(raw.get("recipient_search_selector") or ""),
+            "selector_attempts": raw.get("selector_attempts") if isinstance(raw.get("selector_attempts"), list) else [],
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+        }
+
+    def _forward_picker_forensics(self, page: Any, display_name: str) -> dict[str, Any]:
+        script = """
+        (displayName) => {
+          const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+          const excerpt = (node) => String((node && node.outerHTML) || "").replace(/\\s+/g, " ").slice(0, 800);
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            if (!node) return null;
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)};
+          };
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            const marker = node.getAttribute("data-clinicos-forensic");
+            if (marker) return `[data-clinicos-forensic="${marker}"]`;
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const role = node.getAttribute("role");
+            if (role) return `${node.tagName.toLowerCase()}[role="${role.replace(/"/g, "\\\\\\"")}"]`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const chain = (node) => {
+            const rows = [];
+            let current = node;
+            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+              rows.push({
+                tag: current.tagName.toLowerCase(),
+                role: current.getAttribute("role") || "",
+                aria_label: current.getAttribute("aria-label") || "",
+                classes: String(current.className || "").slice(0, 120),
+                text: normalize(current.innerText || current.textContent || "").slice(0, 160),
+                selector: selectorFor(current, "")
+              });
+            }
+            return rows;
+          };
+          const validName = (text) => {
+            const value = normalize(text);
+            if (value.length < 3) return {ok: false, reason: "name_too_short"};
+            if (/^[\\d\\u06F0-\\u06F9]+$/.test(value)) return {ok: false, reason: "numeric_only"};
+            if (/^(avatar|icon|close|remove|delete|×|x)$/i.test(value)) return {ok: false, reason: "icon_label"};
+            return {ok: true, reason: ""};
+          };
+          const picker = Array.from(document.querySelectorAll('div.anWA5J')).find(visible);
+          const bodyText = normalize(document.body ? document.body.innerText || document.body.textContent || "" : "");
+          const successToast = /sent to|Forwarded|ارسال شد|بازارسال شد/i.test(bodyText);
+          if (!picker) {
+            return {picker_verified: false, picker_structure: {has_picker: false, has_search_input: false, has_list_or_empty_state: false, success_toast_visible: successToast}, selected_row_candidates: [], selected_chip_candidates: [], rejected_selected_candidates: []};
+          }
+          const modalRoot = picker.closest('[role="dialog"], [class*="Modal"], [class*="modal"]') || picker;
+          modalRoot.setAttribute("data-clinicos-forensic", "modal-root");
+          const pickerRect = picker.getBoundingClientRect();
+          const searchInputs = Array.from(picker.querySelectorAll('input, textarea')).filter((node) => visible(node) && !node.disabled && !node.readOnly).map((node, index) => {
+            node.setAttribute("data-clinicos-forensic", `search-${index}`);
+            return {selector: selectorFor(node, ""), tag: node.tagName.toLowerCase(), placeholder: node.getAttribute("placeholder") || "", role: node.getAttribute("role") || "", enabled: !node.disabled, editable: !node.readOnly, bounding_box: boxOf(node)};
+          });
+          const rows = Array.from(modalRoot.querySelectorAll('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"]')).filter(visible);
+          const hasListOrEmpty = rows.length > 0 || /no result|empty|نتیجه|یافت نشد/i.test(normalize(picker.innerText || picker.textContent || ""));
+          const selectedRows = [];
+          const selectedChips = [];
+          const rejected = [];
+          const reject = (node, reason, source) => rejected.push({
+            rejected_candidate_reason: reason,
+            candidate_text: normalize(node.innerText || node.textContent || "").slice(0, 160),
+            candidate_role: node.getAttribute("role") || "",
+            candidate_aria_label: node.getAttribute("aria-label") || "",
+            candidate_aria_selected: node.getAttribute("aria-selected") || "",
+            candidate_checked: Boolean(node.checked),
+            candidate_classes: String(node.className || "").slice(0, 160),
+            candidate_parent_text: normalize(node.parentElement ? node.parentElement.innerText || node.parentElement.textContent || "" : "").slice(0, 160),
+            candidate_outer_html_excerpt: excerpt(node),
+            candidate_bounding_box: boxOf(node),
+            clickable_ancestor_chain: chain(node),
+            source
+          });
+          for (const row of rows) {
+            const text = normalize(row.innerText || row.textContent || "");
+            const selected = row.getAttribute("aria-selected") === "true" || Boolean(row.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [aria-checked="true"]')) || /selected|checked/i.test(String(row.className || ""));
+            if (!selected) continue;
+            const name = validName(text);
+            if (!name.ok) {
+              reject(row, name.reason, "selected_row");
+              continue;
+            }
+            selectedRows.push({text, selector: selectorFor(row, ""), selected: true, aria_selected: row.getAttribute("aria-selected") || "", checkbox_radio_state: Boolean(row.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [aria-checked="true"]')), bounding_box: boxOf(row), clickable_ancestor_chain: chain(row)});
+          }
+          const chipCandidates = Array.from(modalRoot.querySelectorAll('div, span, button, [role="button"]')).filter((node) => {
+            if (!(node instanceof HTMLElement) || !visible(node)) return false;
+            if (node.matches('input, textarea, [contenteditable="true"]')) return false;
+            const rect = node.getBoundingClientRect();
+            const text = normalize(node.innerText || node.textContent || "");
+            return text && rect.y >= pickerRect.bottom - 150 && rect.y <= pickerRect.bottom - 30 && rect.width >= 40 && rect.width <= 280 && rect.height >= 18 && rect.height <= 70;
+          });
+          const chips = chipCandidates.filter((node) => !chipCandidates.some((other) => other !== node && other.contains(node)));
+          for (const chip of chips) {
+            const text = normalize(chip.innerText || chip.textContent || "").replace(/^[×xX]\\s*/, "").replace(/\\s*[×xX]$/, "");
+            const name = validName(text);
+            const controls = Array.from(chip.querySelectorAll('button, [role="button"], [aria-label], svg')).filter((node) => node instanceof Element && visible(node));
+            const remove = controls.find((node) => /remove|delete|deselect|clear|close|حذف|پاک/i.test(`${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""} ${normalize(node.innerText || node.textContent || "")}`));
+            if (!name.ok) {
+              reject(chip, name.reason, "selected_chip");
+              continue;
+            }
+            if (!remove) {
+              reject(chip, "remove_control_not_verified", "selected_chip");
+              continue;
+            }
+            remove.setAttribute("data-clinicos-forensic", `remove-${selectedChips.length}`);
+            selectedChips.push({text, selector: selectorFor(chip, ""), selected: true, bounding_box: boxOf(chip), proposed_remove_selector: selectorFor(remove, ""), proposed_remove_parent_text: normalize(chip.innerText || chip.textContent || ""), candidate_outer_html_excerpt: excerpt(chip), clickable_ancestor_chain: chain(remove)});
+          }
+          const selectedNames = selectedRows.concat(selectedChips).map((item) => item.text);
+          return {
+            dry_run: true,
+            picker_verified: Boolean(searchInputs.length && hasListOrEmpty && !successToast),
+            picker_structure: {has_picker: true, has_search_input: Boolean(searchInputs.length), has_list_or_empty_state: hasListOrEmpty, success_toast_visible: successToast},
+            picker_outer_html_excerpt: excerpt(picker),
+            picker_selector: "div.anWA5J",
+            modal_root_selector: selectorFor(modalRoot, '[data-clinicos-forensic="modal-root"]'),
+            modal_root_outer_html_excerpt: excerpt(modalRoot),
+            picker_bounding_box: boxOf(picker),
+            picker_search_inputs: searchInputs,
+            visible_buttons: Array.from(modalRoot.querySelectorAll('button, [role="button"], [aria-label]')).filter(visible).slice(0, 80).map((node) => ({text: normalize(node.innerText || node.textContent || ""), aria_label: node.getAttribute("aria-label") || "", role: node.getAttribute("role") || "", classes: String(node.className || "").slice(0, 120), bounding_box: boxOf(node)})),
+            visible_rows: rows.slice(0, 80).map((node) => ({text: normalize(node.innerText || node.textContent || "").slice(0, 200), role: node.getAttribute("role") || "", aria_label: node.getAttribute("aria-label") || "", aria_selected: node.getAttribute("aria-selected") || "", classes: String(node.className || "").slice(0, 120), bounding_box: boxOf(node)})),
+            selected_row_candidates: selectedRows,
+            selected_chip_candidates: selectedChips,
+            selected_names_before_search: selectedNames,
+            selected_count_before_search: selectedNames.length,
+            sahar_selected: selectedNames.some((name) => normalize(name).toLowerCase() === "sahar"),
+            rejected_selected_candidates: rejected,
+            rejected_candidate_reasons: rejected.map((item) => item.rejected_candidate_reason),
+            remove_control_candidates: selectedChips.map((item) => ({text: item.text, proposed_remove_selector: item.proposed_remove_selector, proposed_remove_parent_text: item.proposed_remove_parent_text})),
+            destructive_clicks_attempted: 0
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script, display_name)
+        except Exception:
+            raw = {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _forward_selected_recipients_state(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            const marker = node.getAttribute("data-clinicos-selected-recipient");
+            if (marker) return `[data-clinicos-selected-recipient="${marker}"]`;
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const role = node.getAttribute("role");
+            if (role) return `${node.tagName.toLowerCase()}[role="${role}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const rowParent = (node) => {
+            if (!(node instanceof HTMLElement)) return node;
+            return node.closest('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"], button, a') || node;
+          };
+          const clickableParent = (node) => {
+            let current = node;
+            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+              if (!(current instanceof HTMLElement)) continue;
+              const role = current.getAttribute("role") || "";
+              const style = window.getComputedStyle(current);
+              if (current.tagName === "BUTTON" || current.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer") return current;
+            }
+            return node;
+          };
+          const selectedLike = (node) => {
+            if (!(node instanceof HTMLElement)) return false;
+            const ariaSelected = node.getAttribute("aria-selected") || "";
+            const ariaChecked = node.getAttribute("aria-checked") || "";
+            const role = node.getAttribute("role") || "";
+            const checkedInput = node.matches('input[type="checkbox"], input[type="radio"]') && Boolean(node.checked);
+            const checkedChild = Boolean(node.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [aria-checked="true"]'));
+            return ariaSelected === "true"
+              || ariaChecked === "true"
+              || checkedInput
+              || checkedChild;
+          };
+          const selectedName = (row) => {
+            const text = normalize(row.innerText || row.textContent || "");
+            if (text && text.length <= 160) return text;
+            const labelled = Array.from(row.querySelectorAll('[title], [aria-label], span, div')).map((node) => {
+              return normalize(node.getAttribute("title") || node.getAttribute("aria-label") || node.innerText || node.textContent || "");
+            }).filter(Boolean);
+            return (labelled.find((value) => value && value.length <= 120) || text).slice(0, 160);
+          };
+          const validRecipientName = (value) => {
+            const text = normalize(value);
+            if (text.length < 3) return false;
+            if (/^[\\d\\u06F0-\\u06F9\\u0660-\\u0669]+$/.test(text)) return false;
+            if (/^[×xX+\\-–—•·\\.،,؛:;!?\\s]+$/.test(text)) return false;
+            if (/^(close|remove|delete|clear|cancel|back|forward|send|confirm)$/i.test(text)) return false;
+            return true;
+          };
+          const picker = Array.from(document.querySelectorAll('div.anWA5J')).find((node) => {
+            if (!visible(node)) return false;
+            return Boolean(Array.from(node.querySelectorAll('input[type="search"], input, [role="searchbox"], [role="textbox"], [contenteditable="true"]')).find(visible));
+          });
+          const modalRootFor = (node) => {
+            if (!node) return null;
+            let best = null;
+            let current = node;
+            for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+              if (!visible(current)) continue;
+              const rect = current.getBoundingClientRect();
+              const modalSized = rect.width >= 300 && rect.width <= 700 && rect.height >= 360 && rect.height <= window.innerHeight;
+              if (modalSized) best = current;
+            }
+            return best || node;
+          };
+          const searchInput = picker ? Array.from(picker.querySelectorAll('input[type="search"], input, [role="searchbox"], [role="textbox"], [contenteditable="true"]')).find(visible) : null;
+          const pickerRoot = picker ? modalRootFor(searchInput || picker) : null;
+          const nodes = pickerRoot ? Array.from(pickerRoot.querySelectorAll('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"], button, a, [aria-selected], [aria-checked], input[type="checkbox"], input[type="radio"]')) : [];
+          const selected = [];
+          const seen = new Set();
+          const pushSelected = (row, click, text, source, selectedNode) => {
+            if (!row || !click || !text) return;
+            if (!validRecipientName(text)) return;
+            const rect = row.getBoundingClientRect();
+            const key = selectorFor(click, "") || `${text}|${Math.round(rect.x)}|${Math.round(rect.y)}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            const index = selected.length;
+            click.setAttribute("data-clinicos-selected-recipient", String(index));
+            selected.push({
+              selector: selectorFor(row, ""),
+              click_selector: selectorFor(click, `[data-clinicos-selected-recipient="${index}"]`),
+              text,
+              selected: true,
+              source,
+              aria_selected: row.getAttribute("aria-selected") || (selectedNode && selectedNode.getAttribute("aria-selected")) || "",
+              checkbox_radio_state: Boolean((selectedNode && selectedNode.checked === true) || row.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [aria-checked="true"]')),
+              bounding_box: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)}
+            });
+          };
+          for (const node of nodes) {
+            if (!visible(node) || !selectedLike(node)) continue;
+            const row = rowParent(node);
+            if (!row || !visible(row)) continue;
+            const rootRect = pickerRoot.getBoundingClientRect();
+            const rowRect = row.getBoundingClientRect();
+            if (rowRect.left < rootRect.left - 8 || rowRect.right > rootRect.right + 8 || rowRect.top < rootRect.top - 8 || rowRect.bottom > rootRect.bottom + 8) continue;
+            const click = clickableParent(row);
+            const text = selectedName(row);
+            pushSelected(row, click, text, "selected_state", node);
+            if (selected.length >= 20) break;
+          }
+          if (pickerRoot) {
+            const pickerRect = pickerRoot.getBoundingClientRect();
+            const chipCandidates = Array.from(document.querySelectorAll('div, span, button, [role="button"]')).filter((node) => {
+              if (!(node instanceof HTMLElement) || !visible(node)) return false;
+              if (node.matches('input, textarea, [contenteditable="true"]')) return false;
+              const rect = node.getBoundingClientRect();
+              const horizontallyInsideModal = rect.left >= pickerRect.left - 8 && rect.right <= pickerRect.right + 8;
+              if (!horizontallyInsideModal) return false;
+              const text = normalize(node.innerText || node.textContent || "");
+              if (/حذف|رونوشت|اشتراک|افزودن|پیوند|copy|share|link|story/i.test(text)) return false;
+              if (!text || text.length > 120) return false;
+              if (rect.y < pickerRect.bottom - 140 || rect.y > pickerRect.bottom - 35) return false;
+              if (rect.width < 40 || rect.width > 260 || rect.height < 18 || rect.height > 60) return false;
+              if (/جستجو|نوشتن|توضیحات|بازارسال|Forward|Send|Confirm/i.test(text)) return false;
+              return validRecipientName(text.replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, ""));
+            });
+            const chipNodes = chipCandidates.filter((node) => !chipCandidates.some((other) => other !== node && other.contains(node)));
+            for (const node of chipNodes) {
+              const text = normalize(node.innerText || node.textContent || "").replace(/^×\\s*/, "").replace(/\\s*×$/, "");
+              const chipText = normalize(text.replace(/^[×xX]\\s*/, "").replace(/\\s*[×xX]$/, ""));
+              if (!chipText || chipText.length > 120 || !validRecipientName(chipText)) continue;
+              const childControls = Array.from(node.querySelectorAll('svg, button, [role="button"], [aria-label]')).filter((child) => child instanceof HTMLElement && visible(child));
+              const click = childControls.find((child) => {
+                const rect = child.getBoundingClientRect();
+                return rect.width <= 36 && rect.height <= 36;
+              }) || childControls[0] || node;
+              pushSelected(node, click, chipText, "selected_chip", node);
+              if (selected.length >= 20) break;
+            }
+            const removeControls = Array.from(pickerRoot.querySelectorAll('button, [role="button"], [aria-label], svg')).filter((node) => {
+              if (!(node instanceof Element) || !visible(node)) return false;
+              const rect = node.getBoundingClientRect();
+              const label = `${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""} ${normalize(node.innerText || node.textContent || "")}`;
+              return rect.y >= pickerRect.bottom - 150 && rect.y <= pickerRect.bottom - 20 && /close|remove|delete|deselect|clear|Ã—|x|Ø­Ø°Ù|Ù¾Ø§Ú©/i.test(label);
+            });
+            for (const control of removeControls) {
+              let chip = control.parentElement;
+              for (let depth = 0; chip && depth < 5; depth += 1, chip = chip.parentElement) {
+                if (!(chip instanceof HTMLElement) || !visible(chip)) continue;
+                const rect = chip.getBoundingClientRect();
+                if (rect.width < 40 || rect.width > 280 || rect.height < 18 || rect.height > 80) continue;
+                const chipText = normalize(chip.innerText || chip.textContent || "").replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, "");
+                if (!chipText || chipText.length > 120 || !validRecipientName(chipText)) continue;
+                pushSelected(chip, control, chipText, "selected_chip", control);
+                break;
+              }
+              if (selected.length >= 20) break;
+            }
+          }
+          const uniqueSelected = [];
+          const seenSelectedNames = new Set();
+          for (const item of selected) {
+            const key = normalize(item.text);
+            if (!key || seenSelectedNames.has(key)) continue;
+            seenSelectedNames.add(key);
+            uniqueSelected.push(item);
+          }
+          return {
+            marker: "clinicos_bale_forward_selected_recipients_state",
+            selected_count: uniqueSelected.length,
+            selected_names: uniqueSelected.map((item) => item.text),
+            selected_recipients: uniqueSelected
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "selected_count": int(raw.get("selected_count") or 0),
+            "selected_names": raw.get("selected_names") if isinstance(raw.get("selected_names"), list) else [],
+            "selected_recipients": raw.get("selected_recipients") if isinstance(raw.get("selected_recipients"), list) else [],
+        }
+
+    def _forward_recipient_candidates(self, page: Any, display_name: str) -> dict[str, Any]:
+        script = """
+        (displayName) => {
+          const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            const marker = node.getAttribute("data-clinicos-recipient-result");
+            if (marker) return `[data-clinicos-recipient-result="${marker}"]`;
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const role = node.getAttribute("role");
+            if (role) return `${node.tagName.toLowerCase()}[role="${role}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const rowParent = (node) => {
+            if (!(node instanceof HTMLElement)) return node;
+            return node.closest('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"], button, a') || node;
+          };
+          const clickableParent = (node) => {
+            let current = node;
+            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+              if (!(current instanceof HTMLElement)) continue;
+              const role = current.getAttribute("role") || "";
+              const style = window.getComputedStyle(current);
+              if (current.tagName === "BUTTON" || current.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer") return current;
+            }
+            return node;
+          };
+          const nameElementFor = (row) => {
+            if (!(row instanceof HTMLElement)) return null;
+            const preferredSelectors = [
+              '.oUKPfP',
+              '[class*="name" i]',
+              '[class*="title" i]',
+              '[data-testid*="name" i]',
+              '[data-testid*="title" i]',
+              '[aria-label]'
+            ];
+            for (const selector of preferredSelectors) {
+              for (const child of Array.from(row.querySelectorAll(selector))) {
+                if (!visible(child)) continue;
+                const childText = normalize(child.innerText || child.textContent || "");
+                const childAria = normalize(child.getAttribute("aria-label") || "");
+                const childTitle = normalize(child.getAttribute("title") || "");
+                if (childText === target || childAria === target || childTitle === target) return child;
+              }
+            }
+            for (const child of Array.from(row.querySelectorAll('*'))) {
+              if (!visible(child)) continue;
+              const childText = normalize(child.innerText || child.textContent || "");
+              const childAria = normalize(child.getAttribute("aria-label") || "");
+              const childTitle = normalize(child.getAttribute("title") || "");
+              if (childText === target || childAria === target || childTitle === target) return child;
+            }
+            return null;
+          };
+          const picker = Array.from(document.querySelectorAll('div.anWA5J, [role="dialog"], [class*="Modal"], [class*="modal"]')).find(visible);
+          const loadingIndicatorVisible = Boolean(picker && Array.from(picker.querySelectorAll('[class*="loading"], [class*="Loading"], [data-testid*="loading"], [aria-label*="loading"], svg, img')).find((node) => {
+            if (!visible(node)) return false;
+            const label = `${node.getAttribute("aria-label") || ""} ${node.getAttribute("data-testid") || ""} ${String(node.className || "")} ${normalize(node.innerText || node.textContent || "")}`;
+            return /loading|spinner|progress|در حال|بارگذاری/i.test(label);
+          }));
+          const broadNodes = picker ? Array.from(picker.querySelectorAll('[role="listitem"], [role="button"], button, a, div')) : [];
+          const rowNodes = picker ? Array.from(picker.querySelectorAll('.qHFpb6, [role="listitem"], [role="button"], button, a')) : [];
+          const nodes = rowNodes.length ? rowNodes : broadNodes;
+          const target = normalize(displayName);
+          const candidates = [];
+          const seen = new Set();
+          for (const node of nodes) {
+            if (!visible(node)) continue;
+            const text = normalize(node.innerText || node.textContent || "");
+            const aria = normalize(node.getAttribute("aria-label") || "");
+            const title = normalize(node.getAttribute("title") || "");
+            const combined = normalize(`${text} ${aria} ${title}`);
+            if (!combined || combined.length > 500) continue;
+            const hasTarget = text === target || aria === target || title === target || combined.includes(target);
+            if (!hasTarget) continue;
+            const row = rowParent(node);
+            const rowText = normalize(row.innerText || row.textContent || text);
+            const rowAria = normalize(row.getAttribute("aria-label") || aria);
+            const rowTitle = normalize(row.getAttribute("title") || title);
+            const nameElement = nameElementFor(row);
+            const rowName = nameElement ? target : "";
+            const exactWithinRow = rowName === target;
+            const click = nameElement || clickableParent(row);
+            const key = selectorFor(click, "") || `${rowText}|${rowAria}|${rowTitle}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const index = candidates.length;
+            click.setAttribute("data-clinicos-recipient-result", String(index));
+            candidates.push({
+              selector: selectorFor(row, ""),
+              click_selector: selectorFor(click, `[data-clinicos-recipient-result="${index}"]`),
+              text: rowText,
+              row_name: rowName,
+              normalized_name: rowName,
+              selected: row.getAttribute("aria-selected") === "true" || Boolean(row.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [aria-checked="true"]')),
+              checkbox_radio_state: Boolean(row.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked, [aria-checked="true"]')),
+              aria_selected: row.getAttribute("aria-selected") || "",
+              exact_text: rowName,
+              name_selector: nameElement ? selectorFor(nameElement, "") : "",
+              aria_label: rowAria,
+              title: rowTitle,
+              role: row.getAttribute("role") || "",
+              className: String(row.className || "").slice(0, 120),
+              exact_match: exactWithinRow,
+              bounding_box: {x: Math.round(row.getBoundingClientRect().x), y: Math.round(row.getBoundingClientRect().y), width: Math.round(row.getBoundingClientRect().width), height: Math.round(row.getBoundingClientRect().height)}
+            });
+            if (candidates.length >= 20) break;
+          }
+          return {marker: "clinicos_bale_forward_recipient_candidates", recipient_candidates: candidates, loading_indicator_visible: loadingIndicatorVisible};
+        }
+        """
+        try:
+            raw = page.evaluate(script, display_name)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        candidates = raw.get("recipient_candidates") if isinstance(raw.get("recipient_candidates"), list) else []
+        return {
+            "recipient_candidates": candidates,
+            "visible_result_count": len(candidates),
+            "visible_result_names": [str(item.get("row_name") or item.get("normalized_name") or item.get("text") or "") for item in candidates if isinstance(item, dict)],
+            "loading_indicator_visible": bool(raw.get("loading_indicator_visible")),
+        }
+
+    def _forward_search_input_value(self, page: Any, search_selector: str) -> str:
+        script = """
+        (selector) => {
+          const node = document.querySelector(selector);
+          if (!node) return "";
+          if ("value" in node) return String(node.value || "");
+          return String(node.innerText || node.textContent || "");
+        }
+        """
+        try:
+            return str(page.evaluate(script, search_selector) or "")
+        except Exception:
+            return ""
+
+    def _forward_recipient_results_stability(self, page: Any, display_name: str) -> dict[str, Any]:
+        first = self._forward_recipient_candidates(page, display_name)
+        _safe_wait_for_timeout(page, 500)
+        second = self._forward_recipient_candidates(page, display_name)
+
+        def signature(state: dict[str, Any]) -> list[str]:
+            candidates = state.get("recipient_candidates") if isinstance(state.get("recipient_candidates"), list) else []
+            return [
+                f"{item.get('row_name') or item.get('normalized_name') or item.get('text') or ''}|{item.get('selector') or ''}|{item.get('click_selector') or ''}"
+                for item in candidates
+                if isinstance(item, dict)
+            ]
+
+        stable = signature(first) == signature(second) and not bool(first.get("loading_indicator_visible")) and not bool(second.get("loading_indicator_visible"))
+        second["result_set_stable"] = stable
+        second["result_set_first_signature"] = signature(first)
+        second["result_set_second_signature"] = signature(second)
+        return second
+
+    def _forward_recipient_click_diagnostic(self, page: Any, click_selector: str, display_name: str) -> dict[str, Any]:
+        script = """
+        ({clickSelector, displayName}) => {
+          const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const boxOf = (node) => {
+            if (!node) return null;
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)};
+          };
+          const centerOf = (box) => box ? {x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2)} : null;
+          const excerpt = (node) => String((node && node.outerHTML) || "").replace(/\\s+/g, " ").slice(0, 900);
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            const resultMarker = node.getAttribute("data-clinicos-recipient-result");
+            if (resultMarker) return `[data-clinicos-recipient-result="${resultMarker}"]`;
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const role = node.getAttribute("role");
+            if (role) return `${node.tagName.toLowerCase()}[role="${role.replace(/"/g, "\\\\\\"")}"]`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const chain = (node) => {
+            const rows = [];
+            let current = node;
+            for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+              rows.push({tag: current.tagName.toLowerCase(), role: current.getAttribute("role") || "", aria_label: current.getAttribute("aria-label") || "", classes: String(current.className || "").slice(0, 140), text: normalize(current.innerText || current.textContent || "").slice(0, 180), selector: selectorFor(current, "")});
+            }
+            return rows;
+          };
+          const rowFor = (node) => node ? (node.closest('[data-clinicos-recipient-result], .qHFpb6, .dialog-item-content, [role="listitem"], [role="button"]') || node) : null;
+          const target = normalize(displayName);
+          const rowNameInfoFor = (row) => {
+            if (!row) return {name: "", selector: ""};
+            const exact = Array.from(row.querySelectorAll('*')).find((child) => {
+              return normalize(child.innerText || child.textContent || "") === target
+                || normalize(child.getAttribute("aria-label") || "") === target
+                || normalize(child.getAttribute("title") || "") === target;
+            });
+            if (exact) return {name: target, selector: selectorFor(exact, "")};
+            const text = normalize(row.innerText || row.textContent || "");
+            return {name: text === target ? target : text, selector: selectorFor(row, "")};
+          };
+          const click = document.querySelector(clickSelector);
+          if (!click || !visible(click)) return {click_safe: false, click_diagnostic_error: "click_target_missing_or_hidden", target_click_selector: clickSelector};
+          const row = rowFor(click);
+          const rowText = normalize(row && (row.innerText || row.textContent || ""));
+          const rowNameInfo = rowNameInfoFor(row);
+          const rowName = rowNameInfo.name;
+          const clickBox = boxOf(click);
+          const rowBox = boxOf(row);
+          const point = centerOf(clickBox);
+          const top = point ? document.elementFromPoint(point.x, point.y) : null;
+          const topRow = rowFor(top);
+          const topRowText = normalize(topRow && (topRow.innerText || topRow.textContent || ""));
+          const topRowName = rowNameInfoFor(topRow).name;
+          const picker = Array.from(document.querySelectorAll('div.anWA5J')).find(visible);
+          const root = picker ? (picker.closest('[role="dialog"], [class*="Modal"], [class*="modal"]') || picker) : document;
+          const rows = Array.from(root.querySelectorAll('[data-clinicos-recipient-result], .qHFpb6, .dialog-item-content, [role="listitem"], [role="button"]')).filter((candidate) => {
+            if (!visible(candidate)) return false;
+            const text = normalize(candidate.innerText || candidate.textContent || "");
+            return text && text.length <= 300;
+          });
+          const overlappingRows = rows.map((candidate, index) => {
+            const box = boxOf(candidate);
+            const text = normalize(candidate.innerText || candidate.textContent || "");
+            const containsPoint = Boolean(point && box && point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height);
+            const overlapsTarget = Boolean(rowBox && box && !(box.x + box.width < rowBox.x || rowBox.x + rowBox.width < box.x || box.y + box.height < rowBox.y || rowBox.y + rowBox.height < box.y));
+            return {index, text, row_name: rowNameInfoFor(candidate).name, selector: selectorFor(candidate, ""), bounding_box: box, contains_click_point: containsPoint, overlaps_target_row: overlapsTarget, z_index: window.getComputedStyle(candidate).zIndex || ""};
+          }).filter((item) => item.contains_click_point || item.overlaps_target_row).slice(0, 20);
+          const exactRowsAtPoint = overlappingRows.filter((item) => item.contains_click_point && normalize(item.row_name) === target);
+          const otherRowsAtPoint = overlappingRows.filter((item) => item.contains_click_point && normalize(item.row_name) !== target);
+          const uniqueRowKeys = Array.from(new Set(overlappingRows.filter((item) => item.contains_click_point).map((item) => item.row_name)));
+          const uniqueRecipientRowsAtPoint = uniqueRowKeys.length;
+          const nestedElementsSameRowCount = overlappingRows.filter((item) => item.contains_click_point && normalize(item.row_name) === target).length;
+          const clickSafe = rowName === target && topRowName === target && exactRowsAtPoint.length >= 1 && otherRowsAtPoint.length === 0 && !/sahar/i.test(topRowName);
+          return {
+            marker: "clinicos_bale_forward_recipient_click_diagnostic",
+            click_safe: clickSafe,
+            target_row_selector: selectorFor(row, ""),
+            target_row_text: rowText,
+            target_row_name: rowName,
+            target_name_selector: rowNameInfo.selector,
+            target_click_selector: clickSelector,
+            target_click_bounding_box: clickBox,
+            target_click_point: point,
+            element_from_point_tag: top ? top.tagName.toLowerCase() : "",
+            element_from_point_text: normalize(top && (top.innerText || top.textContent || "")).slice(0, 180),
+            element_from_point_row_name: topRowName,
+            element_from_point_row_text: topRowText,
+            element_from_point_outer_html_excerpt: excerpt(top),
+            overlapping_recipient_rows: overlappingRows,
+            unique_recipient_rows_at_click_point: uniqueRecipientRowsAtPoint,
+            nested_elements_same_row_count: nestedElementsSameRowCount,
+            target_row_outer_html_excerpt: excerpt(row),
+            target_click_outer_html_excerpt: excerpt(click),
+            clickable_descendants: Array.from(row.querySelectorAll('button, [role="button"], [aria-label], a, input, svg')).filter(visible).slice(0, 30).map((node) => ({tag: node.tagName.toLowerCase(), text: normalize(node.innerText || node.textContent || ""), aria_label: node.getAttribute("aria-label") || "", role: node.getAttribute("role") || "", selector: selectorFor(node, ""), bounding_box: boxOf(node), z_index: window.getComputedStyle(node).zIndex || ""})),
+            clickable_ancestor_chain: chain(click),
+            z_index: window.getComputedStyle(click).zIndex || ""
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script, {"clickSelector": click_selector, "displayName": display_name})
+        except Exception as exc:
+            raw = {"click_safe": False, "click_diagnostic_error": str(exc)}
+        return raw if isinstance(raw, dict) else {"click_safe": False, "click_diagnostic_error": "invalid_click_diagnostic_result"}
+
+    def _forward_modal_selection_snapshot(self, page: Any, display_name: str) -> dict[str, Any]:
+        selected = self._forward_selected_recipients_state(page)
+        names = selected.get("selected_names") if isinstance(selected.get("selected_names"), list) else []
+        return {
+            "selected_names": names,
+            "selected_count": int(selected.get("selected_count") or 0),
+            "selected_rows": [item for item in selected.get("selected_recipients", []) if isinstance(item, dict) and item.get("source") == "selected_state"],
+            "selected_footer_chips": [item for item in selected.get("selected_recipients", []) if isinstance(item, dict) and item.get("source") == "selected_chip"],
+            "target_selected": any(str(name).strip() == display_name for name in names),
+            "sahar_selected": any(str(name).strip().lower() == "sahar" for name in names),
+        }
+
+    def _forward_confirm_button_state(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          const selectorFor = (node, fallback) => {
+            if (!node) return "";
+            const marker = node.getAttribute("data-clinicos-forward-confirm");
+            if (marker) return `[data-clinicos-forward-confirm="${marker}"]`;
+            if (node.id) return `#${CSS.escape(node.id)}`;
+            const aria = node.getAttribute("aria-label");
+            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
+            const role = node.getAttribute("role");
+            if (role) return `${node.tagName.toLowerCase()}[role="${role}"]`;
+            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
+            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          };
+          const picker = Array.from(document.querySelectorAll('div.anWA5J, [role="dialog"], [class*="Modal"], [class*="modal"]')).find(visible);
+          const nodes = picker ? Array.from(picker.querySelectorAll('button, [role="button"], [aria-label], div')) : [];
+          const debug = [];
+          let selected = null;
+          for (const node of nodes) {
+            if (!visible(node)) continue;
+            const text = textOf(node);
+            const aria = node.getAttribute("aria-label") || "";
+            const role = node.getAttribute("role") || "";
+            const className = String(node.className || "").slice(0, 160);
+            const enabled = !node.disabled && node.getAttribute("aria-disabled") !== "true";
+            const label = `${text} ${aria} ${role} ${className}`;
+            const looksConfirm = /Forward|Send|Done|Confirm|Ø§Ø±Ø³Ø§Ù„|ÙÙˆØ±ÙˆØ§Ø±Ø¯|ØªØ§ÛŒÛŒØ¯/.test(label);
+            debug.push({text, aria_label: aria, role, className, enabled, status: looksConfirm ? "candidate" : "observed"});
+            if (!selected && looksConfirm && enabled) selected = node;
+          }
+          if (selected) selected.setAttribute("data-clinicos-forward-confirm", "0");
+          return {
+            marker: "clinicos_bale_forward_confirm_button_state",
+            confirm_button_selector: selected ? selectorFor(selected, '[data-clinicos-forward-confirm="0"]') : "",
+            candidate_debug: debug.slice(0, 60)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "confirm_button_selector": str(raw.get("confirm_button_selector") or ""),
+            "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
+        }
+
+    def _forward_success_state(self, page: Any) -> dict[str, Any]:
+        script = """
+        () => {
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const pickerVisible = Boolean(Array.from(document.querySelectorAll('div.anWA5J, [role="dialog"], [class*="Modal"], [class*="modal"]')).find(visible));
+          const bodyText = String((document.body && (document.body.innerText || document.body.textContent)) || "");
+          const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+          const successText = /Forwarded|sent|Ø§Ø±Ø³Ø§Ù„ Ø´Ø¯|ÙÙˆØ±ÙˆØ§Ø±Ø¯ Ø´Ø¯/.test(bodyText);
+          const toastText = normalize((Array.from(document.querySelectorAll('[role="status"], [role="alert"], [class*="toast"], [class*="Toast"], .Toastify__toast, div'))
+            .filter(visible)
+            .map((node) => normalize(node.innerText || node.textContent || ""))
+            .find((text) => /Forwarded|sent|chat|chats|ارسال|فوروارد|بازارسال|گفتگو|گفت‌وگو|چت/i.test(text)) || ""));
+          const observedText = toastText || normalize(bodyText);
+          const multiRecipient = /(?:\\b[2-9]\\b|[۲-۹٢-٩]|two|three|four|five|six|seven|eight|nine|دو|سه|چند)\\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)/i.test(observedText);
+          const oneRecipient = /(?:\\b1\\b|[۱١]|one|یک)\\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)/i.test(observedText);
+          const verifiedCount = multiRecipient ? 2 : (oneRecipient ? 1 : ((!pickerVisible && successText) ? 1 : 0));
+          return {
+            marker: "clinicos_bale_forward_success_state",
+            recipient_picker_visible: pickerVisible,
+            forward_verified: !multiRecipient && (!pickerVisible || successText),
+            verification_method: !pickerVisible ? "recipient_picker_closed" : (successText ? "success_text_visible" : ""),
+            success_toast_text: toastText,
+            verified_forward_recipient_count: verifiedCount
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "recipient_picker_visible": bool(raw.get("recipient_picker_visible")),
+            "forward_verified": bool(raw.get("forward_verified")),
+            "verification_method": str(raw.get("verification_method") or ""),
+            "success_toast_text": str(raw.get("success_toast_text") or ""),
+            "verified_forward_recipient_count": int(raw.get("verified_forward_recipient_count") or 0),
+        }
+
+    def _forward_failure_debug(self, page: Any) -> dict[str, Any]:
+        picker_text = ""
+        try:
+            picker_text = str(page.locator("div.anWA5J").first.inner_text(timeout=300) or "")[:2000]
+        except Exception:
+            try:
+                picker_text = str(page.locator('[role="dialog"]').first.inner_text(timeout=300) or "")[:2000]
+            except Exception:
+                picker_text = ""
+        return {
+            "page_url": _safe_page_url(page),
+            "visible_picker_text": picker_text,
         }
 
     def _page_debug_info(self, page: Any, account_id: str) -> dict[str, Any]:
@@ -2222,8 +5494,32 @@ class BalePlugin:
             return result
 
         step_started = time.perf_counter()
+        install_ack = self._first_visible_selector(
+            page,
+            ["text=متوجه شدم", "button:has-text('متوجه شدم')"],
+            timeout_ms=750,
+        )
+        if install_ack:
+            self._click_if_possible(page, install_ack)
+            _safe_wait_for_timeout(page, 500)
+            try:
+                if "/contacts" not in _safe_page_url(page).lower():
+                    page.goto(contacts_url, wait_until="load")
+            except Exception as exc:
+                result["install_prompt_contacts_navigation_error"] = str(exc)
+            add_contact_step("dismiss_install_prompt", "success", step_started, selector=install_ack, current_url=_safe_page_url(page))
+
+        step_started = time.perf_counter()
         contacts_ready = self._first_visible_selector(page, selectors.CONTACTS_UI_READY_SELECTORS, timeout_ms=1500)
         if not contacts_ready:
+            login_state = self._detect_login_state(page, timeout_ms=1500)
+            if login_state.get("install_prompt_detected"):
+                result["error_code"] = "bale_install_prompt"
+                result["reason"] = "install_prompt_visible"
+                result["message"] = "Bale install/help prompt is still visible"
+                result["login_check"] = login_state
+                add_contact_step("wait_contacts_ui", "failed", step_started, error_code="bale_install_prompt", login_check=login_state)
+                return result
             result["error_code"] = "contacts_ui_not_ready"
             result["reason"] = "contacts_ui_not_ready"
             result["message"] = "Bale contacts UI was not ready"
@@ -4808,6 +8104,12 @@ def _safe_wait_for_timeout(page: Any, timeout_ms: int) -> None:
             wait_for_timeout(timeout_ms)
     except Exception:
         return
+
+
+def _valid_bale_channel_uid(value: str) -> bool:
+    if not value or len(value) > 64:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", value))
 
 
 def _visible_text_sample(page: Any, limit: int = 500) -> str:

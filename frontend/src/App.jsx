@@ -1,17 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
 import MainLayout from "./layout/MainLayout.jsx";
-import Dashboard from "./pages/Dashboard.jsx";
-import Tasks from "./pages/Tasks.jsx";
-import Accounts from "./pages/Accounts.jsx";
-import Logs from "./pages/Logs.jsx";
+import CommercialDashboard from "./pages/CommercialDashboard.jsx";
+import CommercialAccounts from "./pages/CommercialAccounts.jsx";
+import CommercialJobs from "./pages/CommercialJobs.jsx";
+import CommercialCampaigns from "./pages/CommercialCampaigns.jsx";
+import CommercialLogs from "./pages/CommercialLogs.jsx";
+import CommercialSettings from "./pages/CommercialSettings.jsx";
 import PlatformSelector from "./pages/PlatformSelector.jsx";
 import PlatformWorkspace from "./pages/PlatformWorkspace.jsx";
 
 const pages = {
-  dashboard: Dashboard,
-  tasks: Tasks,
-  accounts: Accounts,
-  logs: Logs,
+  dashboard: CommercialDashboard,
+  accounts: CommercialAccounts,
+  jobs: CommercialJobs,
+  campaigns: CommercialCampaigns,
+  logs: CommercialLogs,
+  settings: CommercialSettings,
   messaging: PlatformSelector
 };
 
@@ -39,7 +43,7 @@ function isUiEnabled() {
 
 export default function App() {
   const [activePage, setActivePage] = useState(hashToPage);
-  const Page = useMemo(() => pages[activePage] ?? Dashboard, [activePage]);
+  const Page = useMemo(() => pages[activePage] ?? CommercialDashboard, [activePage]);
 
   function handleNavigate(pageId) {
     setActivePage(pageId);

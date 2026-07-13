@@ -27,10 +27,11 @@ from modules.automation_engine.browser.profile_groups import ProfileGroupStore
 from modules.automation_engine.browser.providers import get_provider
 from modules.automation_engine.browser.providers.adspower_provider import AdsPowerProvider
 from modules.automation_engine.plugins.bale import selectors
+from modules.automation_engine.plugins.bale import plugin as bale_plugin_module
 from modules.automation_engine.plugins.bale.account_store import BaleAccountStore
+from modules.automation_engine.plugins.bale.contact_store import BaleContactStore, BaleContactError, normalize_bale_phone
 from modules.automation_engine.plugins.bale.governance import can_account_run_scenario
 from modules.automation_engine.plugins.bale.plugin import BalePlugin, phone_for_bale_contact_field
-from modules.automation_engine.scenario_runner import ScenarioRunner
 from modules.automation_engine.scenario_library import (
     ScenarioExecutorStub,
     ScenarioLoader,
@@ -128,6 +129,10 @@ class MockKeyboard:
 
     def press(self, key: str) -> None:
         self.pressed.append(key)
+        if self.page is not None and hasattr(self.page, "operations"):
+            self.page.operations.append(("key", key, None))
+        if self.page is not None and hasattr(self.page, "handle_key_press"):
+            self.page.handle_key_press(key)
         if key == "Escape" and self.page is not None and self.page.auto_close_contact_modal:
             self.page.close_contact_modal()
 
@@ -168,6 +173,7 @@ class MockPage:
         self.filled: list[tuple[str, str]] = []
         self.typed: list[tuple[str, str]] = []
         self.clicked: list[str] = []
+        self.operations: list[tuple[str, str, str | None]] = []
         self.dom_clicked: list[tuple[str, str]] = []
         self.timeouts: list[int] = []
         self.urls: list[str] = []
@@ -191,6 +197,7 @@ class MockPage:
         if selector not in self.visible_selectors:
             raise TimeoutError(f"Cannot fill missing selector: {selector}")
         self.filled.append((selector, text))
+        self.operations.append(("fill", selector, text))
 
     def click(self, selector: str, timeout: int) -> None:
         if selector not in self.visible_selectors:
@@ -198,6 +205,7 @@ class MockPage:
         if selector in self.disabled_selectors or selector in self.aria_disabled_selectors:
             raise TimeoutError(f"Cannot click disabled selector: {selector}")
         self.clicked.append(selector)
+        self.operations.append(("click", selector, None))
         if ("button:has-text(\"Add\")" in selector or "button:has-text(\"افزودن\")" in selector) and self.auto_close_contact_modal:
             self.close_contact_modal()
         if selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS and selectors.MESSAGE_INPUT_SELECTORS[0] in self.visible_selectors:
@@ -250,6 +258,434 @@ class MockBrowserManager:
 
     def save_session(self, account_id: str) -> None:
         self.saved_accounts.append(account_id)
+
+
+class PreviewChannelPage(MockPage):
+    def __init__(self) -> None:
+        super().__init__(set(), selector_text={"body": "old message latest channel post"})
+
+    def evaluate(self, script: str) -> object:
+        if "clinicos_bale_channel_preview" in script:
+            return {
+                "marker": "clinicos_bale_channel_preview",
+                "channel_view_visible": True,
+                "message_selector_used": "div[data-testid*='message']",
+                "latest_message_visible": True,
+                "candidate_count": 2,
+                "latest": {
+                    "selector": "div[data-testid*='message']",
+                    "text": "latest channel post",
+                    "hasImage": True,
+                    "hasVideo": False,
+                    "hasFile": False,
+                    "id": "msg-2",
+                    "timestampText": "12:34",
+                },
+            }
+        return super().evaluate(script)
+
+
+class SourceChannelReadinessPage(MockPage):
+    def __init__(self, readiness: dict[str, object]) -> None:
+        super().__init__(set(), url="https://web.bale.ai/")
+        self.readiness = readiness
+
+    def evaluate(self, script: str) -> object:
+        if "clinicos_bale_source_channel_readiness" in script:
+            return self.readiness
+        return super().evaluate(script)
+
+
+class LocateLatestChannelMessagePage(SourceChannelReadinessPage):
+    def __init__(self, readiness: dict[str, object], locate_result: dict[str, object]) -> None:
+        super().__init__(readiness)
+        self.locate_result = locate_result
+
+    def evaluate(self, script: str) -> object:
+        if "clinicos_bale_latest_channel_message" in script:
+            return self.locate_result
+        return super().evaluate(script)
+
+
+class OpenMessageForwardLocator(MockLocator):
+    def hover(self, timeout: int) -> None:
+        super().hover(timeout)
+        if self.selector == self.page.latest_forward_selector:
+            self.page.latest_message_hovered = True
+
+
+class OpenMessageForwardPage(SourceChannelReadinessPage):
+    latest_forward_selector = '#message_list_scroller_id [data-clinicos-latest-channel-message="true"]'
+    menu_selector = '[data-clinicos-message-menu-candidate="0"]'
+    forward_selector = '[data-clinicos-forward-option="0"]'
+    picker_selector = '[role="dialog"]'
+    recipient_search_selector = '[data-clinicos-recipient-search="0"]'
+    recipient_result_selector = '[data-clinicos-recipient-result="0"]'
+    confirm_selector = '[data-clinicos-forward-confirm="0"]'
+
+    def __init__(
+        self,
+        readiness: dict[str, object] | None = None,
+        latest_found: bool = True,
+        menu_found: bool = True,
+        forward_found: bool = True,
+        picker_visible: bool = True,
+        hover_required: bool = False,
+        recipients: list[str] | None = None,
+        preselected_recipients: list[str] | None = None,
+        extra_selected_after_target: list[str] | None = None,
+        search_input_found: bool = True,
+        confirm_found: bool = True,
+        verify_success: bool = True,
+        success_toast_text: str = "sent to 1 chat",
+        footer_chips_outside_picker: bool = False,
+        click_diagnostic_safe: bool = True,
+        delayed_extra_selected_after_target: list[str] | None = None,
+        reset_clears_preselected: bool = True,
+    ) -> None:
+        super().__init__(readiness or _ready_source_channel())
+        self.latest_found = latest_found
+        self.menu_found = menu_found
+        self.forward_found = forward_found
+        self.picker_visible = picker_visible
+        self.forward_picker_available = picker_visible
+        self.hover_required = hover_required
+        self.recipients = recipients if recipients is not None else ["Bale-000001"]
+        self.selected_names = list(preselected_recipients or [])
+        self.extra_selected_after_target = list(extra_selected_after_target or [])
+        self.final_forwarded_recipients: list[str] = []
+        self.search_input_found = search_input_found
+        self.confirm_found = confirm_found
+        self.verify_success = verify_success
+        self.success_toast_text = success_toast_text
+        self.footer_chips_outside_picker = footer_chips_outside_picker
+        self.click_diagnostic_safe = click_diagnostic_safe
+        self.delayed_extra_selected_after_target = list(delayed_extra_selected_after_target or [])
+        self.reset_clears_preselected = reset_clears_preselected
+        self.forward_picker_reset_pending = False
+        self.forward_picker_escape_count = 0
+        self.forward_picker_reopen_count = 0
+        self.selected_state_evaluations_after_click = 0
+        self.recipient_selected = False
+        self.confirm_clicked = False
+        self.latest_message_hovered = False
+        self.visible_selectors.update({self.latest_forward_selector})
+        if menu_found:
+            self.visible_selectors.add(self.menu_selector)
+        if forward_found:
+            self.visible_selectors.add(self.forward_selector)
+        if picker_visible:
+            self.visible_selectors.add(self.picker_selector)
+        if search_input_found:
+            self.visible_selectors.add(self.recipient_search_selector)
+        if confirm_found:
+            self.visible_selectors.add(self.confirm_selector)
+        for index, _name in enumerate(self.recipients):
+            self.visible_selectors.add(f'[data-clinicos-recipient-result="{index}"]')
+        for index, _name in enumerate(self.selected_names):
+            self.visible_selectors.add(f'[data-clinicos-selected-recipient="{index}"]')
+
+    def goto(self, url: str, wait_until: str = "load") -> None:
+        super().goto(url, wait_until)
+        if self.forward_picker_reset_pending:
+            self.forward_picker_reset_pending = False
+            if self.reset_clears_preselected:
+                self.selected_names = []
+            self.picker_visible = False
+            self.visible_selectors.discard(self.picker_selector)
+            self.visible_selectors.discard(self.recipient_search_selector)
+            self.visible_selectors.discard(self.confirm_selector)
+            for index in range(20):
+                self.visible_selectors.discard(f'[data-clinicos-selected-recipient="{index}"]')
+
+    def handle_key_press(self, key: str) -> None:
+        if key != "Escape":
+            return
+        self.forward_picker_escape_count += 1
+        if self.picker_visible:
+            self.picker_visible = False
+            self.forward_picker_reset_pending = True
+            self.visible_selectors.discard(self.picker_selector)
+            self.visible_selectors.discard(self.recipient_search_selector)
+            self.visible_selectors.discard(self.confirm_selector)
+
+    def locator(self, selector: str) -> MockLocator:
+        return OpenMessageForwardLocator(selector, self)
+
+    def evaluate(self, script: str, *args: object) -> object:
+        if "clinicos_bale_forward_latest_message_target" in script:
+            if not self.latest_found:
+                return {
+                    "marker": "clinicos_bale_forward_latest_message_target",
+                    "message_found": False,
+                    "candidate_count": 0,
+                    "message_selector_used": '[aria-label="message-item"], .message-item',
+                    "candidate_debug": [{"status": "rejected", "reason": "empty_container"}],
+                }
+            return {
+                "marker": "clinicos_bale_forward_latest_message_target",
+                "message_found": True,
+                "candidate_count": 1,
+                "message_selector_used": '[aria-label="message-item"], .message-item',
+                "latest_message_selector": self.latest_forward_selector,
+                "latest_message_text_preview": "latest channel message",
+                "latest_message_data_date": "1781000000000",
+                "latest_message_signature": "1781000000000|msg-1|latest channel message",
+                "latest_message_html_summary": '<div aria-label="message-item">latest channel message</div>',
+                "has_text": True,
+                "has_image": False,
+                "has_video": False,
+                "has_file": False,
+                "message_dom_id": "msg-1",
+                "message_timestamp_text": "22:10",
+                "candidate_debug": [{"status": "accepted", "text": "latest channel message"}],
+            }
+        if "clinicos_bale_message_menu_candidates" in script:
+            found = self.menu_found and (self.latest_message_hovered or not self.hover_required)
+            return {
+                "marker": "clinicos_bale_message_menu_candidates",
+                "message_menu_selector": self.menu_selector if found else "",
+                "attempted_selectors": ['[aria-label*="More"]', '[role="button"]'],
+                "candidate_debug": [
+                    {
+                        "scope": args[0] if args else self.latest_forward_selector,
+                        "status": "candidate" if found else "observed",
+                        "aria_label": "More",
+                    }
+                ],
+            }
+        if "clinicos_bale_forward_option_candidates" in script:
+            return {
+                "marker": "clinicos_bale_forward_option_candidates",
+                "forward_option_selector": self.forward_selector if self.forward_found else "",
+                "visible_menu_text": "Forward",
+                "candidate_debug": [{"status": "candidate" if self.forward_found else "observed", "text": "Forward"}],
+            }
+        if "clinicos_bale_forward_picker_state" in script:
+            return {
+                "marker": "clinicos_bale_forward_picker_state",
+                "forward_picker_visible": self.picker_visible,
+                "forward_picker_selector": self.picker_selector if self.picker_visible else "",
+                "candidate_debug": [{"status": "candidate", "text": "Forward to"}] if self.picker_visible else [],
+            }
+        if "clinicos_bale_forward_recipient_search_state" in script:
+            return {
+                "marker": "clinicos_bale_forward_recipient_search_state",
+                "recipient_picker_visible": self.picker_visible,
+                "recipient_search_selector": self.recipient_search_selector if self.search_input_found else "",
+                "selector_attempts": ['div.anWA5J input[type="search"]', 'div.anWA5J input'],
+                "candidate_debug": [{"selector": 'div.anWA5J input[type="search"]', "status": "candidate"}] if self.search_input_found else [],
+            }
+        if "document.querySelector(selector)" in script and "value" in script:
+            for selector, value in reversed(self.filled):
+                if selector == args[0]:
+                    return value
+            return ""
+        if "clinicos_bale_forward_selected_recipients_state" in script:
+            if self.recipient_selected:
+                self.selected_state_evaluations_after_click += 1
+                if self.selected_state_evaluations_after_click >= 2:
+                    for delayed_name in self.delayed_extra_selected_after_target:
+                        if delayed_name not in self.selected_names:
+                            self.selected_names.append(delayed_name)
+            return {
+                "marker": "clinicos_bale_forward_selected_recipients_state",
+                "selected_count": len(self.selected_names),
+                "selected_names": list(self.selected_names),
+                "selected_recipients": [
+                    {
+                        "selector": f'[data-clinicos-selected-recipient="{index}"]',
+                        "click_selector": f'[data-clinicos-selected-recipient="{index}"]',
+                        "text": name,
+                        "selected": True,
+                        "checkbox_radio_state": True,
+                        "aria_selected": "true",
+                        "bounding_box": {"x": 10, "y": 40 + index * 20, "width": 240, "height": 18},
+                    }
+                    for index, name in enumerate(self.selected_names)
+                ],
+            }
+        if "clinicos_bale_forward_recipient_click_diagnostic" in script:
+            target = "Bale-000001"
+            selector = args[0].get("clickSelector") if args and isinstance(args[0], dict) else self.recipient_result_selector
+            return {
+                "marker": "clinicos_bale_forward_recipient_click_diagnostic",
+                "click_safe": self.click_diagnostic_safe,
+                "target_row_selector": selector,
+                "target_row_text": target if self.click_diagnostic_safe else "Bale-000001 sahar",
+                "target_row_name": target if self.click_diagnostic_safe else "Bale-000001 sahar",
+                "target_name_selector": selector,
+                "target_click_selector": selector,
+                "target_click_bounding_box": {"x": 10, "y": 80, "width": 240, "height": 18},
+                "target_click_point": {"x": 130, "y": 89},
+                "element_from_point_tag": "div",
+                "element_from_point_text": target if self.click_diagnostic_safe else "sahar",
+                "element_from_point_row_name": target if self.click_diagnostic_safe else "sahar",
+                "overlapping_recipient_rows": (
+                    [{"index": 0, "text": target, "contains_click_point": True}, {"index": 1, "text": "sahar", "contains_click_point": True}]
+                    if not self.click_diagnostic_safe
+                    else [{"index": 0, "text": target, "contains_click_point": True}]
+                ),
+                "unique_recipient_rows_at_click_point": 2 if not self.click_diagnostic_safe else 1,
+                "nested_elements_same_row_count": 1,
+                "clickable_descendants": [{"tag": "div", "text": target, "selector": selector}],
+                "clickable_ancestor_chain": [{"tag": "div", "text": target, "selector": selector}],
+            }
+        if "picker_outer_html_excerpt" in script:
+            rejected = []
+            for name in self.selected_names:
+                if len(name.strip()) < 3:
+                    rejected.append({
+                        "rejected_candidate_reason": "name_too_short",
+                        "candidate_text": name,
+                        "candidate_role": "button",
+                        "candidate_aria_label": "",
+                        "candidate_aria_selected": "",
+                        "candidate_checked": False,
+                        "candidate_classes": "chip",
+                        "candidate_parent_text": name,
+                        "candidate_outer_html_excerpt": f"<div>{name}</div>",
+                        "candidate_bounding_box": {"x": 10, "y": 550, "width": 50, "height": 28},
+                        "clickable_ancestor_chain": [],
+                        "source": "selected_chip",
+                    })
+            selected_chips = [
+                {
+                    "text": name,
+                    "selector": f'[data-clinicos-selected-recipient="{index}"]',
+                    "selected": True,
+                    "bounding_box": {"x": 10, "y": 550 + index * 30, "width": 160, "height": 28},
+                    "proposed_remove_selector": f'[data-clinicos-selected-recipient-remove="{index}"]',
+                    "proposed_remove_parent_text": name,
+                    "candidate_outer_html_excerpt": f"<div>{name}<button aria-label=\"remove\"></button></div>",
+                    "clickable_ancestor_chain": [],
+                }
+                for index, name in enumerate(self.selected_names)
+                if len(name.strip()) >= 3 and not name.strip().isdigit()
+            ]
+            selected_names = [item["text"] for item in selected_chips]
+            return {
+                "dry_run": True,
+                "picker_verified": self.picker_visible and self.search_input_found,
+                "picker_structure": {
+                    "has_picker": self.picker_visible,
+                    "has_search_input": self.search_input_found,
+                    "has_list_or_empty_state": True,
+                    "success_toast_visible": False,
+                },
+                "picker_selector": "div.anWA5J",
+                "picker_outer_html_excerpt": "<div class=\"anWA5J\"><input /></div>",
+                "modal_root_selector": '[data-clinicos-forensic="modal-root"]',
+                "modal_root_outer_html_excerpt": "<div role=\"dialog\"><div class=\"anWA5J\"><input /></div><footer>sahar</footer></div>" if self.footer_chips_outside_picker else "<div role=\"dialog\"><div class=\"anWA5J\"><input /></div></div>",
+                "picker_bounding_box": {"x": 448, "y": 54, "width": 384, "height": 612},
+                "picker_search_inputs": [{"selector": self.recipient_search_selector, "tag": "input", "enabled": True, "editable": True}],
+                "visible_buttons": [],
+                "visible_rows": [{"text": name, "role": "button"} for name in self.recipients],
+                "selected_row_candidates": [],
+                "selected_chip_candidates": selected_chips,
+                "selected_names_before_search": selected_names,
+                "selected_count_before_search": len(selected_names),
+                "sahar_selected": "sahar" in selected_names,
+                "rejected_selected_candidates": rejected,
+                "rejected_candidate_reasons": [item["rejected_candidate_reason"] for item in rejected],
+                "remove_control_candidates": [
+                    {
+                        "text": item["text"],
+                        "proposed_remove_selector": item["proposed_remove_selector"],
+                        "proposed_remove_parent_text": item["proposed_remove_parent_text"],
+                    }
+                    for item in selected_chips
+                ],
+                "destructive_clicks_attempted": 0,
+            }
+        if "clinicos_bale_forward_recipient_candidates" in script:
+            target = str(args[0] if args else "")
+            return {
+                "marker": "clinicos_bale_forward_recipient_candidates",
+                "recipient_candidates": [
+                    {
+                        "selector": f'[data-clinicos-recipient-result="{index}"]',
+                        "click_selector": f'[data-clinicos-recipient-result="{index}"]',
+                        "text": name,
+                        "row_name": name,
+                        "normalized_name": name,
+                        "selected": name in self.selected_names,
+                        "checkbox_radio_state": name in self.selected_names,
+                        "aria_selected": "true" if name in self.selected_names else "false",
+                        "aria_label": "",
+                        "exact_text": name,
+                        "title": "",
+                        "role": "button",
+                        "className": "recipient",
+                        "exact_match": name == target,
+                        "bounding_box": {"x": 10, "y": 80 + index * 20, "width": 240, "height": 18},
+                    }
+                    for index, name in enumerate(self.recipients)
+                    if target in name
+                ],
+            }
+        if "clinicos_bale_forward_confirm_button_state" in script:
+            return {
+                "marker": "clinicos_bale_forward_confirm_button_state",
+                "confirm_button_selector": self.confirm_selector if self.confirm_found else "",
+                "candidate_debug": [{"text": "Forward", "aria_label": "Forward", "role": "button", "className": "send", "enabled": self.confirm_found, "status": "candidate"}],
+            }
+        if "clinicos_bale_forward_success_state" in script:
+            multi_recipient = "2 chat" in self.success_toast_text or "2 chats" in self.success_toast_text
+            one_recipient = "1 chat" in self.success_toast_text or "1 chats" in self.success_toast_text
+            return {
+                "marker": "clinicos_bale_forward_success_state",
+                "recipient_picker_visible": False if self.confirm_clicked and self.verify_success else self.picker_visible,
+                "forward_verified": bool(self.confirm_clicked and self.verify_success and not multi_recipient),
+                "verification_method": "recipient_picker_closed" if self.confirm_clicked and self.verify_success else "",
+                "success_toast_text": self.success_toast_text if self.confirm_clicked and self.verify_success else "",
+                "verified_forward_recipient_count": 2 if multi_recipient else (1 if one_recipient else 0),
+            }
+        return super().evaluate(script)
+
+    def fill(self, selector: str, text: str, timeout: int) -> None:
+        super().fill(selector, text, timeout)
+
+    def click(self, selector: str, timeout: int) -> None:
+        super().click(selector, timeout)
+        if selector == self.forward_selector and self.forward_picker_available:
+            self.picker_visible = True
+            self.forward_picker_reopen_count += 1
+            self.visible_selectors.add(self.picker_selector)
+            if self.search_input_found:
+                self.visible_selectors.add(self.recipient_search_selector)
+            if self.confirm_found:
+                self.visible_selectors.add(self.confirm_selector)
+            for index, _name in enumerate(self.recipients):
+                self.visible_selectors.add(f'[data-clinicos-recipient-result="{index}"]')
+        if selector.startswith('[data-clinicos-selected-recipient=') or selector.startswith('[data-clinicos-selected-recipient"'):
+            try:
+                index = int(selector.split('"')[1])
+            except Exception:
+                index = -1
+            if 0 <= index < len(self.selected_names):
+                self.selected_names.pop(index)
+            elif self.selected_names:
+                self.selected_names.pop(0)
+        if selector.startswith('[data-clinicos-recipient-result=') or selector.startswith('[data-clinicos-recipient-result"') or selector == self.recipient_result_selector:
+            try:
+                index = int(selector.split('"')[1])
+            except Exception:
+                index = 0
+            if 0 <= index < len(self.recipients):
+                name = self.recipients[index]
+                if name not in self.selected_names:
+                    self.selected_names.append(name)
+                for extra_name in self.extra_selected_after_target:
+                    if extra_name not in self.selected_names:
+                        self.selected_names.append(extra_name)
+                self.recipient_selected = True
+        if selector == self.confirm_selector:
+            self.confirm_clicked = True
+            self.final_forwarded_recipients = list(self.selected_names)
+            if self.verify_success:
+                self.picker_visible = False
+                self.visible_selectors.discard(self.picker_selector)
 
 
 class SearchOpensOnClickPage(MockPage):
@@ -745,6 +1181,9 @@ def test_bale_plugin_loads() -> None:
     assert plugin.platform_id == "bale"
     assert hasattr(plugin, "open_account")
     assert hasattr(plugin, "send_test_message")
+    assert hasattr(plugin, "save_bale_contact")
+    assert hasattr(plugin, "open_bale_source_channel")
+    assert hasattr(plugin, "locate_latest_channel_message")
 
 
 def test_scenario_files_parse() -> None:
@@ -1397,146 +1836,6 @@ def test_bale_contact_phone_strips_iran_country_code_for_contact_modal() -> None
     assert phone_for_bale_contact_field("+989304073331") == "9304073331"
     assert phone_for_bale_contact_field("09304073331") == "9304073331"
     assert phone_for_bale_contact_field("9304073331") == "9304073331"
-
-
-def _forward_payload(**overrides: object) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "source": {
-            "type": "channel",
-            "channel_url": "https://web.bale.ai/channel/source",
-            "channel_name": "Default Bale Source Channel",
-            "message_selector": {"strategy": "latest_visible"},
-        },
-        "target": {"phone": "989304073331", "name": "Bale-000001"},
-        "normalized_phone": "989304073331",
-        "contact_naming_value": "Bale-000001",
-    }
-    payload.update(overrides)
-    return payload
-
-
-def test_forward_latest_channel_message_exists_as_separate_action() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    assert hasattr(plugin, "forward_latest_channel_message")
-    assert callable(plugin.forward_latest_channel_message)
-    assert callable(plugin.send_text_message)
-    assert plugin.forward_latest_channel_message != plugin.send_text_message
-
-
-def test_forward_latest_channel_message_missing_channel_url_fails_validation() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    result = plugin.forward_latest_channel_message(
-        "bale_test",
-        _forward_payload(source={"type": "channel", "channel_url": ""}),
-    )
-    assert result["success"] is False
-    assert result["error_code"] == "missing_channel_url"
-    assert result["failed_step"] == "validate_input"
-
-
-def test_forward_latest_channel_message_defaults_missing_selector_to_latest_visible() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    context_result = plugin._build_forward_latest_channel_message_context(
-        _forward_payload(source={"type": "channel", "channel_url": "https://web.bale.ai/channel/source"})
-    )
-    assert context_result["success"] is True
-    assert context_result["context"]["message_selector"]["strategy"] == "latest_visible"
-
-
-def test_forward_latest_channel_message_unsupported_selector_fails_validation() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    result = plugin.forward_latest_channel_message(
-        "bale_test",
-        _forward_payload(
-            source={
-                "type": "channel",
-                "channel_url": "https://web.bale.ai/channel/source",
-                "message_selector": {"strategy": "pinned"},
-            }
-        ),
-    )
-    assert result["success"] is False
-    assert result["error_code"] == "unsupported_message_selector"
-    assert result["failed_step"] == "validate_input"
-
-
-def test_forward_latest_channel_message_channel_latest_maps_to_latest_visible() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    context_result = plugin._build_forward_latest_channel_message_context(
-        _forward_payload(source={"type": "channel_latest", "channel_url": "https://web.bale.ai/channel/source"})
-    )
-    assert context_result["success"] is True
-    assert context_result["context"]["message_selector"]["strategy"] == "latest_visible"
-
-
-def test_forward_latest_channel_message_input_mapping_matches_old_context() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    context_result = plugin._build_forward_latest_channel_message_context(_forward_payload())
-    context = context_result["context"]
-    assert context["channel_url"] == "https://web.bale.ai/channel/source"
-    assert context["message_selector"]["strategy"] == "latest_visible"
-    assert context["contacts"][0]["phone"] == "989304073331"
-    assert context["contacts"][0]["name"] == "Bale-000001"
-    assert context["contacts"][0]["username"] == ""
-    assert context["method"] == "phone"
-    assert context["phone_name"] == "phone"
-
-
-def test_forward_latest_channel_message_uses_phone_as_name_when_name_missing() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    context_result = plugin._build_forward_latest_channel_message_context(
-        _forward_payload(target={"phone": "989304073331"}, contact_naming_value="")
-    )
-    assert context_result["context"]["contacts"][0]["name"] == "989304073331"
-
-
-def test_forward_latest_channel_message_missing_target_phone_fails_validation() -> None:
-    plugin = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))
-    result = plugin.forward_latest_channel_message(
-        "bale_test",
-        _forward_payload(target={"name": "Bale-000001"}, normalized_phone=""),
-    )
-    assert result["success"] is False
-    assert result["error_code"] == "missing_target_phone"
-    assert result["failed_step"] == "validate_input"
-
-
-def test_forward_latest_channel_message_old_scenario_schema_is_accepted() -> None:
-    scenario_path = Path(__file__).parent / "modules" / "automation_engine" / "scenarios" / "bale" / "forward_latest_channel_message.json"
-    scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
-    assert set(scenario.keys()) == {"context", "elements", "steps"}
-    runner = ScenarioRunner(MockPage(set()), scenario_path, {"channel_url": "https://web.bale.ai/channel/source"})
-    assert runner.scenario["context"] == {}
-    assert isinstance(runner.scenario["elements"], dict)
-    assert isinstance(runner.scenario["steps"], list)
-
-
-def test_scenario_runner_interpolates_forward_context_values() -> None:
-    scenario_path = Path(__file__).parent / "modules" / "automation_engine" / "scenarios" / "bale" / "forward_latest_channel_message.json"
-    runner = ScenarioRunner(
-        MockPage(set()),
-        scenario_path,
-        {
-            "channel_url": "https://web.bale.ai/channel/source",
-            "message_selector": {"strategy": "latest_visible"},
-            "contact": {"phone": "989304073331", "name": "Bale-000001", "username": ""},
-        },
-    )
-    assert runner.interpolate("{{channel_url}}") == "https://web.bale.ai/channel/source"
-    assert runner.interpolate("{{contact.phone}}") == "989304073331"
-    assert runner.interpolate("{{contact.name}}") == "Bale-000001"
-    assert runner.interpolate("{{message_selector.strategy}}") == "latest_visible"
-
-
-def test_scenario_runner_missing_selector_fails_clearly() -> None:
-    page = MockPage(set(), url="https://web.bale.ai/chat")
-    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
-    result = plugin.forward_latest_channel_message("bale_test", _forward_payload())
-    assert result["success"] is False
-    assert "selector" in result["error_code"]
-    assert result["failed_step"]
-    assert result["screenshot_path"]
-    assert result["current_url"] == "https://web.bale.ai/channel/source"
 
 
 def test_send_text_message_target_not_found_returns_open_target_chat_failure() -> None:
@@ -2784,6 +3083,16 @@ def test_api_routes_import() -> None:
     assert "/automation/platforms/bale/send-test" in paths
     assert "/automation/platforms/bale/latest-job" in paths
     assert "/automation/platforms/bale/jobs" in paths
+    assert "/automation/platforms/bale/contacts" in paths
+    assert "/automation/platforms/bale/contacts/bulk" in paths
+    assert "/automation/platforms/bale/source-channel" in paths
+    assert "/automation/platforms/bale/forward-latest/preview" in paths
+    assert "/automation/platforms/bale/save-contact" in paths
+    assert "/automation/platforms/bale/open-source-channel" in paths
+    assert "/automation/platforms/bale/locate-latest-channel-message" in paths
+    assert "/automation/platforms/bale/open-message-forward" in paths
+    assert "/automation/platforms/bale/forward-message-to-contact" in paths
+    assert "/automation/platforms/bale/forward-latest-channel-message" in paths
     assert "/automation/platforms/bale/message-config" in paths
     assert "/automation/platforms/bale/profile-groups" in paths
     assert "/automation/platforms/bale/accounts/{account_id}/assign-profile-group" in paths
@@ -2920,6 +3229,1652 @@ def test_bale_account_persistence_create_edit_delete() -> None:
         result = reloaded.delete_account(account["account_id"])
         assert result["ok"] is True
         assert reloaded.get_account(account["account_id"]) is None
+
+
+def test_bale_phone_normalization_equivalent_forms() -> None:
+    assert normalize_bale_phone("09304073331") == "989304073331"
+    assert normalize_bale_phone("+989304073331") == "989304073331"
+    assert normalize_bale_phone("989304073331") == "989304073331"
+
+
+def test_bale_phone_normalization_rejects_invalid() -> None:
+    try:
+        normalize_bale_phone("invalid")
+    except BaleContactError as exc:
+        assert exc.error_code == "invalid_phone"
+    else:
+        raise AssertionError("invalid phone should fail")
+
+
+def test_bale_contact_existing_phone_returns_same_display_name() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        first, first_created = store.get_or_create_bale_contact("bale_test", "09304073331")
+        second, second_created = store.get_or_create_bale_contact("bale_test", "+989304073331")
+        assert first_created is True
+        assert second_created is False
+        assert second["display_name"] == first["display_name"] == "Bale-000001"
+
+
+def test_bale_contact_new_numbers_receive_sequential_names() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        first, _ = store.get_or_create_bale_contact("bale_test", "09304073331")
+        second, _ = store.get_or_create_bale_contact("bale_test", "09121234567")
+        assert first["display_name"] == "Bale-000001"
+        assert second["display_name"] == "Bale-000002"
+
+
+def test_bale_contact_bulk_insert_created_existing_invalid() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        store.get_or_create_bale_contact("bale_test", "09304073331")
+        result = store.bulk_add_bale_contacts("bale_test", ["09304073331", "09121234567", "invalid"])
+        assert result["total"] == 3
+        assert result["created_count"] == 1
+        assert result["existing_count"] == 1
+        assert result["invalid_count"] == 1
+        assert [item["status"] for item in result["results"]] == ["existing", "created", "invalid"]
+        assert result["results"][1]["display_name"] == "Bale-000002"
+
+
+def test_bale_contacts_are_unique_per_account() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        first, _ = store.get_or_create_bale_contact("bale_a", "09304073331")
+        second, _ = store.get_or_create_bale_contact("bale_b", "09304073331")
+        assert first["display_name"] == "Bale-000001"
+        assert second["display_name"] == "Bale-000001"
+        assert len(store.list_bale_contacts("bale_a")) == 1
+        assert len(store.list_bale_contacts("bale_b")) == 1
+
+
+def _save_bale_contact_ready_page() -> MockPage:
+    return MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+        },
+        url="https://web.bale.ai/chat",
+    )
+
+
+def test_save_bale_contact_new_contact() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        page = _save_bale_contact_ready_page()
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        result = plugin.save_bale_contact("bale_action", "09304073331")
+
+    assert result["success"] is True
+    assert result["action"] == "save_bale_contact"
+    assert result["phone_normalized"] == "989304073331"
+    assert result["display_name"] == "Bale-000001"
+    assert result["contact_store_status"] == "created"
+    assert result["contact_save_status"] == "saved"
+    assert result["failed_step"] is None
+    assert result["last_successful_step"] == "verify_result"
+    assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
+    assert (selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9304073331") in page.filled
+
+
+def test_save_bale_contact_existing_contact_uses_stable_display_name() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        existing, _ = store.get_or_create_bale_contact("bale_action", "989304073331")
+        page = _save_bale_contact_ready_page()
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = store
+        result = plugin.save_bale_contact("bale_action", "+989304073331")
+
+    assert existing["display_name"] == "Bale-000001"
+    assert result["success"] is True
+    assert result["phone_normalized"] == "989304073331"
+    assert result["display_name"] == "Bale-000001"
+    assert result["contact_store_status"] == "existing"
+    assert (selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001") in page.filled
+
+
+def test_save_bale_contact_invalid_phone_fails_before_browser() -> None:
+    page = _save_bale_contact_ready_page()
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.save_bale_contact("bale_action", "invalid")
+
+    assert result["success"] is False
+    assert result["action"] == "save_bale_contact"
+    assert result["error_code"] == "invalid_phone"
+    assert result["failed_step"] == "normalize_phone"
+    assert page.urls == []
+
+
+def test_save_bale_contact_route_persists_diagnostic_job_with_null_scenario_id() -> None:
+    class SaveContactPlugin:
+        def save_bale_contact(self, account_id: str, phone: str, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "save_bale_contact",
+                "account_id": account_id,
+                "phone": phone,
+                "phone_normalized": "989304073331",
+                "display_name": "Bale-000001",
+                "failed_step": None,
+                "last_successful_step": "verify_result",
+                "error_code": None,
+                "error_message": None,
+                "step_results": [{"step": "verify_result", "status": "success"}],
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = SaveContactPlugin()
+        try:
+            response = TestClient(app).post(
+                "/automation/platforms/bale/save-contact",
+                json={"account_id": "bale_route", "phone": "09304073331"},
+            )
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "save_bale_contact"
+    latest = latest_response.json()
+    assert latest["action"] == "save_bale_contact"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "completed"
+    assert latest["plugin_result"]["action"] == "save_bale_contact"
+
+
+def test_open_bale_source_channel_valid_uid_builds_correct_url() -> None:
+    page = SourceChannelReadinessPage(
+        {
+            "ready": True,
+            "target_channel_panel_visible": True,
+            "target_channel_header_text": "Source Channel",
+            "target_channel_header_selector": "[data-testid=\"chat-header\"]",
+            "message_stream_visible": True,
+            "message_stream_selector": "[data-testid=\"message-list\"]",
+            "center_panel_visible_text_sample": "Source Channel latest post",
+        }
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    assert result["success"] is True
+    assert result["action"] == "open_bale_source_channel"
+    assert result["requested_channel_url"] == "https://web.bale.ai/chat?uid=5613544284"
+    assert page.urls[-1] == "https://web.bale.ai/chat?uid=5613544284"
+
+
+def test_open_bale_source_channel_invalid_uid_fails_before_browser_launch() -> None:
+    page = SourceChannelReadinessPage({})
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "bad uid!")
+
+    assert result["success"] is False
+    assert result["error_code"] == "invalid_source_channel_uid"
+    assert result["failed_step"] == "validate_source_channel_uid"
+    assert page.urls == []
+
+
+def test_open_bale_source_channel_shell_only_page_is_rejected() -> None:
+    page = SourceChannelReadinessPage(
+        {
+            "ready": False,
+            "target_channel_panel_visible": False,
+            "target_channel_header_text": "",
+            "target_channel_header_selector": "",
+            "message_stream_visible": False,
+            "message_stream_selector": "",
+            "center_panel_visible_text_sample": "",
+        }
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    assert result["success"] is False
+    assert result["error_code"] == "source_channel_not_ready"
+    assert result["failed_step"] == "wait_source_channel_ready"
+    assert result["target_channel_panel_visible"] is False
+    assert result["message_stream_visible"] is False
+
+
+def test_open_bale_source_channel_center_channel_panel_is_accepted() -> None:
+    page = SourceChannelReadinessPage(
+        {
+            "ready": True,
+            "target_channel_panel_visible": True,
+            "target_channel_panel_selector": ".main-section-container",
+            "target_channel_header_text": "Low Member Channel",
+            "target_channel_header_selector": "header.channel-header",
+            "message_stream_visible": True,
+            "message_stream_selector": "div.message-stream",
+            "center_panel_visible_text_sample": "Low Member Channel newest post",
+        }
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    assert result["success"] is True
+    assert result["target_channel_panel_visible"] is True
+    assert result["target_channel_panel_selector"] == ".main-section-container"
+    assert result["target_channel_header_text"] == "Low Member Channel"
+    assert result["target_channel_header_selector"] == "header.channel-header"
+    assert result["message_stream_visible"] is True
+    assert result["message_stream_selector"] == "div.message-stream"
+    assert result["last_successful_step"] == "wait_source_channel_ready"
+
+
+def test_open_bale_source_channel_message_stream_visibility_is_required() -> None:
+    page = SourceChannelReadinessPage(
+        {
+            "ready": False,
+            "target_channel_panel_visible": True,
+            "target_channel_header_text": "Source Channel",
+            "target_channel_header_selector": "header.channel-header",
+            "message_stream_visible": False,
+            "message_stream_selector": "",
+            "center_panel_visible_text_sample": "Source Channel",
+        }
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    assert result["success"] is False
+    assert result["target_channel_panel_visible"] is True
+    assert result["target_channel_header_text"] == "Source Channel"
+    assert result["message_stream_visible"] is False
+    assert result["error_code"] == "source_channel_not_ready"
+
+
+def test_open_bale_source_channel_route_persists_diagnostic_job_with_null_scenario_id() -> None:
+    class OpenSourceChannelPlugin:
+        def open_bale_source_channel(self, account_id: str, source_channel_uid: str, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "open_bale_source_channel",
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "requested_channel_url": f"https://web.bale.ai/chat?uid={source_channel_uid}",
+                "final_page_url": f"https://web.bale.ai/chat?uid={source_channel_uid}",
+                "target_channel_panel_visible": True,
+                "target_channel_header_text": "Source Channel",
+                "target_channel_header_selector": "header.channel-header",
+                "message_stream_visible": True,
+                "message_stream_selector": "div.message-stream",
+                "center_panel_visible_text_sample": "Source Channel newest post",
+                "full_page_visible_text_sample": "Source Channel newest post",
+                "readiness_attempts": [],
+                "readiness_duration_ms": 1,
+                "failed_step": None,
+                "last_successful_step": "wait_source_channel_ready",
+                "error_code": None,
+                "error_message": None,
+                "duration_ms": 1,
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = OpenSourceChannelPlugin()
+        try:
+            response = TestClient(app).post(
+                "/automation/platforms/bale/open-source-channel",
+                json={"account_id": "bale_route", "source_channel_uid": "5613544284"},
+            )
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert response.status_code == 200
+    latest = latest_response.json()
+    assert latest["action"] == "open_bale_source_channel"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "completed"
+    assert latest["plugin_result"]["action"] == "open_bale_source_channel"
+
+
+def _ready_source_channel() -> dict[str, object]:
+    return {
+        "ready": True,
+        "target_channel_panel_visible": True,
+        "target_channel_panel_selector": ".main-section-container",
+        "target_channel_header_text": "Source Channel",
+        "target_channel_header_selector": 'div[aria-label="ChatAppBar"]',
+        "message_stream_visible": True,
+        "message_stream_selector": "#message_list_scroller_id",
+        "center_panel_visible_text_sample": "Source Channel messages",
+    }
+
+
+def test_locate_latest_channel_message_message_stream_required() -> None:
+    page = LocateLatestChannelMessagePage(
+        {
+            "ready": False,
+            "target_channel_panel_visible": True,
+            "target_channel_header_text": "Source Channel",
+            "target_channel_header_selector": 'div[aria-label="ChatAppBar"]',
+            "message_stream_visible": False,
+            "message_stream_selector": "",
+        },
+        {},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.locate_latest_channel_message("bale_locate", "5613544284")
+
+    assert result["success"] is False
+    assert result["error_code"] == "source_channel_not_ready"
+    assert result["failed_step"] == "wait_source_channel_ready"
+
+
+def test_locate_latest_channel_message_shell_only_page_rejected() -> None:
+    page = LocateLatestChannelMessagePage(
+        {
+            "ready": False,
+            "target_channel_panel_visible": False,
+            "target_channel_header_text": "",
+            "target_channel_header_selector": "",
+            "message_stream_visible": False,
+            "message_stream_selector": "",
+        },
+        {},
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.locate_latest_channel_message("bale_locate", "5613544284")
+
+    assert result["success"] is False
+    assert result["message_found"] is False
+    assert result["candidate_count"] == 0
+
+
+def test_locate_latest_channel_message_inspects_center_panel_only() -> None:
+    page = LocateLatestChannelMessagePage(
+        _ready_source_channel(),
+        {
+            "message_found": True,
+            "candidate_count": 1,
+            "message_selector_used": '[aria-label="message-item"], .message-item',
+            "candidate_debug": [{"status": "accepted", "text": "center message"}],
+            "text_preview": "center message",
+            "has_text": True,
+        },
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.locate_latest_channel_message("bale_locate", "5613544284")
+
+    assert result["success"] is True
+    assert result["message_selector_used"] == '[aria-label="message-item"], .message-item'
+    assert result["candidate_debug"][0]["text"] == "center message"
+
+
+def test_locate_latest_channel_message_date_and_service_rows_rejected() -> None:
+    page = LocateLatestChannelMessagePage(
+        _ready_source_channel(),
+        {
+            "message_found": True,
+            "candidate_count": 1,
+            "message_selector_used": '[aria-label="message-item"], .message-item',
+            "candidate_debug": [
+                {"status": "rejected", "reason": "date_row", "text": "۱۲ خرداد"},
+                {"status": "rejected", "reason": "service_row", "text": "user joined"},
+                {"status": "accepted", "text": "real message"},
+            ],
+            "text_preview": "real message",
+            "has_text": True,
+        },
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.locate_latest_channel_message("bale_locate", "5613544284")
+
+    assert result["success"] is True
+    assert result["candidate_count"] == 1
+    assert any(item.get("reason") == "date_row" for item in result["candidate_debug"])
+    assert any(item.get("reason") == "service_row" for item in result["candidate_debug"])
+
+
+def test_locate_latest_channel_message_latest_dom_message_selected_and_media_flags() -> None:
+    page = LocateLatestChannelMessagePage(
+        _ready_source_channel(),
+        {
+            "message_found": True,
+            "candidate_count": 2,
+            "message_selector_used": '[aria-label="message-item"], .message-item',
+            "candidate_debug": [
+                {"status": "accepted", "text": "older message"},
+                {"status": "accepted", "text": "latest message"},
+            ],
+            "text_preview": "latest message",
+            "has_text": True,
+            "has_image": True,
+            "has_video": False,
+            "has_file": True,
+            "message_dom_id": "msg-2",
+            "message_timestamp_text": "21:10",
+        },
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.locate_latest_channel_message("bale_locate", "5613544284")
+
+    assert result["success"] is True
+    assert result["candidate_count"] == 2
+    assert result["text_preview"] == "latest message"
+    assert result["has_text"] is True
+    assert result["has_image"] is True
+    assert result["has_video"] is False
+    assert result["has_file"] is True
+    assert result["message_dom_id"] == "msg-2"
+    assert result["message_timestamp_text"] == "21:10"
+
+
+def test_locate_latest_channel_message_route_persists_diagnostic_job_with_null_scenario_id() -> None:
+    class LocateLatestPlugin:
+        def locate_latest_channel_message(self, account_id: str, source_channel_uid: str, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "locate_latest_channel_message",
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "requested_channel_url": f"https://web.bale.ai/chat?uid={source_channel_uid}",
+                "final_page_url": f"https://web.bale.ai/chat?uid={source_channel_uid}",
+                "message_found": True,
+                "candidate_count": 1,
+                "message_selector_used": '[aria-label="message-item"], .message-item',
+                "candidate_debug": [{"status": "accepted", "text": "latest"}],
+                "text_preview": "latest",
+                "has_text": True,
+                "has_image": False,
+                "has_video": False,
+                "has_file": False,
+                "message_dom_id": None,
+                "message_timestamp_text": "21:10",
+                "failed_step": None,
+                "last_successful_step": "locate_latest_channel_message",
+                "error_code": None,
+                "error_message": None,
+                "step_results": [],
+                "duration_ms": 1,
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = LocateLatestPlugin()
+        try:
+            response = TestClient(app).post(
+                "/automation/platforms/bale/locate-latest-channel-message",
+                json={"account_id": "bale_route", "source_channel_uid": "5613544284"},
+            )
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert response.status_code == 200
+    latest = latest_response.json()
+    assert latest["action"] == "locate_latest_channel_message"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "completed"
+    assert latest["plugin_result"]["action"] == "locate_latest_channel_message"
+
+
+def test_open_message_forward_latest_message_is_required() -> None:
+    page = OpenMessageForwardPage(latest_found=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_message_forward("bale_forward", "5613544284")
+
+    assert result["success"] is False
+    assert result["error_code"] == "latest_message_not_found"
+    assert result["failed_step"] == "locate_latest_channel_message"
+
+
+def test_open_message_forward_menu_discovery_runs_inside_latest_message() -> None:
+    page = OpenMessageForwardPage()
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_message_forward("bale_forward", "5613544284")
+
+    assert result["success"] is True
+    assert result["latest_message_selector"] == OpenMessageForwardPage.latest_forward_selector
+    assert any(item.get("scope") == OpenMessageForwardPage.latest_forward_selector for item in result["candidate_debug"])
+
+
+def test_open_message_forward_supports_hover_only_controls() -> None:
+    page = OpenMessageForwardPage(hover_required=True)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_message_forward("bale_forward", "5613544284")
+
+    assert result["success"] is True
+    assert page.latest_message_hovered is True
+    assert result["message_menu_opened"] is True
+
+
+def test_open_message_forward_menu_open_success_and_forward_detected() -> None:
+    page = OpenMessageForwardPage()
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_message_forward("bale_forward", "5613544284")
+
+    assert result["success"] is True
+    assert result["message_menu_opened"] is True
+    assert result["message_menu_selector"] == OpenMessageForwardPage.menu_selector
+    assert result["forward_option_found"] is True
+    assert result["forward_option_selector"] == OpenMessageForwardPage.forward_selector
+
+
+def test_open_message_forward_recipient_picker_visibility_required() -> None:
+    page = OpenMessageForwardPage(picker_visible=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_message_forward("bale_forward", "5613544284")
+
+    assert result["success"] is False
+    assert result["error_code"] == "forward_picker_not_visible"
+    assert result["failed_step"] == "verify_forward_picker"
+
+
+def test_open_message_forward_does_not_select_recipient_or_confirm() -> None:
+    page = OpenMessageForwardPage()
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_message_forward("bale_forward", "5613544284")
+
+    assert result["success"] is True
+    assert page.clicked == [OpenMessageForwardPage.menu_selector, OpenMessageForwardPage.forward_selector]
+    assert not any("recipient" in selector.lower() or "send" in selector.lower() for selector in page.clicked)
+
+
+def test_open_message_forward_route_persists_diagnostic_job_with_null_scenario_id() -> None:
+    class OpenForwardPlugin:
+        def open_message_forward(self, account_id: str, source_channel_uid: str, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "open_message_forward",
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "latest_message_selector": OpenMessageForwardPage.latest_forward_selector,
+                "latest_message_text_preview": "latest",
+                "message_menu_opened": True,
+                "message_menu_selector": OpenMessageForwardPage.menu_selector,
+                "forward_option_found": True,
+                "forward_option_selector": OpenMessageForwardPage.forward_selector,
+                "forward_picker_visible": True,
+                "forward_picker_selector": OpenMessageForwardPage.picker_selector,
+                "candidate_debug": [],
+                "click_attempts": [],
+                "failed_step": None,
+                "last_successful_step": "verify_forward_picker",
+                "error_code": None,
+                "error_message": None,
+                "step_results": [],
+                "duration_ms": 1,
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = OpenForwardPlugin()
+        try:
+            response = TestClient(app).post(
+                "/automation/platforms/bale/open-message-forward",
+                json={"account_id": "bale_route", "source_channel_uid": "5613544284"},
+            )
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert response.status_code == 200
+    latest = latest_response.json()
+    assert latest["action"] == "open_message_forward"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "completed"
+    assert latest["plugin_result"]["action"] == "open_message_forward"
+
+
+def test_forward_message_to_contact_exact_recipient_confirmed_and_verified() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is True
+    assert result["action"] == "forward_message_to_contact"
+    assert result["recipient_picker_visible"] is False
+    assert result["recipient_search_selector"] == OpenMessageForwardPage.recipient_search_selector
+    assert result["searched_value"] == "Bale-000001"
+    assert result["exact_recipient_found"] is True
+    assert result["recipient_result_selector"] == OpenMessageForwardPage.recipient_result_selector
+    assert result["recipient_selected"] is True
+    assert result["confirm_button_selector"] == OpenMessageForwardPage.confirm_selector
+    assert result["confirm_clicked"] is True
+    assert result["forward_verified"] is True
+    assert result["verification_method"] == "recipient_picker_closed"
+    assert result["clicks_before_search"] == 0
+    assert result["search_input_value"] == "Bale-000001"
+    assert result["search_input_selector"] == OpenMessageForwardPage.recipient_search_selector
+    assert result["result_set_stable"] is True
+    assert result["visible_result_count"] == 1
+    assert result["visible_result_names"] == ["Bale-000001"]
+    assert result["exact_match_count"] == 1
+    assert result["target_row_name"] == "Bale-000001"
+    assert result["selected_count_before_target"] == 0
+    assert result["selected_count_after_target"] == 1
+    assert result["selected_names_after_target"] == ["Bale-000001"]
+    assert result["selected_count_before_confirm"] == 1
+    assert result["selected_names_before_confirm"] == ["Bale-000001"]
+    assert result["confirm_click_count"] == 1
+    assert result["destructive_clicks_attempted"] == 2
+    assert result["channel_uid_verified"] is True
+    assert result["selected_message_preview"] == "latest channel message"
+    assert result["selected_message_signature"]
+    assert result["verified_forwarded_recipient_count"] == 1
+    assert result["verified_forward_recipient_count"] == 1
+    assert result["final_forwarded_recipient_count"] == 1
+    assert result["diagnostics_consistent"] is True
+    assert result["diagnostics_consistency_errors"] == []
+    assert [item["category"] for item in result["click_classifications"]] == ["exact_recipient_select", "forward_confirm"]
+    assert result["destructive_click_classifications"] == result["click_classifications"]
+    assert result["success_toast_text"] == "sent to 1 chat"
+    assert result["verified_forward_recipient_count"] == 1
+    assert result["effective_source_channel_uid"] == "5613544284"
+    assert page.final_forwarded_recipients == ["Bale-000001"]
+    assert page.clicked.count(OpenMessageForwardPage.recipient_result_selector) == 1
+    assert page.clicked.count(OpenMessageForwardPage.confirm_selector) == 1
+    assert page.typed == []
+    fill_operation = ("fill", OpenMessageForwardPage.recipient_search_selector, "Bale-000001")
+    recipient_click_operation = ("click", OpenMessageForwardPage.recipient_result_selector, None)
+    assert fill_operation in page.operations
+    assert recipient_click_operation in page.operations
+    assert page.operations.index(fill_operation) < page.operations.index(recipient_click_operation)
+    assert not any(
+        operation[0] == "click" and "recipient-result" in operation[1]
+        for operation in page.operations[: page.operations.index(fill_operation)]
+    )
+
+
+def test_forward_message_to_contact_preselected_unrelated_contact_is_cleared() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["Unrelated Contact"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is True
+    assert result["preselected_count_initial"] == 1
+    assert result["preselected_names_initial"] == ["Unrelated Contact"]
+    assert result["reset_attempted"] is True
+    assert result["escape_pressed"] is True
+    assert result["picker_closed_after_escape"] is True
+    assert result["page_reloaded"] is True
+    assert result["channel_verified_after_reload"] is True
+    assert result["picker_reopened"] is True
+    assert result["selected_count_after_reset"] == 0
+    assert result["selected_names_after_reset"] == []
+    assert result["reset_cycle_count"] == 1
+    assert '[data-clinicos-selected-recipient="0"]' not in page.clicked
+    assert page.final_forwarded_recipients == ["Bale-000001"]
+
+
+def test_forward_message_to_contact_two_selected_contacts_block_confirmation() -> None:
+    page = OpenMessageForwardPage(
+        recipients=["Bale-000001"],
+        extra_selected_after_target=["Unrelated Contact"],
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "multiple_recipients_selected"
+    assert result["selected_count_after_target"] == 2
+    assert result["selected_names_after_target"] == ["Bale-000001", "Unrelated Contact"]
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert page.final_forwarded_recipients == []
+
+
+def test_forward_message_to_contact_first_visible_row_is_never_clicked_before_search() -> None:
+    page = OpenMessageForwardPage(recipients=["Unrelated Contact", "Bale-000001"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is True
+    assert result["clicks_before_search"] == 0
+    assert '[data-clinicos-recipient-result="0"]' not in page.clicked
+    assert '[data-clinicos-recipient-result="1"]' in page.clicked
+    search_fill_index = page.operations.index(("fill", OpenMessageForwardPage.recipient_search_selector, "Bale-000001"))
+    target_click_index = page.operations.index(("click", '[data-clinicos-recipient-result="1"]', None))
+    assert search_fill_index < target_click_index
+    assert not any(
+        operation[0] == "click" and "recipient-result" in operation[1]
+        for operation in page.operations[:search_fill_index]
+    )
+
+
+def test_forward_message_to_contact_picker_must_be_visible() -> None:
+    page = OpenMessageForwardPage(picker_visible=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "recipient_picker_not_visible"
+    assert result["failed_step"] == "verify_forward_picker"
+
+
+def test_forward_message_to_contact_requires_search_input() -> None:
+    page = OpenMessageForwardPage(search_input_found=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "recipient_search_input_not_found"
+    assert result["recipient_picker_visible"] is True
+
+
+def test_forward_message_to_contact_exact_match_required_and_partial_rejected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001 Extra"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "recipient_not_found"
+    assert result["exact_recipient_found"] is False
+    assert result["exact_match_count"] == 0
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+
+
+def test_forward_message_to_contact_ambiguous_exact_matches_rejected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001", "Bale-000001"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "recipient_results_not_unique"
+    assert result["exact_match_count"] == 2
+    assert result["visible_result_count"] == 2
+    assert result["recipient_selected"] is False
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+
+
+def test_forward_message_to_contact_exact_single_match_is_selected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001 Extra", "Bale-000001"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "recipient_results_not_unique"
+    assert result["exact_match_count"] == 1
+    assert result["visible_result_count"] == 2
+    assert OpenMessageForwardPage.recipient_result_selector not in page.clicked
+    assert page.final_forwarded_recipients == []
+
+
+def test_forward_message_to_contact_confirm_only_with_exactly_one_target_selected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], extra_selected_after_target=["Extra Contact"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["selected_count_before_confirm"] == 0
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert page.confirm_clicked is False
+
+
+def test_forward_message_to_contact_no_duplicate_or_extra_recipient_is_sent() -> None:
+    page = OpenMessageForwardPage(
+        recipients=["Bale-000001"],
+        preselected_recipients=["Unrelated Contact"],
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is True
+    assert result["reset_cycle_count"] == 1
+    assert result["selected_count_after_reset"] == 0
+    assert page.final_forwarded_recipients == ["Bale-000001"]
+
+
+def test_forward_message_to_contact_dry_run_zero_destructive_clicks() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["Unrelated Contact"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", dry_run=True)
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["destructive_clicks_attempted"] == 0
+    assert OpenMessageForwardPage.recipient_result_selector not in page.clicked
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert '[data-clinicos-selected-recipient="0"]' not in page.clicked
+
+
+def test_forward_message_to_contact_single_character_candidates_rejected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["م", "۱"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", dry_run=True)
+
+    rejected_texts = [item["candidate_text"] for item in result["rejected_selected_candidates"]]
+    assert "م" in rejected_texts
+    assert "۱" in rejected_texts
+    assert result["selected_chip_candidates"] == []
+    assert result["destructive_clicks_attempted"] == 0
+
+
+def test_forward_message_to_contact_selected_chip_requires_valid_name_and_remove() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["Bale-000001"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", dry_run=True)
+
+    assert result["selected_chip_candidates"][0]["text"] == "Bale-000001"
+    assert result["selected_chip_candidates"][0]["proposed_remove_selector"]
+    assert result["destructive_clicks_attempted"] == 0
+
+
+def test_forward_message_to_contact_footer_chip_outside_picker_detected_through_modal_root() -> None:
+    page = OpenMessageForwardPage(
+        recipients=["Bale-000001"],
+        preselected_recipients=["sahar"],
+        footer_chips_outside_picker=True,
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", dry_run=True)
+
+    assert result["success"] is True
+    assert result["modal_root_selector"] == '[data-clinicos-forensic="modal-root"]'
+    assert result["selected_names_before_search"] == ["sahar"]
+    assert result["selected_count_before_search"] == 1
+    assert result["sahar_selected"] is True
+    assert result["selected_chip_candidates"][0]["text"] == "sahar"
+    assert result["remove_control_candidates"][0]["proposed_remove_selector"]
+    assert result["destructive_clicks_attempted"] == 0
+    assert OpenMessageForwardPage.recipient_result_selector not in page.clicked
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+
+
+def test_forward_message_to_contact_preselected_recipient_blocks_target_selection_and_confirm() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["sahar"], reset_clears_preselected=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "stale_forward_recipient_state"
+    assert result["preselected_names_initial"] == ["sahar"]
+    assert result["selected_names_after_reset"] == ["sahar"]
+    assert result["reset_cycle_count"] == 1
+    assert OpenMessageForwardPage.recipient_result_selector not in page.clicked
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+
+
+def test_forward_message_to_contact_confirmation_button_required() -> None:
+    page = OpenMessageForwardPage(confirm_found=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "forward_confirm_button_not_found"
+    assert result["recipient_selected"] is True
+
+
+def test_forward_message_to_contact_forward_success_verification_required() -> None:
+    page = OpenMessageForwardPage(verify_success=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "forward_not_verified"
+    assert result["confirm_clicked"] is True
+    assert result["forward_verified"] is False
+
+
+def test_forward_message_to_contact_success_toast_for_two_chats_rejected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="sent to 2 chats")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is False
+    assert result["error_code"] == "unexpected_forward_recipient_count"
+    assert result["confirm_clicked"] is True
+    assert result["confirm_click_count"] == 1
+    assert result["success_toast_text"] == "sent to 2 chats"
+    assert result["verified_forward_recipient_count"] == 2
+    assert result["verified_forwarded_recipient_count"] == 2
+    assert result["final_forwarded_recipient_count"] == 2
+
+
+def test_forward_message_to_contact_one_recipient_success_toast_accepted() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="sent to 1 chat")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is True
+    assert result["confirm_click_count"] == 1
+    assert result["success_toast_text"] == "sent to 1 chat"
+    assert result["diagnostics_consistent"] is True
+    assert result["verified_forwarded_recipient_count"] == 1
+    assert result["verified_forward_recipient_count"] == 1
+    assert result["final_forwarded_recipient_count"] == 1
+    assert result["selected_names_before_confirm"] == ["Bale-000001"]
+    assert page.final_forwarded_recipients == ["Bale-000001"]
+
+
+def test_forward_message_to_contact_picker_closure_alone_does_not_count_verified_recipient() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="")
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
+
+    assert result["success"] is True
+    assert result["forward_verified"] is True
+    assert result["success_toast_text"] == ""
+    assert result["verified_forwarded_recipient_count"] == 0
+    assert result["verified_forward_recipient_count"] == 0
+    assert result["final_forwarded_recipient_count"] == 0
+    assert result["diagnostics_consistent"] is False
+    assert "forward_verified_without_single_verified_recipient_count" in result["diagnostics_consistency_errors"]
+
+
+def test_forward_message_to_contact_diagnostics_report_missing_channel_verification() -> None:
+    plugin = BalePlugin()
+    payload = {
+        "success": True,
+        "forward_verified": True,
+        "confirm_click_count": 1,
+        "display_name": "Bale-000001",
+        "source_channel_uid": "5613544284",
+        "effective_source_channel_uid": "5613544284",
+        "channel_uid_verified": False,
+        "selected_names_before_confirm": ["Bale-000001"],
+        "success_toast_text": "sent to 1 chat",
+        "step_results": [],
+    }
+
+    plugin._normalize_forward_message_to_contact_diagnostics(payload)
+
+    assert payload["verified_forwarded_recipient_count"] == 1
+    assert payload["diagnostics_consistent"] is False
+    assert "success_without_channel_uid_verified" in payload["diagnostics_consistency_errors"]
+
+
+def test_forward_message_to_contact_selection_only_click_element_belongs_to_target_row() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", selection_only=True)
+
+    assert result["success"] is True
+    assert result["selection_only"] is True
+    assert result["clicks_before_search"] == 0
+    assert result["search_input_value"] == "Bale-000001"
+    assert result["visible_result_count"] == 1
+    assert result["visible_result_names"] == ["Bale-000001"]
+    assert result["exact_match_count"] == 1
+    assert result["target_row_text"] == "Bale-000001"
+    assert result["target_row_name"] == "Bale-000001"
+    assert result["element_from_point_row_name"] == "Bale-000001"
+    assert result["recipient_click_count"] == 1
+    assert result["selected_names_after_click"] == ["Bale-000001"]
+    assert result["selected_names_after_500ms"] == ["Bale-000001"]
+    assert result["sahar_selected"] is False
+    assert result["confirm_click_count"] == 0
+    assert result["verified_forward_recipient_count"] == 0
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert page.final_forwarded_recipients == []
+    fill_operation = ("fill", OpenMessageForwardPage.recipient_search_selector, "Bale-000001")
+    recipient_click_operation = ("click", OpenMessageForwardPage.recipient_result_selector, None)
+    assert page.operations.index(fill_operation) < page.operations.index(recipient_click_operation)
+
+
+def test_forward_message_to_contact_selection_only_resets_preselected_without_cleanup_clicks() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["Unrelated Contact"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", selection_only=True)
+
+    assert result["success"] is True
+    assert result["preselected_count_initial"] == 1
+    assert result["preselected_names_initial"] == ["Unrelated Contact"]
+    assert result["reset_attempted"] is True
+    assert result["escape_pressed"] is True
+    assert result["picker_closed_after_escape"] is True
+    assert result["page_reloaded"] is True
+    assert result["channel_verified_after_reload"] is True
+    assert result["picker_reopened"] is True
+    assert result["reset_cycle_count"] == 1
+    assert result["selected_count_after_reset"] == 0
+    assert result["selected_names_after_reset"] == []
+    assert result["clicks_before_search"] == 0
+    assert result["search_input_value"] == "Bale-000001"
+    assert result["visible_result_count"] == 1
+    assert result["exact_match_count"] == 1
+    assert result["recipient_click_count"] == 1
+    assert result["selected_names_after_click"] == ["Bale-000001"]
+    assert result["confirm_click_count"] == 0
+    assert result["final_forwarded_recipient_count"] == 0
+    assert page.forward_picker_escape_count == 1
+    assert not any("selected-recipient" in selector for selector in page.clicked)
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert page.final_forwarded_recipients == []
+
+
+def test_forward_message_to_contact_selection_only_persistent_preselection_fails_after_one_reset() -> None:
+    page = OpenMessageForwardPage(
+        recipients=["Bale-000001"],
+        preselected_recipients=["Unrelated Contact"],
+        reset_clears_preselected=False,
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", selection_only=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "stale_forward_recipient_state"
+    assert result["reset_cycle_count"] == 1
+    assert result["selected_count_after_reset"] == 1
+    assert result["selected_names_after_reset"] == ["Unrelated Contact"]
+    assert result["clicks_before_search"] == 0
+    assert result["recipient_click_count"] == 0
+    assert result["confirm_click_count"] == 0
+    assert result["final_forwarded_recipient_count"] == 0
+    assert page.forward_picker_escape_count == 1
+    assert not any("selected-recipient" in selector for selector in page.clicked)
+    assert OpenMessageForwardPage.recipient_result_selector not in page.clicked
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert page.final_forwarded_recipients == []
+
+
+def test_forward_message_to_contact_selection_only_rejects_overlapping_click_point() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], click_diagnostic_safe=False)
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", selection_only=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "destructive_click_blocked"
+    assert result["element_from_point_row_name"] == "sahar"
+    assert page.clicked.count(OpenMessageForwardPage.recipient_result_selector) == 0
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+
+
+def test_forward_message_to_contact_selection_only_reports_all_selected_names_after_click() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], extra_selected_after_target=["sahar"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", selection_only=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "unexpected_selected_recipient"
+    assert result["selected_names_immediately_after_click"] == ["Bale-000001", "sahar"]
+    assert result["selected_names_after_500ms"] == ["Bale-000001", "sahar"]
+    assert result["sahar_selected_immediately"] is True
+    assert result["sahar_selected_after_500ms"] is True
+    assert result["sahar_selected"] is True
+    assert result["confirm_click_count"] == 0
+    assert page.final_forwarded_recipients == []
+
+
+def test_forward_message_to_contact_selection_only_detects_delayed_second_selection() -> None:
+    page = OpenMessageForwardPage(
+        recipients=["Bale-000001"],
+        delayed_extra_selected_after_target=["sahar"],
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001", selection_only=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "unexpected_selected_recipient"
+    assert result["selected_names_immediately_after_click"] == ["Bale-000001"]
+    assert result["selected_names_after_500ms"] == ["Bale-000001", "sahar"]
+    assert result["sahar_selected_immediately"] is False
+    assert result["sahar_selected_after_500ms"] is True
+    assert result["confirm_click_count"] == 0
+    assert page.final_forwarded_recipients == []
+
+
+def test_forward_message_to_contact_route_persists_diagnostic_job_with_null_scenario_id() -> None:
+    class ForwardToContactPlugin:
+        def forward_message_to_contact(self, account_id: str, source_channel_uid: str, display_name: str, dry_run: bool = False, selection_only: bool = False, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "forward_message_to_contact",
+                "account_id": account_id,
+                "source_channel_uid": source_channel_uid,
+                "display_name": display_name,
+                "recipient_picker_visible": False,
+                "recipient_search_selector": OpenMessageForwardPage.recipient_search_selector,
+                "searched_value": display_name,
+                "exact_recipient_found": True,
+                "recipient_result_selector": OpenMessageForwardPage.recipient_result_selector,
+                "recipient_selected": True,
+                "confirm_button_selector": OpenMessageForwardPage.confirm_selector,
+                "confirm_clicked": True,
+                "forward_verified": True,
+                "candidate_debug": [],
+                "click_attempts": [],
+                "failed_step": None,
+                "last_successful_step": "verify_forward_success",
+                "error_code": None,
+                "error_message": None,
+                "screenshot_path": "",
+                "duration_ms": 1,
+                "step_results": [],
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = ForwardToContactPlugin()
+        try:
+            response = TestClient(app).post(
+                "/automation/platforms/bale/forward-message-to-contact",
+                json={"account_id": "bale_route", "source_channel_uid": "5613544284", "display_name": "Bale-000001"},
+            )
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert response.status_code == 200
+    payload = response.json()
+    latest = latest_response.json()
+    assert payload["action"] == "forward_message_to_contact"
+    assert latest["action"] == "forward_message_to_contact"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "completed"
+    assert latest["plugin_result"]["action"] == "forward_message_to_contact"
+
+
+def _forward_latest_page(**kwargs: object) -> OpenMessageForwardPage:
+    page = OpenMessageForwardPage(**kwargs)
+    page.visible_selectors.update(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0],
+        }
+    )
+    return page
+
+
+def _with_temp_bale_account_store(tmp_dir: str, account_id: str = "bale_orchestrator") -> BaleAccountStore:
+    store = BaleAccountStore(Path(tmp_dir) / "accounts")
+    store.create_account(
+        {
+            "account_id": account_id,
+            "phone": "09214032167",
+            "status": "active",
+            "browser_provider": "native_chrome",
+        }
+    )
+    return store
+
+
+def test_forward_latest_channel_message_new_contact_is_saved_then_forwarded() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "5613544284")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(recipients=["Bale-000001"])
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is True
+    assert result["action"] == "forward_latest_channel_message"
+    assert result["contact_created"] is True
+    assert result["contact_reused"] is False
+    assert result["display_name"] == "Bale-000001"
+    assert result["effective_source_channel_uid"] == "5613544284"
+    assert result["verified_forwarded_recipient_count"] == 1
+    assert result["forward_verified"] is True
+    assert page.final_forwarded_recipients == ["Bale-000001"]
+
+
+def test_forward_latest_channel_message_existing_contact_reuses_exact_stored_name() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "5613544284")
+        contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        existing, _ = contact_store.get_or_create_bale_contact("bale_orchestrator", "09304073331")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(recipients=[existing["display_name"]])
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = contact_store
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "+989304073331", display_name="Ignored Name")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is True
+    assert result["contact_reused"] is True
+    assert result["contact_created"] is False
+    assert result["display_name"] == existing["display_name"]
+    assert ("fill", OpenMessageForwardPage.recipient_search_selector, existing["display_name"]) in page.operations
+
+
+def test_forward_latest_channel_message_request_uid_overrides_stored_uid() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "stored_uid")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(recipients=["Bale-000001"])
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331", source_channel_uid="request_uid")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is True
+    assert result["requested_source_channel_uid"] == "request_uid"
+    assert result["configured_source_channel_uid"] == "stored_uid"
+    assert result["effective_source_channel_uid"] == "request_uid"
+    assert page.urls[-1] == "https://web.bale.ai/chat?uid=request_uid"
+
+
+def test_forward_latest_channel_message_stored_uid_used_when_request_absent() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "stored_uid")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(recipients=["Bale-000001"])
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is True
+    assert result["requested_source_channel_uid"] == ""
+    assert result["effective_source_channel_uid"] == "stored_uid"
+
+
+def test_forward_latest_channel_message_rejects_multiple_phones_and_recipients() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "stored_uid")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        plugin = BalePlugin(browser_manager=MockBrowserManager(_forward_latest_page()))
+        try:
+            phone_result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331,09304073332")
+            name_result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331", display_name="Bale-000001,Bale-000002")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert phone_result["success"] is False
+    assert phone_result["error_code"] == "single_phone_required"
+    assert name_result["success"] is False
+    assert name_result["error_code"] == "single_display_name_required"
+
+
+def test_forward_latest_channel_message_action5_guards_and_confirm_once_remain_active() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "5613544284")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(recipients=["Bale-000001"], success_toast_text="sent to 2 chats")
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is False
+    assert result["error_code"] == "unexpected_forward_recipient_count"
+    assert result["confirm_click_count"] == 1
+    assert result["verified_forwarded_recipient_count"] == 2
+
+
+def test_forward_latest_channel_message_failed_contact_save_blocks_forwarding() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "5613544284")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page()
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "invalid")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is False
+    assert result["failed_step"] == "save_or_resolve_contact"
+    assert page.urls == []
+    assert page.confirm_clicked is False
+
+
+def test_forward_latest_channel_message_failed_channel_verification_blocks_forwarding() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "5613544284")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(readiness={"ready": False, "message_stream_visible": False})
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is False
+    assert result["failed_step"] == "open_source_channel"
+    assert page.confirm_clicked is False
+
+
+def test_forward_latest_channel_message_failed_recipient_selection_blocks_confirm() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = _with_temp_bale_account_store(tmp_dir)
+        account_store.save_source_channel("bale_orchestrator", "5613544284")
+        previous_account_store = bale_plugin_module.bale_account_store
+        bale_plugin_module.bale_account_store = account_store
+        page = _forward_latest_page(recipients=["Partial Bale"])
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        try:
+            result = plugin.forward_latest_channel_message("bale_orchestrator", "09304073331")
+        finally:
+            bale_plugin_module.bale_account_store = previous_account_store
+
+    assert result["success"] is False
+    assert result["failed_step"] == "select_recipient"
+    assert result["confirm_click_count"] == 0
+    assert page.confirm_clicked is False
+
+
+def test_forward_latest_channel_message_route_persists_diagnostics_and_metadata() -> None:
+    class ForwardLatestPlugin:
+        def forward_latest_channel_message(self, **kwargs: object) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "forward_latest_channel_message",
+                "job_id": kwargs.get("job_id"),
+                "campaign_id": kwargs.get("campaign_id"),
+                "account_id": kwargs.get("account_id"),
+                "recipient_id": kwargs.get("recipient_id"),
+                "idempotency_key": kwargs.get("idempotency_key"),
+                "phone": kwargs.get("phone"),
+                "display_name": "Bale-000001",
+                "requested_source_channel_uid": kwargs.get("source_channel_uid"),
+                "configured_source_channel_uid": "stored",
+                "effective_source_channel_uid": kwargs.get("source_channel_uid"),
+                "channel_uid_verified": True,
+                "contact_reused": False,
+                "contact_created": True,
+                "selected_message_data_date": "1",
+                "selected_message_preview": "latest",
+                "selected_message_signature": "sig",
+                "exact_match_count": 1,
+                "selected_names_before_confirm": ["Bale-000001"],
+                "confirm_click_count": 1,
+                "success_toast_text": "sent to 1 chat",
+                "verified_forwarded_recipient_count": 1,
+                "forward_verified": True,
+                "diagnostics_consistent": True,
+                "diagnostics_consistency_errors": [],
+                "failed_step": None,
+                "last_successful_step": "persist_result",
+                "error_code": None,
+                "error_message": None,
+                "screenshot_path": "",
+                "duration_ms": 1,
+                "step_results": [{"step": "persist_result", "status": "success"}],
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = ForwardLatestPlugin()
+        try:
+            response = TestClient(app).post(
+                "/automation/platforms/bale/forward-latest-channel-message",
+                json={
+                    "job_id": "job-1",
+                    "campaign_id": "campaign-1",
+                    "account_id": "bale_route",
+                    "source_channel_uid": "5613544284",
+                    "phone": "09304073331",
+                    "recipient_id": "recipient-1",
+                    "idempotency_key": "idem-1",
+                },
+            )
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert response.status_code == 200
+    payload = response.json()
+    latest = latest_response.json()
+    assert payload["job_id"] == "job-1"
+    assert payload["campaign_id"] == "campaign-1"
+    assert payload["idempotency_key"] == "idem-1"
+    assert latest["action"] == "forward_latest_channel_message"
+    assert latest["scenario_id"] is None
+    assert latest["plugin_result"]["action"] == "forward_latest_channel_message"
+
+
+def test_bale_source_channel_save_load() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleAccountStore(Path(tmp_dir))
+        saved = store.save_source_channel("bale_test", "https://web.bale.ai/channel/test")
+        loaded = store.get_source_channel("bale_test")
+        assert saved["source_channel_uid"] == "test"
+        assert saved["source_channel_url"] == "https://web.bale.ai/chat?uid=test"
+        assert loaded["source_channel_url"] == "https://web.bale.ai/chat?uid=test"
+
+
+def test_bale_source_channel_change_overwrites_and_persists_uid() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleAccountStore(Path(tmp_dir))
+        first = store.save_source_channel("bale_test", "111")
+        second = store.save_source_channel("bale_test", "https://web.bale.ai/chat?uid=222")
+        reloaded = BaleAccountStore(Path(tmp_dir)).get_source_channel("bale_test")
+
+    assert first["source_channel_uid"] == "111"
+    assert second["source_channel_uid"] == "222"
+    assert second["source_channel_url"] == "https://web.bale.ai/chat?uid=222"
+    assert reloaded["source_channel_uid"] == "222"
+    assert reloaded["source_channel_url"] == "https://web.bale.ai/chat?uid=222"
+    assert reloaded["source_channel_url"] != "https://web.bale.ai/chat?uid=111"
+
+
+def test_bale_source_channel_separate_accounts_keep_separate_channels() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleAccountStore(Path(tmp_dir))
+        store.save_source_channel("account_a", "111")
+        store.save_source_channel("account_b", "222")
+        store.save_source_channel("account_a", "333")
+        reloaded = BaleAccountStore(Path(tmp_dir))
+
+        assert reloaded.get_source_channel("account_a")["source_channel_uid"] == "333"
+        assert reloaded.get_source_channel("account_b")["source_channel_uid"] == "222"
+
+
+def test_frontend_source_channel_save_reloads_backend_and_displays_canonical_value() -> None:
+    source = (Path(__file__).resolve().parents[1] / "frontend" / "src" / "pages" / "PlatformWorkspace.jsx").read_text(encoding="utf-8")
+    function_body = source.split("async function saveBaleForwardSourceChannel()", 1)[1].split("async function addBaleForwardContacts()", 1)[0]
+
+    assert "await saveBaleSourceChannel" in function_body
+    assert "await getBaleSourceChannel(balePhaseOneAccountId)" in function_body
+    assert "reloaded.source_channel_uid !== submittedUid" in function_body
+    assert "setBaleSourceChannelUrl(reloaded?.source_channel_url || sourceUrl)" in function_body
+
+
+def test_bale_preview_route_fails_when_no_source_channel_configured() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = BaleAccountStore(Path(tmp_dir) / "accounts")
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_account_store = automation_routes.bale_account_store
+        previous_queue_store = automation_routes.execution_queue_store
+        automation_routes.bale_account_store = account_store
+        automation_routes.execution_queue_store = queue_store
+        try:
+            response = TestClient(app).post("/automation/platforms/bale/forward-latest/preview", json={"account_id": "bale_missing_source"})
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.bale_account_store = previous_account_store
+            automation_routes.execution_queue_store = previous_queue_store
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error_code"] == "source_channel_not_configured"
+    assert payload["failed_step"] == "load_source_channel"
+    latest = latest_response.json()
+    assert latest["action"] == "preview_latest_channel_message"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "failed"
+
+
+def test_bale_preview_success_creates_latest_diagnostic_job() -> None:
+    class PreviewSuccessPlugin:
+        def preview_latest_channel_message(self, account_id: str, source_channel_url: str, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": True,
+                "ok": True,
+                "action": "preview_latest_channel_message",
+                "account_id": account_id,
+                "source_channel_url": source_channel_url,
+                "message_found": True,
+                "text_preview": "latest",
+                "candidate_count": 1,
+                "diagnostics": {"page_url": source_channel_url},
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = BaleAccountStore(Path(tmp_dir) / "accounts")
+        account_store.save_source_channel("bale_preview_success", "https://web.bale.ai/channel/test")
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        queue_store.save_jobs(
+            [
+                {
+                    **_queue_job("old_send", account_id="bale_preview_success"),
+                    "status": "completed",
+                    "updated_at": "2026-07-10T00:00:00+00:00",
+                    "execution_result": {"success": True, "action": "send_text_message", "plugin_result": {"action": "send_text_message"}},
+                }
+            ]
+        )
+        previous_account_store = automation_routes.bale_account_store
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.bale_account_store = account_store
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = PreviewSuccessPlugin()
+        try:
+            preview_response = TestClient(app).post("/automation/platforms/bale/forward-latest/preview", json={"account_id": "bale_preview_success"})
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+            jobs_response = TestClient(app).get("/automation/platforms/bale/jobs?limit=10")
+        finally:
+            automation_routes.bale_account_store = previous_account_store
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    assert preview_response.status_code == 200
+    latest = latest_response.json()
+    jobs = jobs_response.json()
+    assert latest["action"] == "preview_latest_channel_message"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "completed"
+    assert latest["plugin_result"]["action"] == "preview_latest_channel_message"
+    assert latest["execution_result"]["action"] == "preview_latest_channel_message"
+    assert any(job["action"] == "send_text_message" for job in jobs)
+    assert any(job["action"] == "preview_latest_channel_message" for job in jobs)
+    assert all(job["action"] != "send_text_message" for job in jobs if job["job_id"].startswith("bale_preview_"))
+
+
+def test_bale_preview_failure_with_source_creates_preview_diagnostic_job() -> None:
+    class PreviewFailurePlugin:
+        def preview_latest_channel_message(self, account_id: str, source_channel_url: str, provider_mode: str | None = None) -> dict[str, object]:
+            return {
+                "success": False,
+                "ok": False,
+                "action": "preview_latest_channel_message",
+                "account_id": account_id,
+                "source_channel_url": source_channel_url,
+                "error_code": "latest_channel_message_not_found",
+                "error_message": "not found",
+                "failed_step": "locate_latest_channel_message",
+                "diagnostics": {"candidate_count": 0},
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        account_store = BaleAccountStore(Path(tmp_dir) / "accounts")
+        account_store.save_source_channel("bale_preview_failure", "https://web.bale.ai/channel/test")
+        queue_store = BulkExecutionQueueStore(Path(tmp_dir) / "bulk_execution_queue.json")
+        previous_account_store = automation_routes.bale_account_store
+        previous_queue_store = automation_routes.execution_queue_store
+        previous_plugin = automation_routes.bale_plugin
+        automation_routes.bale_account_store = account_store
+        automation_routes.execution_queue_store = queue_store
+        automation_routes.bale_plugin = PreviewFailurePlugin()
+        try:
+            TestClient(app).post("/automation/platforms/bale/forward-latest/preview", json={"account_id": "bale_preview_failure"})
+            latest_response = TestClient(app).get("/automation/platforms/bale/latest-job")
+        finally:
+            automation_routes.bale_account_store = previous_account_store
+            automation_routes.execution_queue_store = previous_queue_store
+            automation_routes.bale_plugin = previous_plugin
+
+    latest = latest_response.json()
+    assert latest["action"] == "preview_latest_channel_message"
+    assert latest["scenario_id"] is None
+    assert latest["status"] == "failed"
+    assert latest["error_code"] == "latest_channel_message_not_found"
+    assert latest["failed_step"] == "locate_latest_channel_message"
+
+
+def test_frontend_preview_completion_refreshes_bale_diagnostics_in_finally() -> None:
+    source = (Path(__file__).resolve().parents[1] / "frontend" / "src" / "pages" / "PlatformWorkspace.jsx").read_text(encoding="utf-8")
+    function_body = source.split("async function previewBaleForwardLatestMessage()", 1)[1].split("async function refreshLatestBaleJob", 1)[0]
+    assert "previewLatestBaleChannelMessage" in function_body
+    assert "finally" in function_body
+    assert "await loadBaleDiagnostics(false);" in function_body.split("finally", 1)[1]
+
+
+def test_bale_preview_plugin_result_parsing_with_mock_page() -> None:
+    page = PreviewChannelPage()
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.preview_latest_channel_message(
+        account_id="bale_preview",
+        source_channel_url="https://web.bale.ai/channel/test",
+        provider_mode="native_chrome",
+    )
+    assert result["success"] is True
+    assert result["message_found"] is True
+    assert result["text_preview"] == "latest channel post"
+    assert result["has_image"] is True
+    assert result["candidate_count"] == 2
+    assert result["diagnostics"]["message_selector_used"] == "div[data-testid*='message']"
 
 
 def test_adspower_account_requires_profile_id() -> None:
@@ -4310,17 +6265,6 @@ if __name__ == "__main__":
     test_send_text_message_uses_modal_scoped_phone_input_fallback_after_country_selector()
     test_send_text_message_uses_second_modal_input_name_fallback()
     test_bale_contact_phone_strips_iran_country_code_for_contact_modal()
-    test_forward_latest_channel_message_exists_as_separate_action()
-    test_forward_latest_channel_message_missing_channel_url_fails_validation()
-    test_forward_latest_channel_message_defaults_missing_selector_to_latest_visible()
-    test_forward_latest_channel_message_unsupported_selector_fails_validation()
-    test_forward_latest_channel_message_channel_latest_maps_to_latest_visible()
-    test_forward_latest_channel_message_input_mapping_matches_old_context()
-    test_forward_latest_channel_message_uses_phone_as_name_when_name_missing()
-    test_forward_latest_channel_message_missing_target_phone_fails_validation()
-    test_forward_latest_channel_message_old_scenario_schema_is_accepted()
-    test_scenario_runner_interpolates_forward_context_values()
-    test_scenario_runner_missing_selector_fails_clearly()
     test_send_text_message_target_not_found_returns_open_target_chat_failure()
     test_send_text_message_type_message_failure_includes_input_diagnostics()
     test_return_to_chat_after_contact_save_does_not_succeed_on_contacts_page()
@@ -4379,6 +6323,83 @@ if __name__ == "__main__":
     test_bale_jobs_route_returns_recent_jobs_with_full_diagnostics()
     test_browser_manager_resolves_system_browser_on_windows()
     test_bale_account_persistence_create_edit_delete()
+    test_bale_phone_normalization_equivalent_forms()
+    test_bale_phone_normalization_rejects_invalid()
+    test_bale_contact_existing_phone_returns_same_display_name()
+    test_bale_contact_new_numbers_receive_sequential_names()
+    test_bale_contact_bulk_insert_created_existing_invalid()
+    test_bale_contacts_are_unique_per_account()
+    test_save_bale_contact_new_contact()
+    test_save_bale_contact_existing_contact_uses_stable_display_name()
+    test_save_bale_contact_invalid_phone_fails_before_browser()
+    test_save_bale_contact_route_persists_diagnostic_job_with_null_scenario_id()
+    test_open_bale_source_channel_valid_uid_builds_correct_url()
+    test_open_bale_source_channel_invalid_uid_fails_before_browser_launch()
+    test_open_bale_source_channel_shell_only_page_is_rejected()
+    test_open_bale_source_channel_center_channel_panel_is_accepted()
+    test_open_bale_source_channel_message_stream_visibility_is_required()
+    test_open_bale_source_channel_route_persists_diagnostic_job_with_null_scenario_id()
+    test_locate_latest_channel_message_message_stream_required()
+    test_locate_latest_channel_message_shell_only_page_rejected()
+    test_locate_latest_channel_message_inspects_center_panel_only()
+    test_locate_latest_channel_message_date_and_service_rows_rejected()
+    test_locate_latest_channel_message_latest_dom_message_selected_and_media_flags()
+    test_locate_latest_channel_message_route_persists_diagnostic_job_with_null_scenario_id()
+    test_open_message_forward_latest_message_is_required()
+    test_open_message_forward_menu_discovery_runs_inside_latest_message()
+    test_open_message_forward_supports_hover_only_controls()
+    test_open_message_forward_menu_open_success_and_forward_detected()
+    test_open_message_forward_recipient_picker_visibility_required()
+    test_open_message_forward_does_not_select_recipient_or_confirm()
+    test_open_message_forward_route_persists_diagnostic_job_with_null_scenario_id()
+    test_forward_message_to_contact_exact_recipient_confirmed_and_verified()
+    test_forward_message_to_contact_preselected_unrelated_contact_is_cleared()
+    test_forward_message_to_contact_two_selected_contacts_block_confirmation()
+    test_forward_message_to_contact_first_visible_row_is_never_clicked_before_search()
+    test_forward_message_to_contact_picker_must_be_visible()
+    test_forward_message_to_contact_requires_search_input()
+    test_forward_message_to_contact_exact_match_required_and_partial_rejected()
+    test_forward_message_to_contact_ambiguous_exact_matches_rejected()
+    test_forward_message_to_contact_exact_single_match_is_selected()
+    test_forward_message_to_contact_confirm_only_with_exactly_one_target_selected()
+    test_forward_message_to_contact_no_duplicate_or_extra_recipient_is_sent()
+    test_forward_message_to_contact_dry_run_zero_destructive_clicks()
+    test_forward_message_to_contact_single_character_candidates_rejected()
+    test_forward_message_to_contact_selected_chip_requires_valid_name_and_remove()
+    test_forward_message_to_contact_footer_chip_outside_picker_detected_through_modal_root()
+    test_forward_message_to_contact_preselected_recipient_blocks_target_selection_and_confirm()
+    test_forward_message_to_contact_confirmation_button_required()
+    test_forward_message_to_contact_forward_success_verification_required()
+    test_forward_message_to_contact_success_toast_for_two_chats_rejected()
+    test_forward_message_to_contact_one_recipient_success_toast_accepted()
+    test_forward_message_to_contact_picker_closure_alone_does_not_count_verified_recipient()
+    test_forward_message_to_contact_diagnostics_report_missing_channel_verification()
+    test_forward_message_to_contact_selection_only_click_element_belongs_to_target_row()
+    test_forward_message_to_contact_selection_only_resets_preselected_without_cleanup_clicks()
+    test_forward_message_to_contact_selection_only_persistent_preselection_fails_after_one_reset()
+    test_forward_message_to_contact_selection_only_rejects_overlapping_click_point()
+    test_forward_message_to_contact_selection_only_reports_all_selected_names_after_click()
+    test_forward_message_to_contact_selection_only_detects_delayed_second_selection()
+    test_forward_message_to_contact_route_persists_diagnostic_job_with_null_scenario_id()
+    test_forward_latest_channel_message_new_contact_is_saved_then_forwarded()
+    test_forward_latest_channel_message_existing_contact_reuses_exact_stored_name()
+    test_forward_latest_channel_message_request_uid_overrides_stored_uid()
+    test_forward_latest_channel_message_stored_uid_used_when_request_absent()
+    test_forward_latest_channel_message_rejects_multiple_phones_and_recipients()
+    test_forward_latest_channel_message_action5_guards_and_confirm_once_remain_active()
+    test_forward_latest_channel_message_failed_contact_save_blocks_forwarding()
+    test_forward_latest_channel_message_failed_channel_verification_blocks_forwarding()
+    test_forward_latest_channel_message_failed_recipient_selection_blocks_confirm()
+    test_forward_latest_channel_message_route_persists_diagnostics_and_metadata()
+    test_bale_source_channel_save_load()
+    test_bale_source_channel_change_overwrites_and_persists_uid()
+    test_bale_source_channel_separate_accounts_keep_separate_channels()
+    test_frontend_source_channel_save_reloads_backend_and_displays_canonical_value()
+    test_bale_preview_route_fails_when_no_source_channel_configured()
+    test_bale_preview_success_creates_latest_diagnostic_job()
+    test_bale_preview_failure_with_source_creates_preview_diagnostic_job()
+    test_bale_preview_plugin_result_parsing_with_mock_page()
+    test_frontend_preview_completion_refreshes_bale_diagnostics_in_finally()
     test_adspower_account_requires_profile_id()
     test_native_chrome_account_does_not_require_adspower_profile_id()
     test_adspower_config_load_save_and_health_error()

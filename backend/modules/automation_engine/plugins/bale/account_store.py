@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from modules.automation_engine.browser.profile_groups import account_user_data_dir
 from modules.automation_engine.browser.profile_provider import BROWSER_PROVIDERS
@@ -61,6 +62,7 @@ class BaleAccountStore:
         self.accounts_path = self.runtime_dir / "accounts.json"
         self.message_config_path = self.runtime_dir / "message_config.json"
         self.preparation_path = self.runtime_dir / "preparation.json"
+        self.source_channels_path = self.runtime_dir / "source_channels.json"
         self._ensure_seed_data()
 
     def list_accounts(self) -> list[dict[str, Any]]:
@@ -153,6 +155,62 @@ class BaleAccountStore:
         self._write_json(self.preparation_path, config)
         return config
 
+    def get_source_channel(self, account_id: str) -> dict[str, Any] | None:
+        account_id = str(account_id or "").strip()
+        for item in self._read_json(self.source_channels_path, []):
+            if str(item.get("account_id") or "") == account_id:
+                return self._normalize_source_channel(item)
+        return None
+
+    def save_source_channel(self, account_id: str, source_channel_url: str) -> dict[str, Any]:
+        account_id = str(account_id or "").strip()
+        source_channel_value = str(source_channel_url or "").strip()
+        if not account_id:
+            raise ValueError("account_id is required")
+        if not source_channel_value:
+            raise ValueError("source_channel_url is required")
+        source_channel_uid = normalize_source_channel_uid(source_channel_value)
+        source_channel_url = canonical_source_channel_url(source_channel_uid)
+        records = [self._normalize_source_channel(item) for item in self._read_json(self.source_channels_path, [])]
+        now = _now()
+        for index, item in enumerate(records):
+            if item["account_id"] == account_id:
+                records[index] = {
+                    **item,
+                    "source_channel_uid": source_channel_uid,
+                    "source_channel_url": source_channel_url,
+                    "updated_at": now,
+                }
+                self._write_json(self.source_channels_path, records)
+                return records[index]
+        record = {
+            "account_id": account_id,
+            "source_channel_uid": source_channel_uid,
+            "source_channel_url": source_channel_url,
+            "created_at": now,
+            "updated_at": now,
+        }
+        records.append(record)
+        self._write_json(self.source_channels_path, records)
+        return record
+
+    def _normalize_source_channel(self, payload: dict[str, Any]) -> dict[str, Any]:
+        created_at = str(payload.get("created_at") or _now())
+        raw_uid = str(payload.get("source_channel_uid") or "").strip()
+        raw_url = str(payload.get("source_channel_url") or "").strip()
+        try:
+            source_channel_uid = raw_uid or normalize_source_channel_uid(raw_url)
+        except ValueError:
+            source_channel_uid = raw_uid
+        source_channel_url = canonical_source_channel_url(source_channel_uid) if source_channel_uid else raw_url
+        return {
+            "account_id": str(payload.get("account_id") or ""),
+            "source_channel_uid": source_channel_uid,
+            "source_channel_url": source_channel_url,
+            "created_at": created_at,
+            "updated_at": str(payload.get("updated_at") or created_at),
+        }
+
     def _normalize_account(self, account: dict[str, Any]) -> dict[str, Any]:
         created_at = str(account.get("created_at") or _now())
         status = account.get("status") if account.get("status") in ACCOUNT_STATUSES else "new"
@@ -222,6 +280,8 @@ class BaleAccountStore:
             self._write_json(self.message_config_path, deepcopy(DEFAULT_MESSAGE_CONFIG))
         if not self.preparation_path.exists():
             self._write_json(self.preparation_path, deepcopy(DEFAULT_PREPARATION))
+        if not self.source_channels_path.exists():
+            self._write_json(self.source_channels_path, [])
 
     def _read_json(self, path: Path, default: Any) -> Any:
         try:
@@ -237,3 +297,26 @@ class BaleAccountStore:
 
 
 bale_account_store = BaleAccountStore()
+
+
+def normalize_source_channel_uid(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("source_channel_url is required")
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("source_channel_url must be a valid Bale URL or source_channel_uid")
+        query_uid = parse_qs(parsed.query).get("uid", [""])[0].strip()
+        path_uid = parsed.path.rstrip("/").split("/")[-1].strip()
+        uid = query_uid or path_uid
+    else:
+        uid = raw
+    if not uid or len(uid) > 64 or not all(ch.isalnum() or ch in {"_", "-"} for ch in uid):
+        raise ValueError("source_channel_url must be a valid Bale URL or source_channel_uid")
+    return uid
+
+
+def canonical_source_channel_url(source_channel_uid: str) -> str:
+    uid = normalize_source_channel_uid(source_channel_uid)
+    return f"https://web.bale.ai/chat?uid={uid}"
