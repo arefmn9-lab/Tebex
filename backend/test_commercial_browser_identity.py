@@ -93,6 +93,21 @@ def _seed(service: CommercialQueueService, account_id: str, count: int = 1) -> d
     service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": count, "round_cooldown_override": 0, "delay_between_deliveries_override": 0})
     campaign = service.create_campaign({"name": f"Campaign {account_id}", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
     service.import_recipients(campaign["id"], [f"0930407{index:04d}" for index in range(count)])
+    for recipient in service.list_recipients(campaign["id"], limit=100)["items"]:
+        service.repository.update_recipient_authorization(
+            recipient["id"],
+            {
+                "recipient_origin": "user_provided",
+                "synthetic_test_data": False,
+                "live_execution_authorized": True,
+                "live_authorized_at": "2026-07-13T00:00:00+00:00",
+                "live_authorized_by": "test",
+                "authorization_source": "test_fixture",
+                "authorization_note": "mock browser identity recipient",
+                "authorization_status": "authorized",
+                "should_not_retry": False,
+            },
+        )
     return campaign
 
 
@@ -212,7 +227,22 @@ def test_account_health_transitions_and_scheduler_filtering() -> None:
         campaign = service.create_campaign({"name": "Health", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
         for account_id in ["acct_auth", "acct_review", "acct_ok"]:
             service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": 1})
-        service.import_recipients(campaign["id"], ["09304071111", "09304071112", "09304071113"])
+        imported = service.import_recipients(campaign["id"], ["09304071111", "09304071112", "09304071113"])
+        for recipient in imported["created_recipients"]:
+            service.repository.update_recipient_authorization(
+                recipient["id"],
+                {
+                    "recipient_origin": "user_provided",
+                    "synthetic_test_data": False,
+                    "live_execution_authorized": True,
+                    "live_authorized_at": "2026-07-13T00:00:00+00:00",
+                    "live_authorized_by": "test",
+                    "authorization_source": "test_fixture",
+                    "authorization_note": "mock browser identity scheduler recipient",
+                    "authorization_status": "authorized",
+                    "should_not_retry": False,
+                },
+            )
         service.scheduler_start()
         result = service.scheduler_run_once(campaign["id"], dry_run=True)
     assert result["started_accounts"] == ["acct_ok"]

@@ -40,6 +40,56 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+PLATFORM_RUN_OUTCOMES = {
+    "sent",
+    "account_not_found",
+    "not_reachable",
+    "blocked",
+    "failed_retryable",
+    "failed_terminal",
+    "skipped_by_policy",
+    "cancelled",
+    "pending",
+    "queued",
+    "assigned",
+    "in_progress",
+}
+TERMINAL_PLATFORM_OUTCOMES = {
+    "sent",
+    "account_not_found",
+    "not_reachable",
+    "blocked",
+    "failed_terminal",
+    "skipped_by_policy",
+    "cancelled",
+}
+ACTIVE_PLATFORM_OUTCOMES = {"queued", "assigned", "in_progress"}
+
+
+def aggregate_scenario_status(outcomes: list[str]) -> str:
+    if not outcomes:
+        return "pending"
+    if any(outcome == "failed_retryable" for outcome in outcomes):
+        return "retry_pending"
+    if all(outcome in TERMINAL_PLATFORM_OUTCOMES for outcome in outcomes):
+        return "completed"
+    if any(outcome in ACTIVE_PLATFORM_OUTCOMES for outcome in outcomes):
+        return "in_progress"
+    return "pending"
+
+
+def aggregate_platform_counts(outcomes: list[str]) -> dict[str, int]:
+    checked = [outcome for outcome in outcomes if outcome in TERMINAL_PLATFORM_OUTCOMES or outcome == "failed_retryable"]
+    return {
+        "selected_platform_count": len(outcomes),
+        "checked_platform_count": len(checked),
+        "sent_platform_count": sum(1 for outcome in outcomes if outcome == "sent"),
+        "account_not_found_count": sum(1 for outcome in outcomes if outcome == "account_not_found"),
+        "failed_platform_count": sum(1 for outcome in outcomes if outcome in {"failed_retryable", "failed_terminal"}),
+        "retryable_platform_count": sum(1 for outcome in outcomes if outcome == "failed_retryable"),
+    }
+
+
 def queue_claim_eligibility_where(job_alias: str = "job", recipient_alias: str = "recipient", manifest_alias: str = "manifest") -> str:
     return f"""
         {recipient_alias}.input_manifest_id IS NOT NULL
@@ -699,6 +749,569 @@ class CommercialQueueRepository:
     def get_recipient(self, recipient_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             return row_to_dict(connection.execute("SELECT * FROM commercial_recipients WHERE id = ?", (recipient_id,)).fetchone())
+
+    def get_campaign_recipient_run_by_phone(self, campaign_id: str, phone_normalized: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id FROM commercial_campaign_recipient_runs
+                WHERE campaign_id = ? AND phone_normalized = ?
+                """,
+                (campaign_id, phone_normalized),
+            ).fetchone()
+            if row is None:
+                return None
+        return self.get_campaign_recipient_run(str(row["id"]))
+
+    def _create_platform_run_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        platform_run: sqlite3.Row | dict[str, Any],
+        previous_status: str | None,
+        new_status: str,
+        event_type: str,
+        job_id: str | None = None,
+        actor: str | None = None,
+        source: str | None = None,
+        reason: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO commercial_platform_run_events (
+                id, campaign_id, campaign_recipient_run_id, platform_run_id,
+                job_id, correlation_id, platform, previous_status, new_status,
+                event_type, actor, source, reason, error_code, error_message,
+                metadata_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("platform_event"),
+                platform_run["campaign_id"],
+                platform_run["campaign_recipient_run_id"],
+                platform_run["id"],
+                job_id,
+                platform_run["correlation_id"],
+                platform_run["platform"],
+                previous_status,
+                new_status,
+                event_type,
+                actor,
+                source,
+                reason,
+                error_code,
+                error_message,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                utc_now(),
+            ),
+        )
+
+    def create_campaign_recipient_run(
+        self,
+        campaign: dict[str, Any],
+        recipient: dict[str, Any],
+        platforms: list[str],
+        global_contact_id: str | None = None,
+        correlation_id: str | None = None,
+        create_delivery_jobs: bool = False,
+    ) -> dict[str, Any]:
+        normalized_platforms: list[str] = []
+        seen: set[str] = set()
+        for platform in platforms:
+            normalized = str(platform or "").strip().lower()
+            if normalized and normalized not in seen:
+                normalized_platforms.append(normalized)
+                seen.add(normalized)
+        if not normalized_platforms:
+            raise ValueError("selected_platform_required")
+        existing = self.get_campaign_recipient_run_by_phone(str(campaign["id"]), str(recipient["phone_normalized"]))
+        if existing is not None:
+            return existing
+        now = utc_now()
+        run_id = new_id("recipient_run")
+        run_correlation_id = correlation_id or new_id("corr")
+        contact_id = global_contact_id or f"global:{recipient['phone_normalized']}"
+        run = {
+            "id": run_id,
+            "campaign_id": campaign["id"],
+            "recipient_id": recipient["id"],
+            "global_contact_id": contact_id,
+            "phone_normalized": recipient["phone_normalized"],
+            "correlation_id": run_correlation_id,
+            "scenario_status": "pending",
+            "selected_platform_count": len(normalized_platforms),
+            "checked_platform_count": 0,
+            "sent_platform_count": 0,
+            "account_not_found_count": 0,
+            "failed_platform_count": 0,
+            "retryable_platform_count": 0,
+            "created_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "updated_at": now,
+        }
+        platform_runs: list[dict[str, Any]] = []
+        with self.connection() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO commercial_campaign_recipient_runs (
+                        id, campaign_id, recipient_id, global_contact_id, phone_normalized,
+                        correlation_id, scenario_status, selected_platform_count,
+                        checked_platform_count, sent_platform_count, account_not_found_count,
+                        failed_platform_count, retryable_platform_count, created_at,
+                        started_at, completed_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(run[key] for key in [
+                        "id", "campaign_id", "recipient_id", "global_contact_id", "phone_normalized",
+                        "correlation_id", "scenario_status", "selected_platform_count",
+                        "checked_platform_count", "sent_platform_count", "account_not_found_count",
+                        "failed_platform_count", "retryable_platform_count", "created_at",
+                        "started_at", "completed_at", "updated_at",
+                    ]),
+                )
+            except sqlite3.IntegrityError:
+                connection.rollback()
+                existing_after_race = self.get_campaign_recipient_run_by_phone(str(campaign["id"]), str(recipient["phone_normalized"]))
+                if existing_after_race is not None:
+                    return existing_after_race
+                raise
+            for platform in normalized_platforms:
+                platform_run = {
+                    "id": new_id("platform_run"),
+                    "campaign_id": campaign["id"],
+                    "campaign_recipient_run_id": run_id,
+                    "recipient_id": recipient["id"],
+                    "global_contact_id": contact_id,
+                    "correlation_id": run_correlation_id,
+                    "platform": platform,
+                    "delivery_job_id": None,
+                    "outcome": "queued" if create_delivery_jobs else "pending",
+                    "attempt_count": 0,
+                    "stable_display_name": None,
+                    "last_error_code": None,
+                    "last_error_message": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                if create_delivery_jobs:
+                    job_id = new_id("job")
+                    platform_run["delivery_job_id"] = job_id
+                    connection.execute(
+                        """
+                        INSERT INTO commercial_delivery_jobs (
+                            id, campaign_id, recipient_id, account_id, source_channel_uid,
+                            display_name, phone_normalized, idempotency_key, status,
+                            priority, attempt_count, max_attempts, scheduled_at, claimed_at,
+                            started_at, completed_at, last_error_code, last_error_message,
+                            result_success, verified_forwarded_recipient_count, forward_verified,
+                            diagnostics_consistent, campaign_recipient_run_id, platform_run_id,
+                            platform, global_contact_id, correlation_id, recipient_origin,
+                            synthetic_test_data, live_execution_authorized, live_authorized_at,
+                            live_authorized_by, authorization_source, authorization_note,
+                            authorization_status, should_not_retry, input_manifest_id,
+                            input_manifest_hash, input_sequence, input_provenance_status,
+                            live_execution_blocked, block_reason, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            campaign["id"],
+                            recipient["id"],
+                            None,
+                            campaign.get("source_channel_uid"),
+                            recipient.get("display_name"),
+                            recipient["phone_normalized"],
+                            f"{campaign['id']}:{recipient['id']}:{platform}:attempt-1",
+                            "queued",
+                            100,
+                            0,
+                            1,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            run_id,
+                            platform_run["id"],
+                            platform,
+                            contact_id,
+                            run_correlation_id,
+                            recipient.get("recipient_origin"),
+                            recipient.get("synthetic_test_data"),
+                            recipient.get("live_execution_authorized"),
+                            recipient.get("live_authorized_at"),
+                            recipient.get("live_authorized_by"),
+                            recipient.get("authorization_source"),
+                            recipient.get("authorization_note"),
+                            recipient.get("authorization_status"),
+                            recipient.get("should_not_retry"),
+                            recipient.get("input_manifest_id"),
+                            recipient.get("input_manifest_hash"),
+                            recipient.get("input_sequence"),
+                            recipient.get("input_provenance_status"),
+                            recipient.get("live_execution_blocked"),
+                            recipient.get("block_reason"),
+                            now,
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO commercial_platform_runs (
+                        id, campaign_id, campaign_recipient_run_id, recipient_id,
+                        global_contact_id, correlation_id, platform, delivery_job_id,
+                        outcome, attempt_count, stable_display_name, last_error_code,
+                        last_error_message, started_at, completed_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(platform_run[key] for key in [
+                        "id", "campaign_id", "campaign_recipient_run_id", "recipient_id",
+                        "global_contact_id", "correlation_id", "platform", "delivery_job_id",
+                        "outcome", "attempt_count", "stable_display_name", "last_error_code",
+                        "last_error_message", "started_at", "completed_at", "created_at", "updated_at",
+                    ]),
+                )
+                self._create_platform_run_event(
+                    connection,
+                    platform_run=platform_run,
+                    previous_status=None,
+                    new_status=str(platform_run["outcome"]),
+                    event_type="platform_run_created",
+                    job_id=platform_run.get("delivery_job_id"),
+                    actor="system",
+                    source="commercial_queue",
+                    reason="recipient_scenario_started",
+                )
+                platform_runs.append(platform_run)
+            connection.commit()
+        self.refresh_campaign_counts(str(campaign["id"]))
+        return {**run, "platform_runs": platform_runs}
+
+    def get_campaign_recipient_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            run = row_to_dict(connection.execute("SELECT * FROM commercial_campaign_recipient_runs WHERE id = ?", (run_id,)).fetchone())
+            if run is None:
+                return None
+            rows = connection.execute(
+                "SELECT * FROM commercial_platform_runs WHERE campaign_recipient_run_id = ? ORDER BY platform ASC",
+                (run_id,),
+            ).fetchall()
+            run["platform_runs"] = [dict(row) for row in rows]
+            job_rows = connection.execute(
+                """
+                SELECT * FROM commercial_delivery_jobs
+                WHERE campaign_recipient_run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            run["job_attempts"] = [dict(row) for row in job_rows]
+            event_rows = connection.execute(
+                """
+                SELECT * FROM commercial_platform_run_events
+                WHERE campaign_recipient_run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            run["platform_events"] = [dict(row) for row in event_rows]
+            return run
+
+    def _refresh_campaign_recipient_run_aggregate(self, connection: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+        rows = connection.execute(
+            "SELECT outcome FROM commercial_platform_runs WHERE campaign_recipient_run_id = ?",
+            (run_id,),
+        ).fetchall()
+        outcomes = [str(row["outcome"]) for row in rows]
+        counts = aggregate_platform_counts(outcomes)
+        scenario_status = aggregate_scenario_status(outcomes)
+        now = utc_now()
+        completed_at = now if scenario_status in {"completed", "cancelled"} else None
+        connection.execute(
+            """
+            UPDATE commercial_campaign_recipient_runs SET
+                scenario_status = ?,
+                selected_platform_count = ?,
+                checked_platform_count = ?,
+                sent_platform_count = ?,
+                account_not_found_count = ?,
+                failed_platform_count = ?,
+                retryable_platform_count = ?,
+                completed_at = CASE WHEN ? IS NOT NULL THEN COALESCE(completed_at, ?) ELSE NULL END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                scenario_status,
+                counts["selected_platform_count"],
+                counts["checked_platform_count"],
+                counts["sent_platform_count"],
+                counts["account_not_found_count"],
+                counts["failed_platform_count"],
+                counts["retryable_platform_count"],
+                completed_at,
+                completed_at,
+                now,
+                run_id,
+            ),
+        )
+        return {
+            "scenario_status": scenario_status,
+            **counts,
+        }
+
+    def update_platform_run_outcome(self, platform_run_id: str, outcome: str, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        if outcome not in PLATFORM_RUN_OUTCOMES:
+            raise ValueError("unsupported_platform_outcome")
+        payload = payload or {}
+        now = utc_now()
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM commercial_platform_runs WHERE id = ?", (platform_run_id,)).fetchone()
+            if row is None:
+                return None
+            previous_outcome = str(row["outcome"])
+            if previous_outcome in TERMINAL_PLATFORM_OUTCOMES and previous_outcome != outcome:
+                raise ValueError("terminal_platform_outcome_immutable")
+            run_id = str(row["campaign_recipient_run_id"])
+            started_at = payload.get("started_at") or (now if outcome == "in_progress" else row["started_at"])
+            completed_at = payload.get("completed_at") or (now if outcome in TERMINAL_PLATFORM_OUTCOMES or outcome == "failed_retryable" else None)
+            stable_display_name = payload.get("stable_display_name") if "stable_display_name" in payload else row["stable_display_name"]
+            connection.execute(
+                """
+                UPDATE commercial_platform_runs SET
+                    outcome = ?,
+                    attempt_count = CASE WHEN ? = 'in_progress' THEN attempt_count + 1 ELSE attempt_count END,
+                    stable_display_name = ?,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    started_at = COALESCE(started_at, ?),
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    outcome,
+                    outcome,
+                    stable_display_name,
+                    payload.get("last_error_code"),
+                    payload.get("last_error_message"),
+                    started_at,
+                    completed_at,
+                    now,
+                    platform_run_id,
+                ),
+            )
+            updated_row = connection.execute("SELECT * FROM commercial_platform_runs WHERE id = ?", (platform_run_id,)).fetchone()
+            if updated_row is not None:
+                self._create_platform_run_event(
+                    connection,
+                    platform_run=updated_row,
+                    previous_status=previous_outcome,
+                    new_status=outcome,
+                    event_type="platform_outcome_updated",
+                    job_id=updated_row["delivery_job_id"],
+                    actor=payload.get("actor"),
+                    source=payload.get("source") or "internal_service",
+                    reason=payload.get("reason"),
+                    error_code=payload.get("last_error_code"),
+                    error_message=payload.get("last_error_message"),
+                    metadata={key: value for key, value in payload.items() if key not in {"actor", "source", "reason"}},
+                )
+            self._refresh_campaign_recipient_run_aggregate(connection, run_id)
+            connection.commit()
+        return self.get_platform_run(platform_run_id)
+
+    def get_platform_run(self, platform_run_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            return row_to_dict(connection.execute("SELECT * FROM commercial_platform_runs WHERE id = ?", (platform_run_id,)).fetchone())
+
+    def retry_retryable_platform_runs(self, run_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connection() as connection:
+            rows = [dict(row) for row in connection.execute(
+                "SELECT * FROM commercial_platform_runs WHERE campaign_recipient_run_id = ? AND outcome = 'failed_retryable'",
+                (run_id,),
+            ).fetchall()]
+            for row in rows:
+                new_job_id = None
+                previous_outcome = str(row["outcome"])
+                if row.get("delivery_job_id"):
+                    old_job = connection.execute(
+                        "SELECT * FROM commercial_delivery_jobs WHERE id = ?",
+                        (row["delivery_job_id"],),
+                    ).fetchone()
+                    if old_job is not None:
+                        new_job_id = new_id("job")
+                        retry_number = int(row.get("attempt_count") or 0) + 1
+                        connection.execute(
+                            """
+                            INSERT INTO commercial_delivery_jobs (
+                                id, campaign_id, recipient_id, account_id, source_channel_uid,
+                                display_name, phone_normalized, idempotency_key, status,
+                                priority, attempt_count, max_attempts, scheduled_at, claimed_at,
+                                started_at, completed_at, last_error_code, last_error_message,
+                                result_success, verified_forwarded_recipient_count, forward_verified,
+                                diagnostics_consistent, campaign_recipient_run_id, platform_run_id,
+                                platform, global_contact_id, correlation_id, recipient_origin,
+                                synthetic_test_data, live_execution_authorized, live_authorized_at,
+                                live_authorized_by, authorization_source, authorization_note,
+                                authorization_status, should_not_retry, input_manifest_id,
+                                input_manifest_hash, input_sequence, input_provenance_status,
+                                live_execution_blocked, block_reason, created_at, updated_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                new_job_id,
+                                old_job["campaign_id"],
+                                old_job["recipient_id"],
+                                None,
+                                old_job["source_channel_uid"],
+                                old_job["display_name"],
+                                old_job["phone_normalized"],
+                                f"{old_job['campaign_id']}:{old_job['recipient_id']}:{row['platform']}:attempt-{retry_number + 1}",
+                                "queued",
+                                old_job["priority"],
+                                0,
+                                old_job["max_attempts"],
+                                old_job["scheduled_at"],
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                row["campaign_recipient_run_id"],
+                                row["id"],
+                                row["platform"],
+                                row["global_contact_id"],
+                                row["correlation_id"],
+                                old_job["recipient_origin"],
+                                old_job["synthetic_test_data"],
+                                old_job["live_execution_authorized"],
+                                old_job["live_authorized_at"],
+                                old_job["live_authorized_by"],
+                                old_job["authorization_source"],
+                                old_job["authorization_note"],
+                                old_job["authorization_status"],
+                                old_job["should_not_retry"],
+                                old_job["input_manifest_id"],
+                                old_job["input_manifest_hash"],
+                                old_job["input_sequence"],
+                                old_job["input_provenance_status"],
+                                old_job["live_execution_blocked"],
+                                old_job["block_reason"],
+                                now,
+                                now,
+                            ),
+                        )
+                connection.execute(
+                    """
+                    UPDATE commercial_platform_runs SET
+                        outcome = ?,
+                        delivery_job_id = COALESCE(?, delivery_job_id),
+                        last_error_code = NULL,
+                        last_error_message = NULL,
+                        started_at = NULL,
+                        completed_at = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("queued" if new_job_id else "pending", new_job_id, now, row["id"]),
+                )
+                updated_row = connection.execute("SELECT * FROM commercial_platform_runs WHERE id = ?", (row["id"],)).fetchone()
+                if updated_row is not None:
+                    self._create_platform_run_event(
+                        connection,
+                        platform_run=updated_row,
+                        previous_status=previous_outcome,
+                        new_status=str(updated_row["outcome"]),
+                        event_type="platform_retry_requeued",
+                        job_id=new_job_id,
+                        actor="system",
+                        source="commercial_queue",
+                        reason="retry_failed_retryable_platform_only",
+                    )
+            aggregate = self._refresh_campaign_recipient_run_aggregate(connection, run_id)
+            connection.commit()
+        if rows:
+            self.refresh_campaign_counts(str(rows[0]["campaign_id"]))
+        return {
+            "campaign_recipient_run_id": run_id,
+            "requeued_platform_run_count": len(rows),
+            "requeued_platforms": [str(row["platform"]) for row in rows],
+            "scenario": self.get_campaign_recipient_run(run_id),
+            "aggregate": aggregate,
+        }
+
+    def list_campaign_recipient_report_rows(self, campaign_id: str, limit: int, offset: int) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            runs = [dict(row) for row in connection.execute(
+                """
+                SELECT * FROM commercial_campaign_recipient_runs
+                WHERE campaign_id = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (campaign_id, limit, offset),
+            ).fetchall()]
+            if not runs:
+                return []
+            run_ids = [str(run["id"]) for run in runs]
+            placeholders = ",".join("?" for _ in run_ids)
+            platform_rows = [dict(row) for row in connection.execute(
+                f"SELECT * FROM commercial_platform_runs WHERE campaign_recipient_run_id IN ({placeholders})",
+                tuple(run_ids),
+            ).fetchall()]
+        by_run: dict[str, list[dict[str, Any]]] = {}
+        for row in platform_rows:
+            by_run.setdefault(str(row["campaign_recipient_run_id"]), []).append(row)
+        report: list[dict[str, Any]] = []
+        for run in runs:
+            platform_outcomes = {str(row["platform"]): str(row["outcome"]) for row in by_run.get(str(run["id"]), [])}
+            active_pending_count = sum(1 for outcome in platform_outcomes.values() if outcome in {"pending", "queued", "assigned", "in_progress"})
+            report.append(
+                {
+                    "campaign_recipient_run_id": run["id"],
+                    "recipient_id": run["recipient_id"],
+                    "global_contact_id": run["global_contact_id"],
+                    "correlation_id": run["correlation_id"],
+                    "phone": run["phone_normalized"],
+                    "scenario_status": run["scenario_status"],
+                    "selected_platforms": sorted(platform_outcomes),
+                    "platform_outcomes": platform_outcomes,
+                    "bale_outcome": platform_outcomes.get("bale"),
+                    "telegram_outcome": platform_outcomes.get("telegram"),
+                    "whatsapp_outcome": platform_outcomes.get("whatsapp"),
+                    "sent_count": int(run["sent_platform_count"]),
+                    "not_found_count": int(run["account_not_found_count"]),
+                    "failed_count": int(run["failed_platform_count"]),
+                    "retry_pending_count": int(run["retryable_platform_count"]),
+                    "active_pending_count": active_pending_count,
+                    "last_updated_at": run["updated_at"],
+                }
+            )
+        return report
 
     def find_recipient_by_phone(self, phone_normalized: str) -> dict[str, Any] | None:
         with self.connection() as connection:
@@ -1396,6 +2009,38 @@ class CommercialQueueRepository:
                 f"SELECT * FROM commercial_delivery_jobs WHERE id IN ({placeholders}) ORDER BY priority DESC, scheduled_at IS NOT NULL ASC, scheduled_at ASC, created_at ASC",
                 tuple(job_ids),
             ).fetchall()
+            for assigned_row in assigned:
+                if assigned_row["status"] != "assigned" or not assigned_row["platform_run_id"]:
+                    continue
+                platform_row = connection.execute(
+                    "SELECT * FROM commercial_platform_runs WHERE id = ?",
+                    (assigned_row["platform_run_id"],),
+                ).fetchone()
+                if platform_row is None:
+                    continue
+                previous_outcome = str(platform_row["outcome"])
+                if previous_outcome not in TERMINAL_PLATFORM_OUTCOMES:
+                    connection.execute(
+                        """
+                        UPDATE commercial_platform_runs SET
+                            outcome = 'assigned',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, assigned_row["platform_run_id"]),
+                    )
+                    self._create_platform_run_event(
+                        connection,
+                        platform_run=platform_row,
+                        previous_status=previous_outcome,
+                        new_status="assigned",
+                        event_type="platform_job_assigned",
+                        job_id=assigned_row["id"],
+                        actor="worker",
+                        source="commercial_queue",
+                        reason="delivery_job_assigned",
+                    )
+                    self._refresh_campaign_recipient_run_aggregate(connection, str(platform_row["campaign_recipient_run_id"]))
             connection.commit()
         assigned_jobs = [dict(row) for row in assigned if row["status"] == "assigned" and row["account_id"] == account_id]
         for job in assigned_jobs:
@@ -1522,6 +2167,38 @@ class CommercialQueueRepository:
                 """,
                 (now, now, job_id),
             )
+            job_row = connection.execute("SELECT platform_run_id FROM commercial_delivery_jobs WHERE id = ?", (job_id,)).fetchone()
+            if job_row is not None and job_row["platform_run_id"]:
+                platform_row = connection.execute(
+                    "SELECT * FROM commercial_platform_runs WHERE id = ?",
+                    (job_row["platform_run_id"],),
+                ).fetchone()
+                previous_outcome = str(platform_row["outcome"]) if platform_row is not None else None
+                connection.execute(
+                    """
+                    UPDATE commercial_platform_runs SET
+                        outcome = 'in_progress',
+                        attempt_count = attempt_count + 1,
+                        started_at = COALESCE(started_at, ?),
+                        completed_at = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, job_row["platform_run_id"]),
+                )
+                if platform_row is not None:
+                    self._create_platform_run_event(
+                        connection,
+                        platform_run=platform_row,
+                        previous_status=previous_outcome,
+                        new_status="in_progress",
+                        event_type="platform_job_started",
+                        job_id=job_id,
+                        actor="worker",
+                        source="commercial_queue",
+                        reason="delivery_job_running",
+                    )
+                    self._refresh_campaign_recipient_run_aggregate(connection, str(platform_row["campaign_recipient_run_id"]))
             connection.commit()
         job = self.get_job(job_id)
         if job:
@@ -1578,6 +2255,76 @@ class CommercialQueueRepository:
                     job_id,
                 ),
             )
+            job_row = connection.execute(
+                "SELECT campaign_recipient_run_id, platform_run_id FROM commercial_delivery_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_row is not None and job_row["platform_run_id"]:
+                platform_row = connection.execute(
+                    "SELECT * FROM commercial_platform_runs WHERE id = ?",
+                    (job_row["platform_run_id"],),
+                ).fetchone()
+                previous_outcome = str(platform_row["outcome"]) if platform_row is not None else None
+                verified_success = (
+                    status == "succeeded"
+                    and bool(payload.get("result_success"))
+                    and bool(payload.get("forward_verified"))
+                    and bool(payload.get("diagnostics_consistent"))
+                )
+                if verified_success:
+                    outcome = "sent"
+                elif status == "cancelled":
+                    outcome = "cancelled"
+                elif status == "skipped":
+                    outcome = "skipped_by_policy"
+                elif payload.get("last_error_code") == "account_not_found":
+                    outcome = "account_not_found"
+                elif bool(payload.get("retryable")):
+                    outcome = "failed_retryable"
+                else:
+                    outcome = "failed_terminal"
+                if previous_outcome in TERMINAL_PLATFORM_OUTCOMES and previous_outcome != outcome:
+                    raise ValueError("terminal_platform_outcome_immutable")
+                connection.execute(
+                    """
+                    UPDATE commercial_platform_runs SET
+                        outcome = ?,
+                        last_error_code = ?,
+                        last_error_message = ?,
+                        completed_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        outcome,
+                        payload.get("last_error_code"),
+                        payload.get("last_error_message"),
+                        now,
+                        now,
+                        job_row["platform_run_id"],
+                    ),
+                )
+                if platform_row is not None:
+                    self._create_platform_run_event(
+                        connection,
+                        platform_run=platform_row,
+                        previous_status=previous_outcome,
+                        new_status=outcome,
+                        event_type="platform_job_completed",
+                        job_id=job_id,
+                        actor="worker",
+                        source="commercial_queue",
+                        reason="delivery_job_completed",
+                        error_code=payload.get("last_error_code"),
+                        error_message=payload.get("last_error_message"),
+                        metadata={
+                            "job_status": status,
+                            "result_success": payload.get("result_success"),
+                            "forward_verified": payload.get("forward_verified"),
+                            "diagnostics_consistent": payload.get("diagnostics_consistent"),
+                        },
+                    )
+                self._refresh_campaign_recipient_run_aggregate(connection, str(job_row["campaign_recipient_run_id"]))
             connection.commit()
         job = self.get_job(job_id)
         if job:

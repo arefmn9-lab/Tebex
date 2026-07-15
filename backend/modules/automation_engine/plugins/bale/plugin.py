@@ -2049,7 +2049,19 @@ class BalePlugin:
         last_successful_step = "resolve_source_channel"
 
         try:
-            resolved_contact, preexisting_contact = self.contact_store.get_or_create_bale_contact(account_id, phone_text)
+            if dry_run:
+                existing_contact = self.contact_store.get_bale_contact(account_id, phone_text)
+                if existing_contact is None:
+                    self._add_step(step_results, "save_or_resolve_contact", "skipped", reason="dry_run_no_stable_name_allocation")
+                    return finish(
+                        False,
+                        "dry_run_contact_not_prepared",
+                        "Dry-run does not allocate stable contact names",
+                        "save_or_resolve_contact",
+                    )
+                resolved_contact, preexisting_contact = existing_contact, False
+            else:
+                resolved_contact, preexisting_contact = self.contact_store.get_or_create_bale_contact(account_id, phone_text)
         except BaleContactError as exc:
             self._add_step(step_results, "save_or_resolve_contact", "failed", error_code=exc.error_code, phone=phone_text)
             return finish(False, exc.error_code, str(exc), "save_or_resolve_contact")

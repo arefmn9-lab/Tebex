@@ -504,6 +504,24 @@ class RecipientConfirmRequest(BaseModel):
     confirmation_checked: bool = False
 
 
+class RecipientScenarioStartRequest(BaseModel):
+    recipient_id: str
+    platforms: list[str]
+    global_contact_id: str | None = None
+    correlation_id: str | None = None
+
+
+class CampaignScenarioStartRequest(BaseModel):
+    platforms: list[str]
+
+
+class PlatformRunOutcomeRequest(BaseModel):
+    outcome: str
+    stable_display_name: str | None = None
+    last_error_code: str | None = None
+    last_error_message: str | None = None
+
+
 class RecipientImportPreviewRequest(BaseModel):
     import_source: str = "paste"
     content: str
@@ -1143,6 +1161,74 @@ def confirm_campaign_recipients(campaign_id: str, request: RecipientConfirmReque
         )
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/campaigns/{campaign_id}/recipient-scenarios")
+def start_recipient_scenario(campaign_id: str, request: RecipientScenarioStartRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.start_recipient_scenario(
+            campaign_id=campaign_id,
+            recipient_id=request.recipient_id,
+            platforms=request.platforms,
+            global_contact_id=request.global_contact_id,
+            correlation_id=request.correlation_id,
+            create_delivery_jobs=False,
+        )
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/campaigns/{campaign_id}/recipient-scenarios/start")
+def start_campaign_recipient_scenarios(campaign_id: str, request: CampaignScenarioStartRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.start_campaign_recipient_scenarios(
+            campaign_id=campaign_id,
+            platforms=request.platforms,
+            create_delivery_jobs=False,
+        )
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.get("/campaigns/{campaign_id}/recipient-scenarios/report")
+def list_recipient_scenario_report(campaign_id: str, response: Response, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.list_recipient_scenario_report(campaign_id, limit=limit, offset=offset)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.get("/recipient-scenarios/{campaign_recipient_run_id}")
+def get_recipient_scenario(campaign_recipient_run_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.get_recipient_scenario(campaign_recipient_run_id)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/recipient-scenarios/{campaign_recipient_run_id}/retry")
+def retry_recipient_scenario(campaign_recipient_run_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.retry_recipient_scenario(campaign_recipient_run_id)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.patch("/platform-runs/{platform_run_id}/outcome")
+def update_platform_run_outcome(platform_run_id: str, request: PlatformRunOutcomeRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error_code": "internal_platform_outcome_update_required",
+            "error_message": "Platform outcomes may only be updated by trusted worker/internal service paths.",
+        },
+    )
 
 
 @router.post("/campaigns/{campaign_id}/contacts/prepare")

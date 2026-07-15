@@ -2626,6 +2626,112 @@ class CommercialQueueService:
     def delete_import_batch(self, batch_id: str) -> dict[str, Any]:
         return self.repository.delete_import_batch(batch_id)
 
+    def _validate_recipient_scenario_start(self, campaign: dict[str, Any], recipient: dict[str, Any], platforms: list[str]) -> None:
+        if recipient.get("validation_status") != "valid":
+            raise CampaignLifecycleError("recipient_invalid", "Recipient must be valid before scenario start", {"recipient_id": recipient.get("id")})
+        manifest_id = recipient.get("input_manifest_id")
+        manifest_hash_value = recipient.get("input_manifest_hash")
+        manifests = self.repository.list_recipient_input_manifests(str(campaign["id"]))
+        manifest = next((item for item in manifests if item.get("manifest_id") == manifest_id), None)
+        try:
+            manifest_phones = set(json.loads(str((manifest or {}).get("normalized_phones_json") or "[]")))
+        except Exception:
+            manifest_phones = set()
+        if (
+            manifest is None
+            or manifest.get("confirmation_status") != "confirmed"
+            or manifest.get("manifest_hash") != manifest_hash_value
+            or recipient.get("phone_normalized") not in manifest_phones
+            or recipient.get("input_provenance_status") != "confirmed_manifest"
+        ):
+            raise CampaignLifecycleError("recipient_manifest_not_confirmed", "Recipient scenario requires confirmed input manifest provenance", {"recipient_id": recipient.get("id")})
+        if bool(recipient.get("synthetic_test_data")):
+            raise CampaignLifecycleError("synthetic_recipient_forbidden", "Synthetic recipients cannot start executable recipient scenarios", {"recipient_id": recipient.get("id")})
+        if bool(recipient.get("live_execution_blocked")) or bool(recipient.get("should_not_retry")):
+            raise CampaignLifecycleError("recipient_live_execution_blocked", "Recipient is blocked from live execution", {"recipient_id": recipient.get("id")})
+        if not bool(recipient.get("live_execution_authorized")) or recipient.get("authorization_status") != "authorized":
+            raise CampaignLifecycleError("recipient_live_execution_not_authorized", "Recipient scenario requires explicit live execution authorization", {"recipient_id": recipient.get("id")})
+        selected = {str(platform or "").strip().lower() for platform in platforms if str(platform or "").strip()}
+        campaign_platform = str(campaign.get("platform") or "").strip().lower()
+        if campaign_platform and campaign_platform not in {"multi", "all", "omni"} and selected != {campaign_platform}:
+            raise CampaignLifecycleError("campaign_platform_scope_invalid", "Selected platforms do not match campaign platform scope", {"campaign_platform": campaign_platform, "selected_platforms": sorted(selected)})
+
+    def start_recipient_scenario(
+        self,
+        campaign_id: str,
+        recipient_id: str,
+        platforms: list[str],
+        global_contact_id: str | None = None,
+        correlation_id: str | None = None,
+        create_delivery_jobs: bool = False,
+    ) -> dict[str, Any]:
+        campaign = self.repository.get_campaign(campaign_id)
+        if campaign is None:
+            raise KeyError(campaign_id)
+        recipient = self.repository.get_recipient(recipient_id)
+        if recipient is None or str(recipient.get("campaign_id")) != campaign_id:
+            raise KeyError(recipient_id)
+        self._validate_recipient_scenario_start(campaign, recipient, platforms)
+        return self.repository.create_campaign_recipient_run(
+            campaign=campaign,
+            recipient=recipient,
+            platforms=platforms,
+            global_contact_id=global_contact_id,
+            correlation_id=correlation_id,
+            create_delivery_jobs=create_delivery_jobs,
+        )
+
+    def start_campaign_recipient_scenarios(
+        self,
+        campaign_id: str,
+        platforms: list[str],
+        create_delivery_jobs: bool = False,
+    ) -> dict[str, Any]:
+        campaign = self.repository.get_campaign(campaign_id)
+        if campaign is None:
+            raise KeyError(campaign_id)
+        recipients = self.repository.list_recipients(campaign_id, "valid", 10000, 0)
+        for recipient in recipients:
+            self._validate_recipient_scenario_start(campaign, recipient, platforms)
+        runs = [
+            self.repository.create_campaign_recipient_run(
+                campaign=campaign,
+                recipient=recipient,
+                platforms=platforms,
+                create_delivery_jobs=create_delivery_jobs,
+            )
+            for recipient in recipients
+        ]
+        return {"campaign_id": campaign_id, "created_scenario_count": len(runs), "items": runs}
+
+    def update_platform_run_outcome(self, platform_run_id: str, outcome: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        updated = self.repository.update_platform_run_outcome(platform_run_id, outcome, payload)
+        if updated is None:
+            raise KeyError(platform_run_id)
+        scenario = self.repository.get_campaign_recipient_run(str(updated["campaign_recipient_run_id"]))
+        return {"platform_run": updated, "scenario": scenario}
+
+    def retry_recipient_scenario(self, campaign_recipient_run_id: str) -> dict[str, Any]:
+        scenario = self.repository.get_campaign_recipient_run(campaign_recipient_run_id)
+        if scenario is None:
+            raise KeyError(campaign_recipient_run_id)
+        return self.repository.retry_retryable_platform_runs(campaign_recipient_run_id)
+
+    def list_recipient_scenario_report(self, campaign_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        limit, offset = _pagination(limit, offset)
+        return {
+            "campaign_id": campaign_id,
+            "items": self.repository.list_campaign_recipient_report_rows(campaign_id, limit, offset),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def get_recipient_scenario(self, campaign_recipient_run_id: str) -> dict[str, Any]:
+        scenario = self.repository.get_campaign_recipient_run(campaign_recipient_run_id)
+        if scenario is None:
+            raise KeyError(campaign_recipient_run_id)
+        return scenario
+
     def list_recipients(self, campaign_id: str, validation_status: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         limit, offset = _pagination(limit, offset)
         return {"items": self.repository.list_recipients(campaign_id, validation_status, limit, offset), "limit": limit, "offset": offset}

@@ -3283,10 +3283,121 @@ def test_bale_contacts_are_unique_per_account() -> None:
         store = BaleContactStore(Path(tmp_dir) / "contacts.json")
         first, _ = store.get_or_create_bale_contact("bale_a", "09304073331")
         second, _ = store.get_or_create_bale_contact("bale_b", "09304073331")
+        identities = store.list_platform_contact_identities("bale")
+        bale_a_bindings = store.list_account_contact_bindings("bale_a")
+        bale_b_bindings = store.list_account_contact_bindings("bale_b")
+
+        assert first["phone_normalized"] == second["phone_normalized"] == "989304073331"
         assert first["display_name"] == "Bale-000001"
         assert second["display_name"] == "Bale-000001"
+        assert first["stable_name"] == second["stable_name"] == "Bale-000001"
+        assert first["stable_sequence"] == second["stable_sequence"] == 1
+        assert len(identities) == 1
         assert len(store.list_bale_contacts("bale_a")) == 1
         assert len(store.list_bale_contacts("bale_b")) == 1
+        assert len(bale_a_bindings) == 1
+        assert len(bale_b_bindings) == 1
+        assert bale_a_bindings[0]["platform_contact_identity_id"] == bale_b_bindings[0]["platform_contact_identity_id"]
+        assert bale_a_bindings[0]["id"] != bale_b_bindings[0]["id"]
+
+
+def test_bale_same_account_repeated_contact_is_idempotent_binding() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        first, first_created = store.get_or_create_bale_contact("bale_a", "09304073331")
+        second, second_created = store.get_or_create_bale_contact("bale_a", "+989304073331")
+        assert first_created is True
+        assert second_created is False
+        assert first["display_name"] == second["display_name"] == "Bale-000001"
+        assert len(store.list_platform_contact_identities("bale")) == 1
+        assert len(store.list_account_contact_bindings("bale_a")) == 1
+
+
+def test_bale_account_binding_verification_state_is_isolated() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        store.get_or_create_bale_contact("bale_a", "09304073331")
+        store.get_or_create_bale_contact("bale_b", "09304073331")
+
+        store.update_contact_metadata("bale_a", "989304073331", {"bale_contact_verified": True, "verification_status": "verified"})
+        bale_a = store.get_bale_contact("bale_a", "09304073331")
+        bale_b = store.get_bale_contact("bale_b", "09304073331")
+
+        assert bale_a["bale_contact_verified"] is True
+        assert bale_a["verification_status"] == "verified"
+        assert bale_b.get("bale_contact_verified") is None
+        assert bale_b["verification_status"] == "unverified"
+
+
+def test_bale_account_binding_failure_state_is_isolated() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        store.get_or_create_bale_contact("bale_a", "09304073331")
+        store.get_or_create_bale_contact("bale_b", "09304073331")
+        store.update_contact_metadata("bale_a", "989304073331", {"bale_contact_verified": True, "verification_status": "verified"})
+        store.update_contact_metadata("bale_b", "989304073331", {"verification_status": "failed", "failure_code": "not_found"})
+
+        bale_a = store.get_bale_contact("bale_a", "09304073331")
+        bale_b = store.get_bale_contact("bale_b", "09304073331")
+
+        assert bale_a["verification_status"] == "verified"
+        assert bale_a.get("failure_code") is None
+        assert bale_b["verification_status"] == "failed"
+        assert bale_b["failure_code"] == "not_found"
+
+
+def test_bale_different_phones_allocate_sequential_identity_names() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        first, _ = store.get_or_create_bale_contact("bale_a", "09304073331")
+        second, _ = store.get_or_create_bale_contact("bale_b", "09121234567")
+        assert first["display_name"] == "Bale-000001"
+        assert second["display_name"] == "Bale-000002"
+        assert len(store.list_platform_contact_identities("bale")) == 2
+
+
+def test_same_phone_different_platforms_get_independent_identities() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        bale, _ = store.get_or_create_platform_contact("bale", "09304073331", account_id="bale_a")
+        telegram, _ = store.get_or_create_platform_contact("telegram", "09304073331", account_id="telegram_a")
+        assert bale["display_name"] == "Bale-000001"
+        assert telegram["display_name"] == "Telegram-000001"
+        assert bale["id"] != telegram["id"]
+        assert len(store.list_platform_contact_identities("bale")) == 1
+        assert len(store.list_platform_contact_identities("telegram")) == 1
+
+
+def test_bale_dry_run_lookup_creates_no_identity_or_binding() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        assert store.get_bale_contact("bale_a", "09304073331") is None
+        assert store.list_platform_contact_identities("bale") == []
+        assert store.list_account_contact_bindings("bale_a") == []
+
+
+def test_bale_confirmed_preparation_can_create_binding_without_new_identity_sequence() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        first, _ = store.get_or_create_bale_contact("bale_a", "09304073331")
+        second, second_created = store.get_or_create_bale_contact("bale_b", "09304073331")
+        assert second_created is True
+        assert first["stable_sequence"] == second["stable_sequence"] == 1
+        assert len(store.list_platform_contact_identities("bale")) == 1
+        assert len(store.list_account_contact_bindings("bale_b")) == 1
+
+
+def test_bale_concurrent_binding_creation_produces_no_duplicate_binding() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BaleContactStore(Path(tmp_dir) / "contacts.json")
+        store.get_or_create_bale_contact("bale_a", "09304073331")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda _: store.get_or_create_bale_contact("bale_b", "09304073331"), range(8)))
+        assert len(store.list_platform_contact_identities("bale")) == 1
+        assert len(store.list_account_contact_bindings("bale_b")) == 1
+        assert {result[0]["stable_name"] for result in results} == {"Bale-000001"}
 
 
 def _save_bale_contact_ready_page() -> MockPage:
@@ -6329,6 +6440,14 @@ if __name__ == "__main__":
     test_bale_contact_new_numbers_receive_sequential_names()
     test_bale_contact_bulk_insert_created_existing_invalid()
     test_bale_contacts_are_unique_per_account()
+    test_bale_same_account_repeated_contact_is_idempotent_binding()
+    test_bale_account_binding_verification_state_is_isolated()
+    test_bale_account_binding_failure_state_is_isolated()
+    test_bale_different_phones_allocate_sequential_identity_names()
+    test_same_phone_different_platforms_get_independent_identities()
+    test_bale_dry_run_lookup_creates_no_identity_or_binding()
+    test_bale_confirmed_preparation_can_create_binding_without_new_identity_sequence()
+    test_bale_concurrent_binding_creation_produces_no_duplicate_binding()
     test_save_bale_contact_new_contact()
     test_save_bale_contact_existing_contact_uses_stable_display_name()
     test_save_bale_contact_invalid_phone_fails_before_browser()

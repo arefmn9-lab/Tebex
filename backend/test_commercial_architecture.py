@@ -50,7 +50,24 @@ def _campaign(service: CommercialQueueService, **overrides: object) -> dict:
 
 
 def _job(service: CommercialQueueService, campaign_id: str) -> dict:
-    service.import_recipients(campaign_id, ["09304073331"])
+    result = service.import_recipients(campaign_id, ["09304073331"])
+    recipient = result["created_recipients"][0]
+    job = result["created_jobs"][0]
+    authorization = {
+        "recipient_origin": "user_import",
+        "live_execution_authorized": True,
+        "live_authorized_by": "architecture_fixture",
+        "live_authorized_at": "2026-07-14T00:00:00+00:00",
+        "authorization_source": "architecture_fixture",
+        "authorization_status": "authorized",
+        "authorization_note": "Temp-DB architecture fixture only; no adapter execution.",
+        "should_not_retry": False,
+        "synthetic_test_data": False,
+        "live_execution_blocked": False,
+        "block_reason": None,
+    }
+    service.repository.update_recipient_authorization(recipient["id"], authorization)
+    service.repository.update_job_authorization_metadata(job["id"], authorization)
     return service.list_jobs(campaign_id=campaign_id, limit=1)["items"][0]
 
 

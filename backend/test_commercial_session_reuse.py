@@ -148,7 +148,12 @@ def _seed(service: CommercialQueueService, account_id: str = "acct_a", count: in
     service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": count, "round_cooldown_override": 0, "delay_between_deliveries_override": 0})
     campaign = service.create_campaign({"name": "Reuse", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
     service.import_recipients(campaign["id"], [f"0930407333{index}" for index in range(1, count + 1)])
-    for recipient in service.list_recipients(campaign["id"], limit=100)["items"]:
+    _authorize_campaign_recipients(service, campaign["id"])
+    return campaign
+
+
+def _authorize_campaign_recipients(service: CommercialQueueService, campaign_id: str, note: str = "mock recipient") -> None:
+    for recipient in service.list_recipients(campaign_id, limit=1000)["items"]:
         service.repository.update_recipient_authorization(
             recipient["id"],
             {
@@ -158,12 +163,11 @@ def _seed(service: CommercialQueueService, account_id: str = "acct_a", count: in
                 "live_authorized_at": "2026-07-12T00:00:00+00:00",
                 "live_authorized_by": "test",
                 "authorization_source": "test_fixture",
-                "authorization_note": "mock recipient",
+                "authorization_note": note,
                 "authorization_status": "authorized",
                 "should_not_retry": False,
             },
         )
-    return campaign
 
 
 def test_feature_flag_false_preserves_legacy_lifecycle_and_standalone_supported() -> None:
@@ -299,10 +303,13 @@ def test_scheduler_batching_zero_stagger_20_account_isolation_and_failure_isolat
         service.sleeper = lambda seconds: sleeps.append(seconds)
         service.update_global_settings({"session_reuse_enabled": True, "max_concurrent_accounts": 20, "browser_start_batch_size": 5, "browser_start_stagger_ms": 0, "deliveries_per_account_round": 1})
         campaign = service.create_campaign({"name": "Many", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
+        phones: list[str] = []
         for index in range(20):
             account_id = f"acct_{index:02d}"
             service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": 1, "round_cooldown_override": 0})
-            service.import_recipients(campaign["id"], [f"09304073{index:03d}"])
+            phones.append(f"09304073{index:03d}")
+        service.import_recipients(campaign["id"], phones)
+        _authorize_campaign_recipients(service, campaign["id"], "mock 20-account scheduler recipient")
         service.scheduler_start()
         result = service.scheduler_run_once(campaign["id"], dry_run=True)
     assert sleeps == []

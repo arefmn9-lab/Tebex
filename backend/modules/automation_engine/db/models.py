@@ -146,6 +146,88 @@ CREATE TABLE IF NOT EXISTS commercial_recipients (
 )
 """
 
+CREATE_CAMPAIGN_RECIPIENT_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_campaign_recipient_runs (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    recipient_id TEXT NOT NULL,
+    global_contact_id TEXT NOT NULL,
+    phone_normalized TEXT NOT NULL,
+    correlation_id TEXT NOT NULL UNIQUE,
+    scenario_status TEXT NOT NULL CHECK(scenario_status IN ('pending','in_progress','retry_pending','completed','cancelled')),
+    selected_platform_count INTEGER NOT NULL,
+    checked_platform_count INTEGER NOT NULL,
+    sent_platform_count INTEGER NOT NULL,
+    account_not_found_count INTEGER NOT NULL,
+    failed_platform_count INTEGER NOT NULL,
+    retryable_platform_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id),
+    FOREIGN KEY(recipient_id) REFERENCES commercial_recipients(id),
+    UNIQUE(campaign_id, phone_normalized)
+)
+"""
+
+CREATE_PLATFORM_RUNS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_platform_runs (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    campaign_recipient_run_id TEXT NOT NULL,
+    recipient_id TEXT NOT NULL,
+    global_contact_id TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    delivery_job_id TEXT,
+    outcome TEXT NOT NULL CHECK(outcome IN (
+        'sent','account_not_found','not_reachable','blocked',
+        'failed_retryable','failed_terminal','skipped_by_policy',
+        'cancelled','pending','queued','assigned','in_progress'
+    )),
+    attempt_count INTEGER NOT NULL,
+    stable_display_name TEXT,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id),
+    FOREIGN KEY(campaign_recipient_run_id) REFERENCES commercial_campaign_recipient_runs(id),
+    FOREIGN KEY(recipient_id) REFERENCES commercial_recipients(id),
+    FOREIGN KEY(delivery_job_id) REFERENCES commercial_delivery_jobs(id),
+    UNIQUE(campaign_recipient_run_id, platform)
+)
+"""
+
+CREATE_PLATFORM_RUN_EVENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_platform_run_events (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    campaign_recipient_run_id TEXT NOT NULL,
+    platform_run_id TEXT NOT NULL,
+    job_id TEXT,
+    correlation_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    previous_status TEXT,
+    new_status TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT,
+    source TEXT,
+    reason TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id),
+    FOREIGN KEY(campaign_recipient_run_id) REFERENCES commercial_campaign_recipient_runs(id),
+    FOREIGN KEY(platform_run_id) REFERENCES commercial_platform_runs(id),
+    FOREIGN KEY(job_id) REFERENCES commercial_delivery_jobs(id)
+)
+"""
+
 CREATE_DELIVERY_JOBS_TABLE = """
 CREATE TABLE IF NOT EXISTS commercial_delivery_jobs (
     id TEXT PRIMARY KEY,
@@ -170,6 +252,11 @@ CREATE TABLE IF NOT EXISTS commercial_delivery_jobs (
     verified_forwarded_recipient_count INTEGER,
     forward_verified INTEGER,
     diagnostics_consistent INTEGER,
+    campaign_recipient_run_id TEXT,
+    platform_run_id TEXT,
+    platform TEXT,
+    global_contact_id TEXT,
+    correlation_id TEXT,
     error_domain TEXT,
     severity TEXT,
     retryable INTEGER,
@@ -195,7 +282,9 @@ CREATE TABLE IF NOT EXISTS commercial_delivery_jobs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id),
-    FOREIGN KEY(recipient_id) REFERENCES commercial_recipients(id)
+    FOREIGN KEY(recipient_id) REFERENCES commercial_recipients(id),
+    FOREIGN KEY(campaign_recipient_run_id) REFERENCES commercial_campaign_recipient_runs(id),
+    FOREIGN KEY(platform_run_id) REFERENCES commercial_platform_runs(id)
 )
 """
 
@@ -524,6 +613,12 @@ CREATE TABLE IF NOT EXISTS commercial_execution_authorizations (
 
 COMMERCIAL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipients_campaign_phone ON commercial_recipients(campaign_id, phone_normalized)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_runs_campaign_status ON commercial_campaign_recipient_runs(campaign_id, scenario_status)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_runs_recipient ON commercial_campaign_recipient_runs(recipient_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_recipient_runs_campaign_phone_unique ON commercial_campaign_recipient_runs(campaign_id, phone_normalized)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_platform_runs_scenario ON commercial_platform_runs(campaign_recipient_run_id, platform)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_platform_runs_outcome ON commercial_platform_runs(outcome)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_platform_run_events_platform ON commercial_platform_run_events(platform_run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_delivery_jobs_status ON commercial_delivery_jobs(status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_delivery_jobs_account_status ON commercial_delivery_jobs(account_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_delivery_jobs_campaign_status ON commercial_delivery_jobs(campaign_id, status)",
@@ -567,6 +662,11 @@ SCHEMA_ALTERATIONS = {
         "policy_overrides_json": "TEXT",
     },
     "commercial_delivery_jobs": {
+        "campaign_recipient_run_id": "TEXT",
+        "platform_run_id": "TEXT",
+        "platform": "TEXT",
+        "global_contact_id": "TEXT",
+        "correlation_id": "TEXT",
         "error_domain": "TEXT",
         "severity": "TEXT",
         "retryable": "INTEGER",
@@ -675,7 +775,10 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_ACCOUNT_SETTINGS_TABLE)
     connection.execute(CREATE_CAMPAIGNS_TABLE)
     connection.execute(CREATE_RECIPIENTS_TABLE)
+    connection.execute(CREATE_CAMPAIGN_RECIPIENT_RUNS_TABLE)
+    connection.execute(CREATE_PLATFORM_RUNS_TABLE)
     connection.execute(CREATE_DELIVERY_JOBS_TABLE)
+    connection.execute(CREATE_PLATFORM_RUN_EVENTS_TABLE)
     connection.execute(CREATE_JOB_EVENTS_TABLE)
     connection.execute(CREATE_ACCOUNT_WORKER_LOCKS_TABLE)
     connection.execute(CREATE_SCHEDULER_STATE_TABLE)
