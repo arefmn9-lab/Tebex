@@ -146,6 +146,15 @@ CREATE TABLE IF NOT EXISTS commercial_recipients (
 )
 """
 
+CREATE_GLOBAL_CONTACTS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_global_contacts (
+    id TEXT PRIMARY KEY,
+    normalized_phone TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
 CREATE_CAMPAIGN_RECIPIENT_RUNS_TABLE = """
 CREATE TABLE IF NOT EXISTS commercial_campaign_recipient_runs (
     id TEXT PRIMARY KEY,
@@ -161,6 +170,7 @@ CREATE TABLE IF NOT EXISTS commercial_campaign_recipient_runs (
     account_not_found_count INTEGER NOT NULL,
     failed_platform_count INTEGER NOT NULL,
     retryable_platform_count INTEGER NOT NULL,
+    pending_platform_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT,
@@ -613,6 +623,7 @@ CREATE TABLE IF NOT EXISTS commercial_execution_authorizations (
 
 COMMERCIAL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipients_campaign_phone ON commercial_recipients(campaign_id, phone_normalized)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_global_contacts_phone ON commercial_global_contacts(normalized_phone)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_runs_campaign_status ON commercial_campaign_recipient_runs(campaign_id, scenario_status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_runs_recipient ON commercial_campaign_recipient_runs(recipient_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_recipient_runs_campaign_phone_unique ON commercial_campaign_recipient_runs(campaign_id, phone_normalized)",
@@ -699,6 +710,9 @@ SCHEMA_ALTERATIONS = {
         "live_execution_blocked": "INTEGER",
         "block_reason": "TEXT",
     },
+    "commercial_campaign_recipient_runs": {
+        "pending_platform_count": "INTEGER NOT NULL DEFAULT 0",
+    },
     "commercial_live_execution_approvals": {
         "configuration_revision_id": "TEXT",
         "execution_snapshot_id": "TEXT",
@@ -775,6 +789,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_ACCOUNT_SETTINGS_TABLE)
     connection.execute(CREATE_CAMPAIGNS_TABLE)
     connection.execute(CREATE_RECIPIENTS_TABLE)
+    connection.execute(CREATE_GLOBAL_CONTACTS_TABLE)
     connection.execute(CREATE_CAMPAIGN_RECIPIENT_RUNS_TABLE)
     connection.execute(CREATE_PLATFORM_RUNS_TABLE)
     connection.execute(CREATE_DELIVERY_JOBS_TABLE)

@@ -219,6 +219,7 @@ class CommercialQueueService:
         self.orchestrator = orchestrator
         self.account_auth_checker = account_auth_checker or (lambda account_id: bale_account_store.get_account(account_id) is not None)
         self.sleeper = sleeper or time.sleep
+        self.contact_store = bale_contact_store
         self.recover_stale_jobs()
 
     def get_global_settings(self) -> dict[str, Any]:
@@ -399,6 +400,16 @@ class CommercialQueueService:
                 "critical": critical,
                 "validation_status": validation_status,
             }
+        extension_config: dict[str, Any] = {}
+        for candidate in [draft_config, approved_config, execution_override or {}]:
+            if isinstance(candidate.get("platforms"), dict):
+                extension_config["platforms"] = candidate["platforms"]
+            if isinstance(candidate.get("platform_settings"), dict):
+                extension_config["platform_settings"] = candidate["platform_settings"]
+        if extension_config.get("platforms"):
+            final["platforms"] = extension_config["platforms"]
+        if extension_config.get("platform_settings"):
+            final["platform_settings"] = extension_config["platform_settings"]
         origin_trace["fields"] = field_records
         resolved_hash = _configuration_hash(final)
         return {
@@ -428,6 +439,17 @@ class CommercialQueueService:
             uid = str(_get_nested(configuration, "source.source_channel_uid"))
             if uid not in url:
                 errors.append({"error_code": "effective_configuration_invalid", "field": "source.source_channel_url", "message": "Source URL must contain source UID"})
+        selected_platforms = self._selected_platforms_from_configuration(configuration)
+        platform_settings = configuration.get("platform_settings") if isinstance(configuration.get("platform_settings"), dict) else {}
+        if selected_platforms and (platform_settings or isinstance(configuration.get("platforms"), dict)):
+            for platform in selected_platforms:
+                settings = platform_settings.get(platform) or {}
+                source_uid = str(settings.get("source_uid") or settings.get("source_channel_uid") or "")
+                source_url = str(settings.get("source_url") or settings.get("source_channel_url") or "")
+                if not source_uid or not source_url:
+                    errors.append({"error_code": "platform_source_not_configured", "field": f"platform_settings.{platform}.source"})
+                elif source_uid not in source_url:
+                    errors.append({"error_code": "platform_source_invalid", "field": f"platform_settings.{platform}.source_url"})
         return {"ok": not errors, "errors": errors, "critical_fields": sorted(CRITICAL_CONFIGURATION_FIELDS)}
 
     def _next_revision_number(self, campaign_id: str) -> int:
@@ -2045,6 +2067,262 @@ class CommercialQueueService:
             "created_jobs": created_jobs,
         }
 
+    def _normalize_selected_platforms(self, platforms: list[str] | None, campaign: dict[str, Any] | None = None) -> list[str]:
+        raw = platforms or []
+        if not raw and campaign:
+            campaign_platform = str(campaign.get("platform") or "").strip().lower()
+            if campaign_platform and campaign_platform not in {"multi", "all", "omni"}:
+                raw = [campaign_platform]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for platform in raw:
+            value = str(platform or "").strip().lower()
+            if value and value not in seen:
+                normalized.append(value)
+                seen.add(value)
+        if not normalized:
+            raise CampaignLifecycleError("selected_platform_required", "At least one selected platform is required")
+        return normalized
+
+    def _selected_platforms_from_configuration(self, configuration: dict[str, Any]) -> list[str]:
+        platforms = configuration.get("platforms") if isinstance(configuration.get("platforms"), dict) else {}
+        selected = platforms.get("selected_platforms") if isinstance(platforms, dict) else []
+        if isinstance(selected, list):
+            return self._normalize_selected_platforms([str(item) for item in selected])
+        source_platform = _get_nested(configuration, "source.platform")
+        return self._normalize_selected_platforms([str(source_platform)]) if source_platform else []
+
+    def _platform_settings_from_configuration(self, configuration: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        settings = configuration.get("platform_settings") if isinstance(configuration.get("platform_settings"), dict) else {}
+        return {str(key).lower(): dict(value or {}) for key, value in settings.items() if isinstance(value, dict)}
+
+    def confirm_recipient_manifest(
+        self,
+        campaign_id: str,
+        phones: list[str],
+        submitted_by: str = "user",
+        source_type: str = "manual",
+        confirmation_checked: bool = False,
+    ) -> dict[str, Any]:
+        if not confirmation_checked:
+            raise CampaignLifecycleError("recipient_input_manifest_required", "Explicit recipient confirmation checkbox is required")
+        preview = self.preview_campaign_recipients(campaign_id, phones, source_type=source_type)
+        manifest = self.repository.create_recipient_input_manifest(
+            campaign_id=campaign_id,
+            phones=preview["final_phones"],
+            batch_id=None,
+            submitted_by=submitted_by,
+            source_type=source_type,
+            source_filename=None,
+            confirmation_status="confirmed",
+            confirmed_by=submitted_by,
+        )
+        return {
+            "campaign_id": campaign_id,
+            "manifest": manifest,
+            "preview": preview,
+            "materialization_required": True,
+            "created_recipient_count": 0,
+            "created_job_count": 0,
+            "execution_started": False,
+        }
+
+    def materialize_campaign_recipients(
+        self,
+        campaign_id: str,
+        platforms: list[str],
+        authorize_for_live_execution: bool = False,
+        authorized_by: str | None = None,
+        authorization_note: str | None = None,
+        create_platform_identities: bool = False,
+    ) -> dict[str, Any]:
+        campaign = self.repository.get_campaign(campaign_id)
+        if campaign is None:
+            raise KeyError(campaign_id)
+        selected_platforms = self._normalize_selected_platforms(platforms, campaign)
+        manifest = self._latest_confirmed_manifest(campaign_id)
+        if manifest is None:
+            raise CampaignLifecycleError("recipient_manifest_not_confirmed", "A confirmed recipient manifest is required before materialization")
+        phones = json.loads(str(manifest.get("normalized_phones_json") or "[]"))
+        existing_by_phone = self.repository.get_campaign_phone_map(campaign_id)
+        authorization = {
+            "recipient_origin": "user_import",
+            "synthetic_test_data": False,
+            "live_execution_authorized": bool(authorize_for_live_execution),
+            "live_authorized_at": utc_now() if authorize_for_live_execution else None,
+            "live_authorized_by": authorized_by if authorize_for_live_execution else None,
+            "authorization_source": "manifest_materialization_explicit" if authorize_for_live_execution else "manifest_materialization",
+            "authorization_note": authorization_note or ("Explicitly authorized during materialization" if authorize_for_live_execution else "Materialization does not grant live authorization by default"),
+            "authorization_status": "authorized" if authorize_for_live_execution else "authorization_required",
+            "should_not_retry": False,
+            "contact_preparation_allowed": bool(create_platform_identities),
+            "live_execution_blocked": False,
+            "block_reason": None,
+        }
+        recipients: list[dict[str, Any]] = []
+        scenarios: list[dict[str, Any]] = []
+        platform_identity_results: list[dict[str, Any]] = []
+        if len(phones) > 1000 and not create_platform_identities:
+            bulk = self.repository.bulk_materialize_recipient_runs(
+                campaign=campaign,
+                phones=[str(phone) for phone in phones],
+                platforms=selected_platforms,
+                manifest=manifest,
+                authorization=authorization,
+            )
+            return {
+                "campaign_id": campaign_id,
+                "manifest_id": manifest["manifest_id"],
+                "selected_platforms": selected_platforms,
+                "materialized_recipient_count": len(phones),
+                "scenario_count": int(bulk["scenario_count"]),
+                "platform_run_count": int(bulk["platform_run_count"]),
+                "created_job_count": 0,
+                "queued_job_count": 0,
+                "platform_identity_policy": "not_created",
+                "platform_identities": [],
+                "items": [],
+            }
+        for sequence, phone in enumerate(phones, start=1):
+            phone_text = str(phone)
+            global_contact = self.repository.get_or_create_global_contact(phone_text)
+            recipient = self.repository.get_recipient(existing_by_phone[phone_text]) if phone_text in existing_by_phone else None
+            if recipient is None:
+                recipient = self.repository.create_recipient_only(
+                    campaign=campaign,
+                    phone_raw=phone_text,
+                    phone_normalized=phone_text,
+                    display_name=None,
+                    import_source=str(manifest.get("source_type") or "manual"),
+                    manifest=manifest,
+                    input_sequence=sequence,
+                    authorization=authorization,
+                    skip_existing_lookup=True,
+                )
+                existing_by_phone[phone_text] = str(recipient["id"])
+            recipients.append(recipient)
+            scenario = self.repository.create_campaign_recipient_run(
+                campaign=campaign,
+                recipient=recipient,
+                platforms=selected_platforms,
+                global_contact_id=str(global_contact["id"]),
+                create_delivery_jobs=False,
+            )
+            scenarios.append(scenario)
+            if create_platform_identities:
+                for platform in selected_platforms:
+                    contact, created = self.contact_store.get_or_create_platform_contact(platform, phone_text)
+                    platform_identity_results.append({
+                        "platform": platform,
+                        "phone_normalized": phone_text,
+                        "stable_name": contact.get("stable_name") or contact.get("display_name"),
+                        "created": bool(created),
+                    })
+        return {
+            "campaign_id": campaign_id,
+            "manifest_id": manifest["manifest_id"],
+            "selected_platforms": selected_platforms,
+            "materialized_recipient_count": len(recipients),
+            "scenario_count": len(scenarios),
+            "platform_run_count": sum(len(item.get("platform_runs") or []) for item in scenarios),
+            "created_job_count": 0,
+            "queued_job_count": 0,
+            "platform_identity_policy": "explicit" if create_platform_identities else "not_created",
+            "platform_identities": platform_identity_results,
+            "items": scenarios,
+        }
+
+    def configure_campaign_platform_settings(
+        self,
+        campaign_id: str,
+        platforms: list[str],
+        platform_settings: dict[str, Any],
+        created_by: str = "user",
+    ) -> dict[str, Any]:
+        campaign = self.repository.get_campaign(campaign_id)
+        if campaign is None:
+            raise KeyError(campaign_id)
+        selected_platforms = self._normalize_selected_platforms(platforms, campaign)
+        normalized_settings: dict[str, dict[str, Any]] = {}
+        for platform in selected_platforms:
+            raw = dict((platform_settings or {}).get(platform) or {})
+            source_uid = str(raw.get("source_uid") or raw.get("source_channel_uid") or "").strip()
+            source_url = str(raw.get("source_url") or raw.get("source_channel_url") or "").strip()
+            normalized_settings[platform] = {
+                "source_uid": source_uid,
+                "source_url": source_url,
+                "source_label": raw.get("source_label") or raw.get("source_channel_label") or "",
+                "source_origin": "explicit_user_selection" if source_uid and source_url else "",
+                "sender_account_ids": [str(item) for item in raw.get("sender_account_ids", [])],
+            }
+        configuration = {
+            "source": {
+                "platform": selected_platforms[0],
+                "source_channel_uid": normalized_settings[selected_platforms[0]]["source_uid"],
+                "source_channel_url": normalized_settings[selected_platforms[0]]["source_url"],
+                "source_channel_label": normalized_settings[selected_platforms[0]]["source_label"],
+                "source_origin": "explicit_user_selection",
+            },
+            "platforms": {"selected_platforms": selected_platforms},
+            "platform_settings": normalized_settings,
+            "accounts": {
+                "allowed_account_ids": sorted({account for item in normalized_settings.values() for account in item.get("sender_account_ids", [])}),
+                "max_concurrent_accounts": self.get_global_settings().get("max_concurrent_accounts"),
+            },
+            "delivery": {
+                "daily_delivery_limit": self.get_global_settings().get("default_daily_limit_per_account"),
+                "deliveries_per_round": self.get_global_settings().get("deliveries_per_account_round"),
+                "max_jobs_per_execution": self.get_global_settings().get("deliveries_per_account_round"),
+                "stop_on_first_non_success": True,
+                "automatic_retry": False,
+                "retry_policy": {"max_attempts": 1, "automatic_retry": False},
+            },
+            "timing": {
+                "timezone": "Asia/Tehran",
+                "active_window_start": "00:00",
+                "active_window_end": "23:59",
+                "weekdays": [0, 1, 2, 3, 4, 5, 6],
+                "min_interval_seconds": self.get_global_settings().get("delay_between_deliveries_seconds"),
+                "max_interval_seconds": self.get_global_settings().get("delay_between_deliveries_seconds"),
+                "cooldown_seconds": self.get_global_settings().get("round_cooldown_seconds"),
+                "catch_up_policy": "skip",
+            },
+            "recipients": {
+                "require_live_authorization": True,
+                "require_verified_contact": True,
+                "allow_synthetic": False,
+                "deduplication_policy": "campaign_phone_unique",
+            },
+            "safety": {
+                "require_live_readiness": True,
+                "require_approval": True,
+                "uncertain_delivery_policy": "stop_manual_review",
+                "duplicate_delivery_policy": "block",
+            },
+            "platform": {"adapter_name": selected_platforms[0], "session_reuse_enabled": False, "adapter_configuration": {}},
+        }
+        draft = self.create_or_update_campaign_configuration_draft(
+            campaign_id,
+            configuration,
+            created_by=created_by,
+            change_summary="platform source settings updated",
+        )
+        validation = self.validate_campaign_configuration(campaign_id, str(draft["revision_id"]))
+        if not validation["validation"]["ok"]:
+            return {"campaign_id": campaign_id, "revision": validation["revision"], "validation": validation["validation"], "approved": False}
+        approved = self.approve_campaign_configuration_revision(campaign_id, str(draft["revision_id"]), approved_by=created_by)
+        snapshot = self.create_execution_configuration_snapshot(campaign_id, str(draft["revision_id"]), created_by=created_by)
+        return {
+            "campaign_id": campaign_id,
+            "selected_platforms": selected_platforms,
+            "platform_settings": normalized_settings,
+            "revision": approved["revision"],
+            "validation": approved["validation"]["validation"],
+            "snapshot": snapshot["snapshot"],
+            "assigned_job_count": snapshot["assigned_job_count"],
+            "approved": True,
+        }
+
     def preview_campaign_recipients(self, campaign_id: str, phones: list[str], source_type: str = "manual") -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
@@ -2071,6 +2349,8 @@ class CommercialQueueService:
             seen[normalized] = raw_text
             valid.append({"input_sequence": index, "phone_raw": raw_text, "phone_normalized": normalized})
         normalized_phones = [item["phone_normalized"] for item in valid]
+        existing_global_contact_phones = self.repository.get_existing_global_contact_phones(normalized_phones)
+        existing_global_contact_count = sum(1 for phone in normalized_phones if phone in existing_global_contact_phones)
         return {
             "campaign_id": campaign_id,
             "source_type": source_type,
@@ -2079,6 +2359,9 @@ class CommercialQueueService:
             "valid_count": len(valid),
             "duplicate_count": len(duplicates),
             "invalid_count": len(invalid),
+            "existing_global_contact_count": existing_global_contact_count,
+            "existing_platform_contact_count": 0,
+            "new_contact_count": len(valid) - existing_global_contact_count,
             "final_phones": normalized_phones,
             "manifest_hash_preview": hashlib.sha256(json.dumps(sorted(normalized_phones), ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest(),
             "valid_items": valid,
@@ -2122,9 +2405,18 @@ class CommercialQueueService:
         errors: list[dict[str, Any]] = []
         if manifest is None:
             errors.append({"error_code": "recipient_manifest_not_confirmed", "field": "recipient_manifest_id"})
-        source = configuration.get("resolved_configuration", {}).get("source", {})
-        if not source.get("source_channel_uid") or not source.get("source_channel_url"):
-            errors.append({"error_code": "source_not_validated", "field": "source"})
+        resolved_configuration = configuration.get("resolved_configuration", {})
+        selected_platforms = self._selected_platforms_from_configuration(resolved_configuration)
+        platform_settings = self._platform_settings_from_configuration(resolved_configuration)
+        if platform_settings or isinstance(resolved_configuration.get("platforms"), dict):
+            for platform in selected_platforms:
+                settings = platform_settings.get(platform) or {}
+                if not settings.get("source_uid") or not settings.get("source_url"):
+                    errors.append({"error_code": "platform_source_not_configured", "field": f"platform_settings.{platform}.source"})
+        else:
+            source = resolved_configuration.get("source", {})
+            if not source.get("source_channel_uid") or not source.get("source_channel_url"):
+                errors.append({"error_code": "source_not_validated", "field": "source"})
         revision = self.repository.get_latest_configuration_revision(campaign_id, {"approved", "active"})
         if revision is None:
             errors.append({"error_code": "configuration_revision_mismatch", "field": "configuration_revision_id"})
@@ -2141,6 +2433,15 @@ class CommercialQueueService:
                 errors.append({"error_code": "recipient_provenance_unknown", "recipient_id": recipient.get("id")})
             if bool(recipient.get("synthetic_test_data")) or bool(recipient.get("live_execution_blocked")) or recipient.get("authorization_status") != "authorized":
                 errors.append({"error_code": "approval_scope_invalid", "recipient_id": recipient.get("id")})
+        scenario_rows = self.repository.list_campaign_recipient_report_rows(campaign_id, 100000, 0)
+        manifest_count = int((manifest or {}).get("recipient_count") or 0)
+        scenario_required = bool(platform_settings or isinstance(resolved_configuration.get("platforms"), dict) or scenario_rows)
+        if scenario_required:
+            if manifest_count and len(scenario_rows) != manifest_count:
+                errors.append({"error_code": "recipient_scenario_scope_incomplete", "field": "recipient_scenarios", "expected": manifest_count, "actual": len(scenario_rows)})
+            for row in scenario_rows:
+                if sorted(row.get("selected_platforms") or []) != sorted(selected_platforms):
+                    errors.append({"error_code": "platform_run_scope_mismatch", "campaign_recipient_run_id": row.get("campaign_recipient_run_id")})
         return errors
 
     def final_review(self, campaign_id: str) -> dict[str, Any]:
@@ -2154,10 +2455,33 @@ class CommercialQueueService:
         snapshot = self.repository.get_latest_configuration_snapshot(campaign_id)
         recipients = self.repository.list_recipients(campaign_id, None, 10000, 0)
         jobs = self.repository.list_campaign_jobs_all(campaign_id)
-        source = configuration.get("resolved_configuration", {}).get("source", {})
+        resolved_configuration = configuration.get("resolved_configuration", {})
+        selected_platforms = self._selected_platforms_from_configuration(resolved_configuration)
+        platform_settings = self._platform_settings_from_configuration(resolved_configuration)
+        source = resolved_configuration.get("source", {})
         accounts = configuration.get("resolved_configuration", {}).get("accounts", {})
         delivery = configuration.get("resolved_configuration", {}).get("delivery", {})
         timing = configuration.get("resolved_configuration", {}).get("timing", {})
+        scenario_rows = self.repository.list_campaign_recipient_report_rows(campaign_id, 100000, 0)
+        platform_run_count = sum(len(row.get("selected_platforms") or []) for row in scenario_rows)
+        source_summary = {
+            platform: {
+                "source_uid": (platform_settings.get(platform) or {}).get("source_uid"),
+                "source_url": (platform_settings.get(platform) or {}).get("source_url"),
+                "source_label": (platform_settings.get(platform) or {}).get("source_label"),
+                "source_origin": (platform_settings.get(platform) or {}).get("source_origin"),
+            }
+            for platform in selected_platforms
+        }
+        sender_account_summary = (
+            {
+                platform: {
+                    "sender_account_ids": list((platform_settings.get(platform) or {}).get("sender_account_ids") or []),
+                }
+                for platform in selected_platforms
+            }
+            if platform_settings else {}
+        )
         contact_summary = {
             "recipient_count": len(recipients),
             "verified_count": sum(1 for recipient in recipients if bool(recipient.get("bale_contact_verified"))),
@@ -2174,8 +2498,9 @@ class CommercialQueueService:
             "manifest_id": manifest.get("manifest_id") if manifest else None,
             "manifest_hash": manifest.get("manifest_hash") if manifest else None,
             "recipient_count": len(recipients),
-            "source_uid": source.get("source_channel_uid"),
-            "source_url": source.get("source_channel_url"),
+            "selected_platforms": selected_platforms,
+            "platform_sources": source_summary,
+            "sender_accounts": sender_account_summary,
             "account_ids": accounts.get("allowed_account_ids") or [],
             "delivery": {
                 "max_jobs_per_execution": delivery.get("max_jobs_per_execution"),
@@ -2207,12 +2532,19 @@ class CommercialQueueService:
                 "recipient_count": len(recipients),
                 "manifest_confirmed": manifest is not None,
             },
+            "recipient_scenario_summary": {
+                "scenario_count": len(scenario_rows),
+                "platform_run_count": platform_run_count,
+                "selected_platforms": selected_platforms,
+            },
             "contact_preparation_state": contact_summary,
             "source": {
                 "source_uid": source.get("source_channel_uid"),
                 "source_url": source.get("source_channel_url"),
                 "source_label": source.get("source_channel_label"),
             },
+            "platform_sources": source_summary,
+            "sender_accounts": sender_account_summary,
             "accounts": {
                 "allowed_account_ids": accounts.get("allowed_account_ids") or [],
                 "max_concurrent_accounts": accounts.get("max_concurrent_accounts"),
@@ -2289,18 +2621,33 @@ class CommercialQueueService:
             errors.append({"error_code": "approval_scope_invalid", "field": "one_send_limit", "limits": limits})
         return errors
 
+    def _is_controlled_single_recipient_review(self, review: dict[str, Any]) -> bool:
+        campaign_id = str(review["campaign_id"])
+        recipients = self.repository.list_recipients(campaign_id, None, 10000, 0)
+        source = review.get("source") or {}
+        source_uid = str(source.get("source_uid") or "")
+        return (
+            any(str(recipient.get("phone_normalized") or "") == CONTROLLED_SINGLE_RECIPIENT_PHONE for recipient in recipients)
+            or source_uid in {CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID, "5613544284"}
+        )
+
     def live_preflight(self, campaign_id: str, approval_id: str | None = None) -> dict[str, Any]:
         review = self.final_review(campaign_id)
         blocking_errors: list[dict[str, Any]] = list(review.get("validation_errors") or [])
-        blocking_errors.extend(self._single_recipient_scope_errors(review))
         approvals = self.repository.list_live_execution_approvals(campaign_id)
         approval = self.get_live_execution_approval(approval_id) if approval_id else (self._serialize_live_approval(approvals[0]) if approvals else None)
+        preflight_approval_scope = str((approval or {}).get("approval_scope") or "campaign_send")
         now = datetime.now(timezone.utc)
         if approval is None:
             blocking_errors.append({"error_code": "explicit_live_confirmation_required", "field": "approval_id"})
+            if self._is_controlled_single_recipient_review(review):
+                blocking_errors.extend(self._single_recipient_scope_errors(review))
         else:
-            if approval.get("approval_scope") != CONTROLLED_SINGLE_RECIPIENT_APPROVAL_SCOPE:
+            approval_scope = preflight_approval_scope
+            if approval_scope not in {"campaign_send", CONTROLLED_SINGLE_RECIPIENT_APPROVAL_SCOPE}:
                 blocking_errors.append({"error_code": "approval_scope_invalid", "field": "approval_scope", "actual": approval.get("approval_scope")})
+            if approval_scope == CONTROLLED_SINGLE_RECIPIENT_APPROVAL_SCOPE:
+                blocking_errors.extend(self._single_recipient_scope_errors(review))
             if approval.get("approval_status") != "approved":
                 blocking_errors.append({"error_code": "approval_not_approved", "status": approval.get("approval_status")})
             expires_at = parse_time(approval.get("expires_at"))
@@ -2314,19 +2661,43 @@ class CommercialQueueService:
                 blocking_errors.append({"error_code": "execution_snapshot_mismatch", "field": "execution_snapshot_id"})
             if approval.get("configuration_snapshot_hash") != (review.get("execution_snapshot") or {}).get("configuration_hash"):
                 blocking_errors.append({"error_code": "configuration_snapshot_hash_mismatch", "field": "configuration_snapshot_hash"})
+        scenarios = self.repository.list_campaign_recipient_report_rows(campaign_id, 100000, 0)
         duplicate_scope = any(
-            str(job.get("phone_normalized")) == CONTROLLED_SINGLE_RECIPIENT_PHONE
-            and job.get("status") == "succeeded"
+            job.get("status") == "succeeded"
             and int(job.get("verified_forwarded_recipient_count") or 0) > 0
             for job in self.repository.list_campaign_jobs_all(campaign_id)
         )
         if duplicate_scope:
             blocking_errors.append({"error_code": "duplicate_execution_scope", "field": "delivery_history"})
-        account_health = self.get_account_health(CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID)
+        retry_pending_count = sum(1 for row in scenarios if int(row.get("retry_pending_count") or 0) > 0)
+        if retry_pending_count:
+            blocking_errors.append({"error_code": "retry_state_present", "field": "recipient_scenarios", "retry_pending_count": retry_pending_count})
+        sender_accounts = review.get("sender_accounts") or {}
+        account_summary: dict[str, Any] = {}
+        for platform, summary in sender_accounts.items():
+            account_ids = [str(item) for item in summary.get("sender_account_ids") or []]
+            account_details: list[dict[str, Any]] = []
+            if not account_ids:
+                blocking_errors.append({"error_code": "sender_account_unavailable", "platform": platform})
+            for account_id in account_ids:
+                settings = self.get_account_settings(account_id)
+                health = self.get_account_health(account_id)
+                blocked = (not bool(settings.get("enabled"))) or str(health.get("health_status") or "") in BLOCKING_STATES or bool(health.get("manual_review_required"))
+                if blocked:
+                    blocking_errors.append({"error_code": "sender_account_unavailable", "platform": platform, "account_id": account_id})
+                account_details.append({
+                    "account_id": account_id,
+                    "enabled": bool(settings.get("enabled")),
+                    "health_status": health.get("health_status"),
+                    "manual_review_required": bool(health.get("manual_review_required")),
+                    "checked_from_stored_state_only": True,
+                })
+            account_summary[platform] = {"sender_account_ids": account_ids, "accounts": account_details}
+        controlled_account_health = self.get_account_health(CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID) if preflight_approval_scope == CONTROLLED_SINGLE_RECIPIENT_APPROVAL_SCOPE else {}
         browser_auth = {
             "account_id": CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID,
-            "health_status": account_health.get("health_status"),
-            "last_authentication_verified_at": account_health.get("last_authentication_verified_at"),
+            "health_status": controlled_account_health.get("health_status"),
+            "last_authentication_verified_at": controlled_account_health.get("last_authentication_verified_at"),
             "checked_from_stored_state_only": True,
         }
         return {
@@ -2335,15 +2706,16 @@ class CommercialQueueService:
             "execute_allowed": False,
             "execution_feature_status": "disabled",
             "blocking_errors": blocking_errors,
+            "warning_errors": [{"warning_code": "live_execution_endpoint_disabled"}],
             "warnings": [{"warning_code": "live_execution_endpoint_disabled"}],
             "recipient_summary": {
-                "stable_display_name": CONTROLLED_SINGLE_RECIPIENT_NAME,
-                "phone_masked": "989****4491",
-                "required_phone": CONTROLLED_SINGLE_RECIPIENT_PHONE,
                 "recipient_count": review.get("confirmed_recipients_summary", {}).get("recipient_count"),
+                "scenario_count": review.get("recipient_scenario_summary", {}).get("scenario_count"),
+                "platform_run_count": review.get("recipient_scenario_summary", {}).get("platform_run_count"),
             },
-            "source_summary": review.get("source"),
-            "account_summary": {"allowed_account_ids": review.get("accounts", {}).get("allowed_account_ids"), "required_account_id": CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID},
+            "per_platform_summary": review.get("recipient_scenario_summary"),
+            "source_summary": review.get("platform_sources") or review.get("source"),
+            "account_summary": account_summary or {"allowed_account_ids": review.get("accounts", {}).get("allowed_account_ids")},
             "manifest_summary": review.get("confirmed_recipients_summary"),
             "snapshot_summary": {
                 "snapshot_id": (review.get("execution_snapshot") or {}).get("snapshot_id"),
@@ -2351,6 +2723,7 @@ class CommercialQueueService:
             },
             "approval_summary": approval,
             "duplicate_send_history": {"duplicate_scope_found": duplicate_scope},
+            "retry_summary": {"retry_pending_scenario_count": retry_pending_count},
             "limits": review.get("limits"),
             "browser_authentication_status": browser_auth,
             "final_review_hash": review.get("final_review_hash"),
@@ -2441,6 +2814,8 @@ class CommercialQueueService:
         manifest_id = review["confirmed_recipients_summary"].get("manifest_id")
         manifest_hash_value = review["confirmed_recipients_summary"].get("manifest_hash")
         source = review["source"]
+        platform_sources = review.get("platform_sources") or {}
+        first_platform_source = next(iter(platform_sources.values()), {}) if isinstance(platform_sources, dict) and platform_sources else {}
         account_ids = review["accounts"].get("allowed_account_ids") or []
         approval = self.repository.create_live_execution_approval({
             "campaign_id": campaign_id,
@@ -2453,8 +2828,8 @@ class CommercialQueueService:
             "approved_by": requested_by if explicit_confirmation else None,
             "approval_note": "send approval requested from final review",
             "approval_scope": approval_scope,
-            "source_uid": source.get("source_uid"),
-            "source_url": source.get("source_url"),
+            "source_uid": source.get("source_uid") or first_platform_source.get("source_uid"),
+            "source_url": source.get("source_url") or first_platform_source.get("source_url"),
             "account_ids": account_ids,
             "recipient_count": review["confirmed_recipients_summary"]["recipient_count"],
             "validation_result": review["validation"],

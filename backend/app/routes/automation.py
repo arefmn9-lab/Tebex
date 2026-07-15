@@ -504,6 +504,20 @@ class RecipientConfirmRequest(BaseModel):
     confirmation_checked: bool = False
 
 
+class CampaignMaterializeRequest(BaseModel):
+    platforms: list[str]
+    authorize_for_live_execution: bool = False
+    authorized_by: str | None = None
+    authorization_note: str | None = None
+    create_platform_identities: bool = False
+
+
+class CampaignPlatformSettingsRequest(BaseModel):
+    platforms: list[str]
+    platform_settings: dict[str, Any]
+    created_by: str = "user"
+
+
 class RecipientScenarioStartRequest(BaseModel):
     recipient_id: str
     platforms: list[str]
@@ -1152,12 +1166,42 @@ def preview_campaign_recipients(campaign_id: str, request: RecipientPreviewReque
 def confirm_campaign_recipients(campaign_id: str, request: RecipientConfirmRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        return commercial_queue_service.confirm_campaign_recipients(
+        return commercial_queue_service.confirm_recipient_manifest(
             campaign_id,
             request.phones,
             submitted_by=request.submitted_by,
             source_type=request.source_type,
             confirmation_checked=request.confirmation_checked,
+        )
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/campaigns/{campaign_id}/materialize")
+def materialize_campaign_recipients(campaign_id: str, request: CampaignMaterializeRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.materialize_campaign_recipients(
+            campaign_id,
+            request.platforms,
+            authorize_for_live_execution=request.authorize_for_live_execution,
+            authorized_by=request.authorized_by,
+            authorization_note=request.authorization_note,
+            create_platform_identities=request.create_platform_identities,
+        )
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/campaigns/{campaign_id}/platform-settings")
+def configure_campaign_platform_settings(campaign_id: str, request: CampaignPlatformSettingsRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.configure_campaign_platform_settings(
+            campaign_id,
+            request.platforms,
+            request.platform_settings,
+            created_by=request.created_by,
         )
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
@@ -1197,6 +1241,27 @@ def list_recipient_scenario_report(campaign_id: str, response: Response, limit: 
     _set_dashboard_cors_headers(response)
     try:
         return commercial_queue_service.list_recipient_scenario_report(campaign_id, limit=limit, offset=offset)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.get("/campaigns/{campaign_id}/recipient-scenarios")
+def list_campaign_recipient_scenarios(campaign_id: str, response: Response, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.list_recipient_scenario_report(campaign_id, limit=limit, offset=offset)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.get("/campaigns/{campaign_id}/recipient-scenarios/{campaign_recipient_run_id}")
+def get_campaign_recipient_scenario(campaign_id: str, campaign_recipient_run_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        scenario = commercial_queue_service.get_recipient_scenario(campaign_recipient_run_id)
+        if scenario.get("campaign_id") != campaign_id:
+            raise KeyError(campaign_recipient_run_id)
+        return scenario
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 

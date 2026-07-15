@@ -87,6 +87,7 @@ def aggregate_platform_counts(outcomes: list[str]) -> dict[str, int]:
         "account_not_found_count": sum(1 for outcome in outcomes if outcome == "account_not_found"),
         "failed_platform_count": sum(1 for outcome in outcomes if outcome in {"failed_retryable", "failed_terminal"}),
         "retryable_platform_count": sum(1 for outcome in outcomes if outcome == "failed_retryable"),
+        "pending_platform_count": sum(1 for outcome in outcomes if outcome in {"pending", "queued", "assigned", "in_progress"}),
     }
 
 
@@ -633,6 +634,150 @@ class CommercialQueueRepository:
             ).fetchall()
             return {str(row["phone_normalized"]): str(row["id"]) for row in rows}
 
+    def get_or_create_global_contact(self, normalized_phone: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM commercial_global_contacts WHERE normalized_phone = ?",
+                (normalized_phone,),
+            ).fetchone()
+            if row is not None:
+                return dict(row)
+            record = {
+                "id": new_id("global_contact"),
+                "normalized_phone": normalized_phone,
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO commercial_global_contacts (id, normalized_phone, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (record["id"], record["normalized_phone"], record["created_at"], record["updated_at"]),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError:
+                connection.rollback()
+                row = connection.execute(
+                    "SELECT * FROM commercial_global_contacts WHERE normalized_phone = ?",
+                    (normalized_phone,),
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
+                raise
+            return self.get_global_contact(str(record["id"])) or record
+
+    def get_global_contact_by_phone(self, normalized_phone: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            return row_to_dict(
+                connection.execute(
+                    "SELECT * FROM commercial_global_contacts WHERE normalized_phone = ?",
+                    (normalized_phone,),
+                ).fetchone()
+            )
+
+    def get_existing_global_contact_phones(self, normalized_phones: list[str]) -> set[str]:
+        values = sorted({str(phone) for phone in normalized_phones if str(phone)})
+        if not values:
+            return set()
+        found: set[str] = set()
+        with self.connection() as connection:
+            for index in range(0, len(values), 900):
+                chunk = values[index:index + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT normalized_phone FROM commercial_global_contacts WHERE normalized_phone IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                found.update(str(row["normalized_phone"]) for row in rows)
+        return found
+
+    def get_global_contact(self, global_contact_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            return row_to_dict(connection.execute("SELECT * FROM commercial_global_contacts WHERE id = ?", (global_contact_id,)).fetchone())
+
+    def count_global_contacts(self) -> int:
+        with self.connection() as connection:
+            return int(connection.execute("SELECT COUNT(*) AS count FROM commercial_global_contacts").fetchone()["count"])
+
+    def create_recipient_only(
+        self,
+        campaign: dict[str, Any],
+        phone_raw: str,
+        phone_normalized: str,
+        display_name: str | None,
+        import_source: str,
+        manifest: dict[str, Any],
+        input_sequence: int,
+        authorization: dict[str, Any] | None = None,
+        skip_existing_lookup: bool = False,
+    ) -> dict[str, Any]:
+        if not skip_existing_lookup:
+            existing_id = self.get_campaign_phone_map(str(campaign["id"])).get(phone_normalized)
+            if existing_id:
+                return self.get_recipient(existing_id) or {"id": existing_id}
+        now = utc_now()
+        authorization = authorization or {}
+        recipient = {
+            "id": new_id("recipient"),
+            "campaign_id": campaign["id"],
+            "phone_raw": phone_raw,
+            "phone_normalized": phone_normalized,
+            "display_name": display_name,
+            "import_source": import_source,
+            "validation_status": "valid",
+            "duplicate_of_recipient_id": None,
+            "recipient_origin": authorization.get("recipient_origin") or "user_import",
+            "synthetic_test_data": int(bool(authorization.get("synthetic_test_data", False))),
+            "live_execution_authorized": int(bool(authorization.get("live_execution_authorized", False))),
+            "live_authorized_at": authorization.get("live_authorized_at"),
+            "live_authorized_by": authorization.get("live_authorized_by"),
+            "authorization_source": authorization.get("authorization_source") or "manifest_materialization",
+            "authorization_note": authorization.get("authorization_note") or "Materialized from confirmed recipient manifest",
+            "authorization_status": authorization.get("authorization_status") or "authorization_required",
+            "should_not_retry": int(bool(authorization.get("should_not_retry", False))),
+            "input_manifest_id": manifest["manifest_id"],
+            "input_manifest_hash": manifest["manifest_hash"],
+            "input_sequence": input_sequence,
+            "input_provenance_status": "confirmed_manifest",
+            "contact_preparation_allowed": int(bool(authorization.get("contact_preparation_allowed", False))),
+            "live_execution_blocked": int(bool(authorization.get("live_execution_blocked", False))),
+            "block_reason": authorization.get("block_reason"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO commercial_recipients (
+                    id, campaign_id, phone_raw, phone_normalized, display_name,
+                    import_source, validation_status, duplicate_of_recipient_id,
+                    recipient_origin, synthetic_test_data, live_execution_authorized,
+                    live_authorized_at, live_authorized_by, authorization_source,
+                    authorization_note, authorization_status, should_not_retry,
+                    input_manifest_id, input_manifest_hash, input_sequence,
+                    input_provenance_status, contact_preparation_allowed,
+                    live_execution_blocked, block_reason, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(recipient[key] for key in [
+                    "id", "campaign_id", "phone_raw", "phone_normalized", "display_name",
+                    "import_source", "validation_status", "duplicate_of_recipient_id",
+                    "recipient_origin", "synthetic_test_data", "live_execution_authorized",
+                    "live_authorized_at", "live_authorized_by", "authorization_source",
+                    "authorization_note", "authorization_status", "should_not_retry",
+                    "input_manifest_id", "input_manifest_hash", "input_sequence",
+                    "input_provenance_status", "contact_preparation_allowed",
+                    "live_execution_blocked", "block_reason", "created_at", "updated_at",
+                ]),
+            )
+            connection.commit()
+        self.refresh_campaign_counts(str(campaign["id"]))
+        return self.get_recipient(str(recipient["id"])) or recipient
+
     def create_recipient_and_job(self, campaign: dict[str, Any], phone_raw: str, phone_normalized: str, display_name: str | None, import_source: str) -> tuple[dict[str, Any], dict[str, Any]]:
         now = utc_now()
         recipient = {
@@ -849,6 +994,7 @@ class CommercialQueueRepository:
             "account_not_found_count": 0,
             "failed_platform_count": 0,
             "retryable_platform_count": 0,
+            "pending_platform_count": len(normalized_platforms),
             "created_at": now,
             "started_at": None,
             "completed_at": None,
@@ -864,16 +1010,16 @@ class CommercialQueueRepository:
                         id, campaign_id, recipient_id, global_contact_id, phone_normalized,
                         correlation_id, scenario_status, selected_platform_count,
                         checked_platform_count, sent_platform_count, account_not_found_count,
-                        failed_platform_count, retryable_platform_count, created_at,
+                        failed_platform_count, retryable_platform_count, pending_platform_count, created_at,
                         started_at, completed_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     tuple(run[key] for key in [
                         "id", "campaign_id", "recipient_id", "global_contact_id", "phone_normalized",
                         "correlation_id", "scenario_status", "selected_platform_count",
                         "checked_platform_count", "sent_platform_count", "account_not_found_count",
-                        "failed_platform_count", "retryable_platform_count", "created_at",
+                        "failed_platform_count", "retryable_platform_count", "pending_platform_count", "created_at",
                         "started_at", "completed_at", "updated_at",
                     ]),
                 )
@@ -1054,6 +1200,7 @@ class CommercialQueueRepository:
                 account_not_found_count = ?,
                 failed_platform_count = ?,
                 retryable_platform_count = ?,
+                pending_platform_count = ?,
                 completed_at = CASE WHEN ? IS NOT NULL THEN COALESCE(completed_at, ?) ELSE NULL END,
                 updated_at = ?
             WHERE id = ?
@@ -1066,6 +1213,7 @@ class CommercialQueueRepository:
                 counts["account_not_found_count"],
                 counts["failed_platform_count"],
                 counts["retryable_platform_count"],
+                counts["pending_platform_count"],
                 completed_at,
                 completed_at,
                 now,
@@ -1141,6 +1289,220 @@ class CommercialQueueRepository:
     def get_platform_run(self, platform_run_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             return row_to_dict(connection.execute("SELECT * FROM commercial_platform_runs WHERE id = ?", (platform_run_id,)).fetchone())
+
+    def bulk_materialize_recipient_runs(
+        self,
+        campaign: dict[str, Any],
+        phones: list[str],
+        platforms: list[str],
+        manifest: dict[str, Any],
+        authorization: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        normalized_platforms = []
+        seen_platforms: set[str] = set()
+        for platform in platforms:
+            value = str(platform or "").strip().lower()
+            if value and value not in seen_platforms:
+                normalized_platforms.append(value)
+                seen_platforms.add(value)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_contacts = {
+                str(row["normalized_phone"]): dict(row)
+                for row in connection.execute("SELECT * FROM commercial_global_contacts").fetchall()
+            }
+            existing_recipients = {
+                str(row["phone_normalized"]): dict(row)
+                for row in connection.execute("SELECT * FROM commercial_recipients WHERE campaign_id = ?", (campaign["id"],)).fetchall()
+            }
+            existing_runs = {
+                str(row["phone_normalized"]): dict(row)
+                for row in connection.execute("SELECT * FROM commercial_campaign_recipient_runs WHERE campaign_id = ?", (campaign["id"],)).fetchall()
+            }
+            created_recipients = 0
+            scenario_count = 0
+            platform_run_count = 0
+            for sequence, phone in enumerate(phones, start=1):
+                phone_text = str(phone)
+                global_contact = existing_contacts.get(phone_text)
+                if global_contact is None:
+                    global_contact = {
+                        "id": new_id("global_contact"),
+                        "normalized_phone": phone_text,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    connection.execute(
+                        "INSERT INTO commercial_global_contacts (id, normalized_phone, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                        (global_contact["id"], phone_text, now, now),
+                    )
+                    existing_contacts[phone_text] = global_contact
+                recipient = existing_recipients.get(phone_text)
+                if recipient is None:
+                    recipient = {
+                        "id": new_id("recipient"),
+                        "campaign_id": campaign["id"],
+                        "phone_raw": phone_text,
+                        "phone_normalized": phone_text,
+                        "display_name": None,
+                        "import_source": manifest.get("source_type") or "manual",
+                        "validation_status": "valid",
+                        "duplicate_of_recipient_id": None,
+                        "recipient_origin": authorization.get("recipient_origin") or "user_import",
+                        "synthetic_test_data": int(bool(authorization.get("synthetic_test_data", False))),
+                        "live_execution_authorized": int(bool(authorization.get("live_execution_authorized", False))),
+                        "live_authorized_at": authorization.get("live_authorized_at"),
+                        "live_authorized_by": authorization.get("live_authorized_by"),
+                        "authorization_source": authorization.get("authorization_source") or "manifest_materialization",
+                        "authorization_note": authorization.get("authorization_note") or "Materialized from confirmed recipient manifest",
+                        "authorization_status": authorization.get("authorization_status") or "authorization_required",
+                        "should_not_retry": int(bool(authorization.get("should_not_retry", False))),
+                        "input_manifest_id": manifest["manifest_id"],
+                        "input_manifest_hash": manifest["manifest_hash"],
+                        "input_sequence": sequence,
+                        "input_provenance_status": "confirmed_manifest",
+                        "contact_preparation_allowed": int(bool(authorization.get("contact_preparation_allowed", False))),
+                        "live_execution_blocked": int(bool(authorization.get("live_execution_blocked", False))),
+                        "block_reason": authorization.get("block_reason"),
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    connection.execute(
+                        """
+                        INSERT INTO commercial_recipients (
+                            id, campaign_id, phone_raw, phone_normalized, display_name,
+                            import_source, validation_status, duplicate_of_recipient_id,
+                            recipient_origin, synthetic_test_data, live_execution_authorized,
+                            live_authorized_at, live_authorized_by, authorization_source,
+                            authorization_note, authorization_status, should_not_retry,
+                            input_manifest_id, input_manifest_hash, input_sequence,
+                            input_provenance_status, contact_preparation_allowed,
+                            live_execution_blocked, block_reason, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        tuple(recipient[key] for key in [
+                            "id", "campaign_id", "phone_raw", "phone_normalized", "display_name",
+                            "import_source", "validation_status", "duplicate_of_recipient_id",
+                            "recipient_origin", "synthetic_test_data", "live_execution_authorized",
+                            "live_authorized_at", "live_authorized_by", "authorization_source",
+                            "authorization_note", "authorization_status", "should_not_retry",
+                            "input_manifest_id", "input_manifest_hash", "input_sequence",
+                            "input_provenance_status", "contact_preparation_allowed",
+                            "live_execution_blocked", "block_reason", "created_at", "updated_at",
+                        ]),
+                    )
+                    existing_recipients[phone_text] = recipient
+                    created_recipients += 1
+                run = existing_runs.get(phone_text)
+                if run is None:
+                    run = {
+                        "id": new_id("recipient_run"),
+                        "campaign_id": campaign["id"],
+                        "recipient_id": recipient["id"],
+                        "global_contact_id": global_contact["id"],
+                        "phone_normalized": phone_text,
+                        "correlation_id": new_id("corr"),
+                        "scenario_status": "pending",
+                        "selected_platform_count": len(normalized_platforms),
+                        "checked_platform_count": 0,
+                        "sent_platform_count": 0,
+                        "account_not_found_count": 0,
+                        "failed_platform_count": 0,
+                        "retryable_platform_count": 0,
+                        "pending_platform_count": len(normalized_platforms),
+                        "created_at": now,
+                        "started_at": None,
+                        "completed_at": None,
+                        "updated_at": now,
+                    }
+                    connection.execute(
+                        """
+                        INSERT INTO commercial_campaign_recipient_runs (
+                            id, campaign_id, recipient_id, global_contact_id, phone_normalized,
+                            correlation_id, scenario_status, selected_platform_count,
+                            checked_platform_count, sent_platform_count, account_not_found_count,
+                            failed_platform_count, retryable_platform_count, pending_platform_count,
+                            created_at, started_at, completed_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        tuple(run[key] for key in [
+                            "id", "campaign_id", "recipient_id", "global_contact_id", "phone_normalized",
+                            "correlation_id", "scenario_status", "selected_platform_count",
+                            "checked_platform_count", "sent_platform_count", "account_not_found_count",
+                            "failed_platform_count", "retryable_platform_count", "pending_platform_count",
+                            "created_at", "started_at", "completed_at", "updated_at",
+                        ]),
+                    )
+                    existing_runs[phone_text] = run
+                    scenario_count += 1
+                existing_platforms = {
+                    str(row["platform"])
+                    for row in connection.execute(
+                        "SELECT platform FROM commercial_platform_runs WHERE campaign_recipient_run_id = ?",
+                        (run["id"],),
+                    ).fetchall()
+                }
+                for platform in normalized_platforms:
+                    if platform in existing_platforms:
+                        continue
+                    platform_run = {
+                        "id": new_id("platform_run"),
+                        "campaign_id": campaign["id"],
+                        "campaign_recipient_run_id": run["id"],
+                        "recipient_id": recipient["id"],
+                        "global_contact_id": global_contact["id"],
+                        "correlation_id": run["correlation_id"],
+                        "platform": platform,
+                        "delivery_job_id": None,
+                        "outcome": "pending",
+                        "attempt_count": 0,
+                        "stable_display_name": None,
+                        "last_error_code": None,
+                        "last_error_message": None,
+                        "started_at": None,
+                        "completed_at": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    connection.execute(
+                        """
+                        INSERT INTO commercial_platform_runs (
+                            id, campaign_id, campaign_recipient_run_id, recipient_id,
+                            global_contact_id, correlation_id, platform, delivery_job_id,
+                            outcome, attempt_count, stable_display_name, last_error_code,
+                            last_error_message, started_at, completed_at, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        tuple(platform_run[key] for key in [
+                            "id", "campaign_id", "campaign_recipient_run_id", "recipient_id",
+                            "global_contact_id", "correlation_id", "platform", "delivery_job_id",
+                            "outcome", "attempt_count", "stable_display_name", "last_error_code",
+                            "last_error_message", "started_at", "completed_at", "created_at", "updated_at",
+                        ]),
+                    )
+                    self._create_platform_run_event(
+                        connection,
+                        platform_run=platform_run,
+                        previous_status=None,
+                        new_status="pending",
+                        event_type="platform_run_created",
+                        actor="system",
+                        source="commercial_queue",
+                        reason="recipient_scenario_started",
+                    )
+                    platform_run_count += 1
+            connection.commit()
+        self.refresh_campaign_counts(str(campaign["id"]))
+        return {
+            "created_recipient_count": created_recipients,
+            "scenario_count": len(phones),
+            "created_scenario_count": scenario_count,
+            "platform_run_count": platform_run_count,
+        }
 
     def retry_retryable_platform_runs(self, run_id: str) -> dict[str, Any]:
         now = utc_now()
@@ -1307,6 +1669,7 @@ class CommercialQueueRepository:
                     "not_found_count": int(run["account_not_found_count"]),
                     "failed_count": int(run["failed_platform_count"]),
                     "retry_pending_count": int(run["retryable_platform_count"]),
+                    "pending_platform_count": int(run.get("pending_platform_count") or active_pending_count),
                     "active_pending_count": active_pending_count,
                     "last_updated_at": run["updated_at"],
                 }

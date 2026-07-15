@@ -14,6 +14,7 @@ import {
   listLiveApprovals,
   listCampaignConfigurationRevisions,
   listCampaignRecipients,
+  listRecipientScenarios,
   listCampaigns,
   pauseCampaign,
   queueCampaign,
@@ -280,6 +281,7 @@ export default function CommercialCampaigns() {
   const [form, setForm] = useState({ name: "", platform: "bale", status: "draft", source_channel_uid: "", deliveries_per_round: "", daily_limit_per_account: "", delay_between_deliveries_seconds: "", round_cooldown_seconds: "", operation_order: "save_contact,forward_message", send_method: "forward_latest_channel_message" });
   const [detail, setDetail] = useState(null);
   const [recipients, setRecipients] = useState([]);
+  const [recipientScenarios, setRecipientScenarios] = useState([]);
   const [events, setEvents] = useState([]);
   const [detailValidation, setDetailValidation] = useState(null);
   const [importCampaign, setImportCampaign] = useState(null);
@@ -352,6 +354,7 @@ export default function CommercialCampaigns() {
   async function openDetail(campaign) {
     setDetail(campaign);
     setRecipients([]);
+    setRecipientScenarios([]);
     setEvents([]);
     setDetailValidation(null);
     setEffectivePolicy(null);
@@ -362,8 +365,9 @@ export default function CommercialCampaigns() {
     setConfigurationDraftText("");
     setConfigurationResult(null);
     try {
-      const [recipientData, eventData, validationData, policyData, approvalData, configData, revisionData] = await Promise.all([
+      const [recipientData, scenarioData, eventData, validationData, policyData, approvalData, configData, revisionData] = await Promise.all([
         listCampaignRecipients(campaign.id, { limit: 50 }),
+        listRecipientScenarios(campaign.id, { limit: 100 }),
         listEvents({ campaign_id: campaign.id, limit: 20 }),
         validateCampaignStart(campaign.id).catch((err) => err?.data?.detail?.validation || null),
         getEffectivePolicy({ campaign_id: campaign.id }),
@@ -374,6 +378,7 @@ export default function CommercialCampaigns() {
       const refreshed = rows.find((item) => item.id === campaign.id) || campaign;
       setDetail(refreshed);
       setRecipients(recipientData.items || []);
+      setRecipientScenarios(scenarioData.items || []);
       setEvents(eventData.items || []);
       setDetailValidation(validationData);
       setEffectivePolicy(policyData);
@@ -675,11 +680,11 @@ export default function CommercialCampaigns() {
           ) : null}
           {livePreflight ? (
             <KeyValueGrid data={{
-              "گیرنده": livePreflight.recipient_summary?.stable_display_name || "Bale-000008",
-              "شماره": livePreflight.recipient_summary?.phone_masked,
-              "Source UID": livePreflight.source_summary?.source_uid,
-              "Source URL": livePreflight.source_summary?.source_url,
-              "Account": livePreflight.account_summary?.required_account_id,
+              recipient_count: livePreflight.recipient_summary?.recipient_count,
+              scenario_count: livePreflight.recipient_summary?.scenario_count,
+              platform_run_count: livePreflight.recipient_summary?.platform_run_count,
+              "Source": JSON.stringify(livePreflight.source_summary || {}),
+              "Accounts": JSON.stringify(livePreflight.account_summary || {}),
               "Manifest": livePreflight.manifest_summary?.manifest_confirmed ? "confirmed" : "missing",
               "Snapshot": livePreflight.snapshot_summary?.snapshot_id ? "present" : "missing",
               "Approval": livePreflight.approval_summary?.approval_status || "missing",
@@ -688,6 +693,12 @@ export default function CommercialCampaigns() {
               "Ready for live execution": livePreflight.execute_allowed ? "yes" : "no / pending explicit confirmation",
             }} />
           ) : null}
+          <h4 className="subheading">Unified recipient scenarios</h4>
+          <KeyValueGrid data={{
+            scenario_count: recipientScenarios.length,
+            platform_run_count: recipientScenarios.reduce((sum, item) => sum + (item.selected_platforms || []).length, 0),
+            execution_disabled: true,
+          }} />
           {liveReadiness ? (
             <KeyValueGrid data={{
               ready: liveReadiness.ready,

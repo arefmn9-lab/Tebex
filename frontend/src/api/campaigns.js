@@ -76,6 +76,24 @@ export function confirmCampaignRecipients(campaignId, payload) {
   });
 }
 
+export function materializeCampaign(campaignId, payload) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/materialize`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function configureCampaignPlatformSettings(campaignId, payload) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/platform-settings`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listRecipientScenarios(campaignId, params = {}) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/recipient-scenarios?${queryString(params)}`);
+}
+
 export function prepareCampaignContacts(campaignId) {
   return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/contacts/prepare`, { method: "POST" });
 }
