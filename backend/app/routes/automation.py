@@ -487,6 +487,30 @@ class CampaignLivePreflightRequest(BaseModel):
     approval_id: str | None = None
 
 
+class CampaignExecuteRequest(BaseModel):
+    approval_id: str
+    final_review_hash: str
+    execution_snapshot_id: str
+    idempotency_key: str
+    requested_by: str = "test"
+    mode: str = "disabled"
+    platforms: list[str] | None = None
+
+
+class CampaignScenarioRetryRequest(BaseModel):
+    approval_id: str
+    final_review_hash: str
+    execution_snapshot_id: str
+    idempotency_key: str
+    requested_by: str = "test"
+    mode: str = "disabled"
+    platforms: list[str] | None = None
+
+
+class ExecutionBatchCancelRequest(BaseModel):
+    reason: str = "cancelled_by_request"
+
+
 class RecipientImportRequest(BaseModel):
     phones: list[str]
     import_source: str = "manual"
@@ -1284,6 +1308,43 @@ def retry_recipient_scenario(campaign_recipient_run_id: str, response: Response)
         raise _campaign_lifecycle_error(exc) from exc
 
 
+@router.post("/campaigns/{campaign_id}/recipient-scenarios/{campaign_recipient_run_id}/retry")
+def retry_campaign_recipient_scenario_controlled(campaign_id: str, campaign_recipient_run_id: str, request: CampaignScenarioRetryRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.retry_controlled_recipient_scenario(
+            campaign_id=campaign_id,
+            campaign_recipient_run_id=campaign_recipient_run_id,
+            approval_id=request.approval_id,
+            final_review_hash=request.final_review_hash,
+            execution_snapshot_id=request.execution_snapshot_id,
+            idempotency_key=request.idempotency_key,
+            requested_by=request.requested_by,
+            mode=request.mode,
+            selected_platforms=request.platforms,
+        )
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/execution-batches/{batch_id}/cancel")
+def cancel_execution_batch_controlled(batch_id: str, request: ExecutionBatchCancelRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.cancel_execution_batch(batch_id, request.reason)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.get("/execution-batches/{batch_id}")
+def get_execution_batch_report(batch_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.get_execution_batch_report(batch_id)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
 @router.patch("/platform-runs/{platform_run_id}/outcome")
 def update_platform_run_outcome(platform_run_id: str, request: PlatformRunOutcomeRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
@@ -1340,6 +1401,24 @@ def campaign_live_preflight(campaign_id: str, request: CampaignLivePreflightRequ
     _set_dashboard_cors_headers(response)
     try:
         return commercial_queue_service.live_preflight(campaign_id, approval_id=request.approval_id)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.post("/campaigns/{campaign_id}/execute")
+def execute_campaign_controlled(campaign_id: str, request: CampaignExecuteRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.request_controlled_execution(
+            campaign_id=campaign_id,
+            approval_id=request.approval_id,
+            final_review_hash=request.final_review_hash,
+            execution_snapshot_id=request.execution_snapshot_id,
+            idempotency_key=request.idempotency_key,
+            requested_by=request.requested_by,
+            mode=request.mode,
+            selected_platforms=request.platforms,
+        )
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 

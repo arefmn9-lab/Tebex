@@ -2729,6 +2729,242 @@ class CommercialQueueService:
             "final_review_hash": review.get("final_review_hash"),
         }
 
+    def _controlled_execution_payload(
+        self,
+        campaign_id: str,
+        approval_id: str,
+        final_review_hash: str,
+        execution_snapshot_id: str,
+        idempotency_key: str,
+        requested_by: str,
+        mode: str,
+        selected_platforms: list[str] | None,
+        allow_retry_state: bool = False,
+    ) -> dict[str, Any]:
+        if mode != "mock_only":
+            raise CampaignLifecycleError("controlled_execution_disabled", "Controlled execution defaults to disabled and only mock_only is allowed in this phase", {"mode": mode})
+        if not idempotency_key:
+            raise CampaignLifecycleError("idempotency_key_required", "Execution request requires an explicit idempotency key", {"campaign_id": campaign_id})
+        campaign = self.repository.get_campaign(campaign_id)
+        if campaign is None:
+            raise KeyError(campaign_id)
+        review = self.final_review(campaign_id)
+        if review.get("final_review_hash") != final_review_hash:
+            raise CampaignLifecycleError("final_review_hash_mismatch", "Final review hash no longer matches current campaign state", {"expected": review.get("final_review_hash"), "provided": final_review_hash})
+        snapshot = review.get("execution_snapshot") or {}
+        if snapshot.get("snapshot_id") != execution_snapshot_id:
+            raise CampaignLifecycleError("execution_snapshot_mismatch", "Execution snapshot does not match the approved final review", {"expected": snapshot.get("snapshot_id"), "provided": execution_snapshot_id})
+        approval = self.get_live_execution_approval(approval_id)
+        if approval is None:
+            raise CampaignLifecycleError("explicit_live_confirmation_required", "Approved execution request requires an approval", {"approval_id": approval_id})
+        if approval.get("campaign_id") != campaign_id:
+            raise CampaignLifecycleError("approval_campaign_mismatch", "Approval does not belong to the requested campaign", {"approval_id": approval_id})
+        if approval.get("approval_status") != "approved":
+            raise CampaignLifecycleError("approval_not_approved", "Approval is not active", {"status": approval.get("approval_status")})
+        if approval.get("final_review_hash") != final_review_hash:
+            raise CampaignLifecycleError("final_review_hash_mismatch", "Approval final review hash does not match execution request", {"approval_id": approval_id})
+        if approval.get("execution_snapshot_id") != execution_snapshot_id:
+            raise CampaignLifecycleError("execution_snapshot_mismatch", "Approval snapshot does not match execution request", {"approval_id": approval_id})
+        preflight = self.live_preflight(campaign_id, approval_id=approval_id)
+        blocking_errors = list(preflight.get("blocking_errors") or [])
+        if allow_retry_state:
+            blocking_errors = [error for error in blocking_errors if error.get("error_code") not in {"retry_state_present", "duplicate_execution_scope"}]
+        if blocking_errors:
+            raise CampaignLifecycleError("preflight_not_ready", "Execution request requires a clean current preflight", {"blocking_errors": preflight.get("blocking_errors")})
+        approved_platforms = list((review.get("recipient_scenario_summary") or {}).get("selected_platforms") or [])
+        requested_platforms = self._normalize_selected_platforms(selected_platforms or approved_platforms, campaign)
+        if any(platform not in approved_platforms for platform in requested_platforms):
+            raise CampaignLifecycleError("platform_scope_not_approved", "Requested platform subset is outside the approved scope", {"requested": requested_platforms, "approved": approved_platforms})
+        platform_sources = review.get("platform_sources") or {}
+        sender_accounts = review.get("sender_accounts") or {}
+        for platform in requested_platforms:
+            source = platform_sources.get(platform) or {}
+            if not source.get("source_uid") or not source.get("source_url"):
+                raise CampaignLifecycleError("source_snapshot_missing", "Platform source settings must be explicit before execution", {"platform": platform})
+            account_ids = list((sender_accounts.get(platform) or {}).get("sender_account_ids") or [])
+            if not account_ids:
+                raise CampaignLifecycleError("sender_account_unavailable", "A healthy sender account is required for controlled execution", {"platform": platform})
+            for account_id in account_ids:
+                settings = self.get_account_settings(str(account_id))
+                health = self.get_account_health(str(account_id))
+                if not bool(settings.get("enabled")) or str(health.get("health_status") or "") in BLOCKING_STATES or bool(health.get("manual_review_required")):
+                    raise CampaignLifecycleError("sender_account_unavailable", "A healthy sender account is required for controlled execution", {"platform": platform, "account_id": account_id})
+        revision = review.get("configuration_revision") or {}
+        return {
+            "campaign_id": campaign_id,
+            "approval_id": approval_id,
+            "final_review_hash": final_review_hash,
+            "execution_snapshot_id": execution_snapshot_id,
+            "configuration_snapshot_hash": snapshot.get("configuration_hash"),
+            "configuration_revision_id": revision.get("revision_id"),
+            "recipient_manifest_id": approval.get("recipient_manifest_id"),
+            "recipient_manifest_hash": approval.get("recipient_manifest_hash"),
+            "idempotency_key": idempotency_key,
+            "requested_by": requested_by,
+            "mode": mode,
+            "selected_platforms": requested_platforms,
+            "source_by_platform": platform_sources,
+            "sender_accounts_by_platform": {platform: (sender_accounts.get(platform) or {}).get("sender_account_ids") or [] for platform in requested_platforms},
+            "max_attempts": 3,
+            "metadata": {"preflight_ready": True, "controlled_live_enabled": False},
+        }
+
+    def request_controlled_execution(
+        self,
+        campaign_id: str,
+        approval_id: str,
+        final_review_hash: str,
+        execution_snapshot_id: str,
+        idempotency_key: str,
+        requested_by: str = "test",
+        mode: str = "disabled",
+        selected_platforms: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._controlled_execution_payload(
+            campaign_id,
+            approval_id,
+            final_review_hash,
+            execution_snapshot_id,
+            idempotency_key,
+            requested_by,
+            mode,
+            selected_platforms,
+            False,
+        )
+        payload["eligible_outcomes"] = ["pending"]
+        result = self.repository.create_controlled_execution_batch_and_jobs(payload)
+        return {
+            "campaign_id": campaign_id,
+            "execution_mode": mode,
+            "execution_started": False,
+            "adapter_called": False,
+            "batch": result["batch"],
+            "jobs": result["jobs"],
+            "idempotent": bool(result.get("idempotent")),
+            "created_job_count": int(result.get("created_job_count") or 0),
+        }
+
+    def retry_controlled_recipient_scenario(
+        self,
+        campaign_id: str,
+        campaign_recipient_run_id: str,
+        approval_id: str,
+        final_review_hash: str,
+        execution_snapshot_id: str,
+        idempotency_key: str,
+        requested_by: str = "test",
+        mode: str = "disabled",
+        selected_platforms: list[str] | None = None,
+    ) -> dict[str, Any]:
+        scenario = self.repository.get_campaign_recipient_run(campaign_recipient_run_id)
+        if scenario is None or str(scenario.get("campaign_id")) != campaign_id:
+            raise KeyError(campaign_recipient_run_id)
+        payload = self._controlled_execution_payload(
+            campaign_id,
+            approval_id,
+            final_review_hash,
+            execution_snapshot_id,
+            idempotency_key,
+            requested_by,
+            mode,
+            selected_platforms,
+            True,
+        )
+        retryable_platforms = [str(row["platform"]) for row in scenario.get("platform_runs") or [] if row.get("outcome") == "failed_retryable"]
+        if not retryable_platforms:
+            raise CampaignLifecycleError("retryable_platform_run_required", "Retry requires at least one failed_retryable platform run", {"campaign_recipient_run_id": campaign_recipient_run_id})
+        payload["selected_platforms"] = [platform for platform in payload["selected_platforms"] if platform in retryable_platforms]
+        payload["eligible_outcomes"] = ["failed_retryable"]
+        payload["campaign_recipient_run_id"] = campaign_recipient_run_id
+        result = self.repository.create_controlled_execution_batch_and_jobs(payload)
+        return {
+            "campaign_id": campaign_id,
+            "campaign_recipient_run_id": campaign_recipient_run_id,
+            "execution_mode": mode,
+            "batch": result["batch"],
+            "jobs": result["jobs"],
+            "idempotent": bool(result.get("idempotent")),
+            "created_job_count": int(result.get("created_job_count") or 0),
+        }
+
+    def get_execution_batch_report(self, batch_id: str) -> dict[str, Any]:
+        batch = self.repository.get_execution_batch(batch_id)
+        if batch is None:
+            raise KeyError(batch_id)
+        jobs = self.repository.list_execution_batch_jobs(batch_id)
+        scenarios = self.repository.list_campaign_recipient_report_rows(str(batch["campaign_id"]), 100000, 0)
+        return {"batch": batch, "jobs": jobs, "scenarios": scenarios}
+
+    def cancel_execution_batch(self, batch_id: str, reason: str = "cancelled_by_request") -> dict[str, Any]:
+        return self.repository.cancel_execution_batch(batch_id, reason)
+
+    def apply_trusted_adapter_result(self, job_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        job = self.repository.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if not job.get("execution_batch_id") or job.get("adapter_mode") != "mock_only":
+            raise CampaignLifecycleError("trusted_worker_result_required", "Only controlled mock worker jobs may apply trusted results in this phase", {"job_id": job_id})
+        normalized = dict(result)
+        if normalized.get("error_category") == "sender_auth" and normalized.get("outcome") == "account_not_found":
+            normalized["outcome"] = "failed_retryable" if normalized.get("retryable", True) else "failed_terminal"
+            normalized["error_code"] = normalized.get("error_code") or "sender_auth_failed"
+        applied = self.repository.apply_trusted_worker_result(job_id, normalized)
+        if applied.get("applied") and applied.get("outcome") == "sent":
+            account_id = str((applied.get("job") or {}).get("account_id") or "")
+            if account_id:
+                self.repository.increment_account_sent_counts(account_id)
+                self.account_health.record_success(account_id)
+        if applied.get("applied") and normalized.get("error_category") == "sender_auth":
+            account_id = str((applied.get("job") or {}).get("account_id") or "")
+            if account_id:
+                self.account_health.record_failure(account_id, {"error_code": normalized.get("error_code") or "sender_auth_failed", "manual_review_required": bool(normalized.get("manual_review_required"))})
+        job_after = applied.get("job") or {}
+        if job_after:
+            self.repository.create_job_event({
+                "job_id": job_id,
+                "campaign_id": job_after.get("campaign_id"),
+                "account_id": job_after.get("account_id"),
+                "recipient_id": job_after.get("recipient_id"),
+                "event_type": "adapter_result_received" if applied.get("applied") else "adapter_result_rejected",
+                "component": "controlled_worker",
+                "step_name": "apply_trusted_adapter_result",
+                "status": job_after.get("status") or "failed",
+                "message": "Trusted mock adapter result processed",
+                "error_code": normalized.get("error_code") or applied.get("reason"),
+                "error_message": normalized.get("error_message"),
+                "platform": job_after.get("platform"),
+                "retryable": normalized.get("retryable"),
+                "diagnostics": {
+                    "execution_batch_id": job_after.get("execution_batch_id"),
+                    "platform_run_id": job_after.get("platform_run_id"),
+                    "attempt_number": job_after.get("execution_attempt_number"),
+                    "outcome": normalized.get("outcome"),
+                    "applied": applied.get("applied"),
+                    "reason": applied.get("reason"),
+                },
+            })
+        return applied
+
+    def run_controlled_mock_worker(
+        self,
+        account_id: str,
+        campaign_id: str,
+        results_by_job_id: dict[str, dict[str, Any]],
+        max_jobs: int | None = None,
+    ) -> dict[str, Any]:
+        assignment = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
+        processed: list[dict[str, Any]] = []
+        for job_id in assignment.get("assigned_job_ids") or []:
+            running = self.repository.mark_job_running(str(job_id))
+            if running is None:
+                continue
+            plan_json = running.get("execution_plan_json")
+            result = dict(results_by_job_id.get(str(job_id)) or {"outcome": "sent", "success": True})
+            result.setdefault("trusted_result_key", f"mock:{job_id}:{result.get('outcome', 'sent')}")
+            applied = self.apply_trusted_adapter_result(str(job_id), result)
+            processed.append({"job_id": job_id, "execution_plan": json.loads(plan_json or "{}"), "result": applied})
+        return {"account_id": account_id, "assignment": assignment, "processed_count": len(processed), "results": processed, "real_adapter_called": False}
+
     def issue_execution_authorization_for_approved_preflight(self, campaign_id: str, approval_id: str, expires_in_minutes: int = 15) -> dict[str, Any]:
         preflight = self.live_preflight(campaign_id, approval_id=approval_id)
         approval = preflight.get("approval_summary") or {}

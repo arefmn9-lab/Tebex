@@ -289,12 +289,81 @@ CREATE TABLE IF NOT EXISTS commercial_delivery_jobs (
     live_authorization_missing INTEGER,
     historical_normal_mode_attempt INTEGER,
     historical_normal_mode_confirmed INTEGER,
+    execution_batch_id TEXT,
+    execution_plan_json TEXT,
+    adapter_mode TEXT,
+    execution_attempt_number INTEGER,
+    previous_job_id TEXT,
+    trusted_result_key TEXT,
+    result_applied_at TEXT,
+    cancellation_requested_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id),
     FOREIGN KEY(recipient_id) REFERENCES commercial_recipients(id),
     FOREIGN KEY(campaign_recipient_run_id) REFERENCES commercial_campaign_recipient_runs(id),
     FOREIGN KEY(platform_run_id) REFERENCES commercial_platform_runs(id)
+)
+"""
+
+CREATE_EXECUTION_BATCHES_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_execution_batches (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    approval_id TEXT NOT NULL,
+    final_review_hash TEXT NOT NULL,
+    execution_snapshot_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    requested_by TEXT,
+    mode TEXT NOT NULL CHECK(mode IN ('disabled','mock_only','controlled_live')),
+    status TEXT NOT NULL CHECK(status IN ('creating','queued','in_progress','completed','partially_completed','failed','cancelled')),
+    selected_platforms_json TEXT NOT NULL,
+    eligible_platform_run_count INTEGER NOT NULL,
+    created_job_count INTEGER NOT NULL,
+    skipped_platform_run_count INTEGER NOT NULL,
+    completed_job_count INTEGER NOT NULL DEFAULT 0,
+    succeeded_job_count INTEGER NOT NULL DEFAULT 0,
+    failed_job_count INTEGER NOT NULL DEFAULT 0,
+    cancelled_job_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    cancellation_reason TEXT,
+    metadata_json TEXT,
+    UNIQUE(campaign_id, idempotency_key),
+    FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id),
+    FOREIGN KEY(approval_id) REFERENCES commercial_live_execution_approvals(approval_id),
+    FOREIGN KEY(execution_snapshot_id) REFERENCES commercial_execution_configuration_snapshots(snapshot_id)
+)
+"""
+
+CREATE_EXECUTION_ATTEMPTS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_execution_attempts (
+    id TEXT PRIMARY KEY,
+    execution_batch_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    platform_run_id TEXT NOT NULL,
+    campaign_recipient_run_id TEXT NOT NULL,
+    campaign_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    previous_job_id TEXT,
+    status TEXT NOT NULL,
+    trusted_result_key TEXT,
+    outcome TEXT,
+    error_code TEXT,
+    error_category TEXT,
+    retryable INTEGER,
+    started_at TEXT,
+    finished_at TEXT,
+    diagnostics_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_id, attempt_number),
+    FOREIGN KEY(execution_batch_id) REFERENCES commercial_execution_batches(id),
+    FOREIGN KEY(job_id) REFERENCES commercial_delivery_jobs(id),
+    FOREIGN KEY(platform_run_id) REFERENCES commercial_platform_runs(id),
+    FOREIGN KEY(campaign_recipient_run_id) REFERENCES commercial_campaign_recipient_runs(id)
 )
 """
 
@@ -652,6 +721,10 @@ COMMERCIAL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_commercial_config_revisions_campaign_status ON commercial_campaign_configuration_revisions(campaign_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_config_snapshots_campaign ON commercial_execution_configuration_snapshots(campaign_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_execution_auth_campaign ON commercial_execution_authorizations(campaign_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_execution_batches_campaign ON commercial_execution_batches(campaign_id, status)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_execution_batches_idempotency ON commercial_execution_batches(campaign_id, idempotency_key)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_execution_attempts_batch ON commercial_execution_attempts(execution_batch_id, status)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_active_platform_job ON commercial_delivery_jobs(platform_run_id) WHERE platform_run_id IS NOT NULL AND status IN ('queued','assigned','running')",
 ]
 
 SCHEMA_ALTERATIONS = {
@@ -709,6 +782,14 @@ SCHEMA_ALTERATIONS = {
         "input_provenance_status": "TEXT",
         "live_execution_blocked": "INTEGER",
         "block_reason": "TEXT",
+        "execution_batch_id": "TEXT",
+        "execution_plan_json": "TEXT",
+        "adapter_mode": "TEXT",
+        "execution_attempt_number": "INTEGER",
+        "previous_job_id": "TEXT",
+        "trusted_result_key": "TEXT",
+        "result_applied_at": "TEXT",
+        "cancellation_requested_at": "TEXT",
     },
     "commercial_campaign_recipient_runs": {
         "pending_platform_count": "INTEGER NOT NULL DEFAULT 0",
@@ -809,6 +890,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_CAMPAIGN_CONFIGURATION_REVISIONS_TABLE)
     connection.execute(CREATE_EXECUTION_CONFIGURATION_SNAPSHOTS_TABLE)
     connection.execute(CREATE_EXECUTION_AUTHORIZATIONS_TABLE)
+    connection.execute(CREATE_EXECUTION_BATCHES_TABLE)
+    connection.execute(CREATE_EXECUTION_ATTEMPTS_TABLE)
     for table_name, columns in SCHEMA_ALTERATIONS.items():
         existing = {
             str(row[1])
