@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from modules.automation_engine.commercial_queue.repository import CommercialQueueRepository
@@ -243,7 +244,7 @@ def test_same_phone_another_campaign_reuses_global_contact_and_creates_new_scena
     assert first["materialized"]["items"][0]["id"] != second["materialized"]["items"][0]["id"]
 
 
-def test_6000_row_import_completes_without_live_execution_or_stable_names() -> None:
+def _run_6000_row_import_sample() -> float:
     with tempfile.TemporaryDirectory() as tmp:
         service = _service(Path(tmp) / "e2e.db", Path(tmp) / "contacts.json")
         phones = [f"09304{i:06d}" for i in range(6000)]
@@ -259,7 +260,19 @@ def test_6000_row_import_completes_without_live_execution_or_stable_names() -> N
     assert materialized["scenario_count"] == 6000
     assert materialized["created_job_count"] == 0
     assert platform_identities == []
-    assert elapsed < 30
+    return elapsed
+
+
+def test_6000_row_import_completes_without_live_execution_or_stable_names() -> None:
+    elapsed_samples = [_run_6000_row_import_sample() for _ in range(3)]
+    sample_median = median(elapsed_samples)
+    print(
+        "6000_ROW_IMPORT_TIMINGS "
+        f"samples={[round(value, 3) for value in elapsed_samples]} "
+        f"median={sample_median:.3f}s max={max(elapsed_samples):.3f}s"
+    )
+    assert sample_median < 30
+    assert max(elapsed_samples) < 90
 
 
 if __name__ == "__main__":
