@@ -3440,6 +3440,9 @@ class BalePlugin:
             return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
           };
           const attempted = [
+            '[data-testid="message-side-option-forward"]',
+            '[data-testid*="message-side-option-forward"]',
+            '[data-testid*="forward"]',
             '[aria-label="بیشتر"]',
             '[aria-label*="بیشتر"]',
             '[aria-label*="More"]',
@@ -3484,7 +3487,8 @@ class BalePlugin:
                 };
                 debug.push(item);
                 if (!selected && looksLikeMenu && box) {
-                  const clickTarget = node.closest('button, [role="button"], [aria-label], [title]') || node;
+                  const isDirectForwardControl = /(^|\\b)message-side-option-forward(\\b|$)/i.test(testid);
+                  const clickTarget = isDirectForwardControl ? node : (node.closest('button, [role="button"], [aria-label], [title]') || node);
                   clickTarget.setAttribute("data-clinicos-message-menu-candidate", "0");
                   selected = clickTarget;
                 }

@@ -4051,6 +4051,37 @@ def test_open_message_forward_supports_hover_only_controls() -> None:
     assert result["message_menu_opened"] is True
 
 
+def test_message_forward_candidate_clicks_direct_hover_forward_control_not_message_item() -> None:
+    class DirectForwardCandidatePage:
+        def __init__(self) -> None:
+            self.script = ""
+            self.latest_selector = ""
+
+        def evaluate(self, script: str, latest_selector: str) -> dict[str, object]:
+            self.script = script
+            self.latest_selector = latest_selector
+            return {
+                "marker": "clinicos_bale_message_menu_candidates",
+                "message_menu_selector": '[data-clinicos-message-menu-candidate="0"]',
+                "attempted_selectors": ['[data-testid="message-side-option-forward"]'],
+                "candidate_debug": [
+                    {
+                        "selector": '[data-testid="message-side-option-forward"]',
+                        "data_testid": "message-side-option-forward",
+                        "status": "candidate",
+                    }
+                ],
+            }
+
+    page = DirectForwardCandidatePage()
+    result = BalePlugin(browser_manager=MockBrowserManager(MockPage(set())))._message_forward_menu_candidates(page, OpenMessageForwardPage.latest_forward_selector)
+
+    assert result["message_menu_selector"] == '[data-clinicos-message-menu-candidate="0"]'
+    assert page.latest_selector == OpenMessageForwardPage.latest_forward_selector
+    assert 'data-testid="message-side-option-forward"' in page.script
+    assert "isDirectForwardControl ? node" in page.script
+
+
 def test_open_message_forward_menu_open_success_and_forward_detected() -> None:
     page = OpenMessageForwardPage()
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
@@ -6645,6 +6676,7 @@ if __name__ == "__main__":
     test_open_message_forward_latest_message_is_required()
     test_open_message_forward_menu_discovery_runs_inside_latest_message()
     test_open_message_forward_supports_hover_only_controls()
+    test_message_forward_candidate_clicks_direct_hover_forward_control_not_message_item()
     test_open_message_forward_menu_open_success_and_forward_detected()
     test_open_message_forward_recipient_picker_visibility_required()
     test_open_message_forward_does_not_select_recipient_or_confirm()

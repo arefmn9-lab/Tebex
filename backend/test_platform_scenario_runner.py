@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,24 +50,87 @@ class RecordingActions(ScenarioActionExecutor):
 
 class FakeBalePlugin:
     def __init__(self) -> None:
-        self.open_calls: list[dict[str, object]] = []
-        self.forward_calls: list[dict[str, object]] = []
+        self.navigate_calls: list[dict[str, object]] = []
+        self.clicked: list[str] = []
+        self.filled: list[tuple[str, str]] = []
         self.forward_latest_called = 0
+        self.forward_message_called = 0
+        self.page = SimpleNamespace(url="")
+        self.page.wait_for_timeout = lambda timeout: None
+        self.page.locator = lambda selector: SimpleNamespace(
+            first=SimpleNamespace(
+                scroll_into_view_if_needed=lambda timeout=None: None,
+                hover=lambda timeout=None: None,
+            )
+        )
+        self.picker_visible = False
+        self.selected_names: list[str] = []
+        self.search_value = ""
 
-    def open_bale_source_channel(self, **kwargs: object) -> dict[str, object]:
-        self.open_calls.append(kwargs)
-        return {"success": True, "message_stream_visible": True, "source_resolved": True}
+    @contextmanager
+    def _runtime_or_page_session(self, account_id: str, provider_mode: str = "native_chrome", runtime_session: object | None = None):
+        yield self.page, {"account_id": account_id, "provider_mode": provider_mode}
+
+    def _goto_with_timeout(self, page: object, url: str, timeout_ms: int = 30000, wait_until: str = "load") -> None:
+        self.navigate_calls.append({"url": url, "timeout_ms": timeout_ms, "wait_until": wait_until})
+        page.url = url
+
+    def _source_channel_readiness(self, page: object) -> dict[str, object]:
+        return {"ready": True, "message_stream_visible": True, "target_channel_header_text": "source"}
+
+    def _resolve_latest_forward_message_target(self, page: object) -> dict[str, object]:
+        return {"message_found": True, "latest_message_selector": "[data-latest-message]", "latest_message_text_preview": "latest", "latest_message_signature": "sig"}
+
+    def _message_forward_menu_candidates(self, page: object, latest_message_selector: str) -> dict[str, object]:
+        return {
+            "message_menu_selector": "[data-clinicos-message-menu-candidate=\"0\"]",
+            "candidate_debug": [{"data_testid": "message-side-option-forward", "status": "candidate"}],
+        }
+
+    def _click_selector_short(self, page: object, selector: str, timeout_ms: int = 1000) -> dict[str, object]:
+        self.clicked.append(selector)
+        if selector == "[data-clinicos-message-menu-candidate=\"0\"]":
+            self.picker_visible = True
+        if selector == "[data-recipient]":
+            self.selected_names = [self.search_value]
+        if selector == "[data-confirm]":
+            self.clicked.append("final-confirm")
+        return {"status": "success", "selector": selector}
+
+    def _forward_picker_state(self, page: object) -> dict[str, object]:
+        return {"forward_picker_visible": self.picker_visible, "forward_picker_selector": "[role=\"dialog\"]" if self.picker_visible else ""}
+
+    def _forward_option_candidates(self, page: object) -> dict[str, object]:
+        return {"forward_option_selector": "", "candidate_debug": []}
+
+    def _forward_recipient_search_state(self, page: object) -> dict[str, object]:
+        return {"recipient_search_selector": "[data-search]"}
+
+    def _fill_or_type(self, page: object, selector: str, value: str) -> None:
+        self.search_value = value
+        self.filled.append((selector, value))
+
+    def _forward_search_input_value(self, page: object, selector: str) -> str:
+        return self.search_value
+
+    def _forward_recipient_results_stability(self, page: object, exact_text: str) -> dict[str, object]:
+        return {
+            "result_set_stable": True,
+            "recipient_candidates": [{"exact_match": True, "click_selector": "[data-recipient]", "row_name": exact_text}],
+        }
+
+    def _forward_recipient_click_diagnostic(self, page: object, recipient_selector: str, exact_text: str) -> dict[str, object]:
+        return {"click_safe": True}
+
+    def _forward_selected_recipients_state(self, page: object) -> dict[str, object]:
+        return {"selected_count": len(self.selected_names), "selected_names": list(self.selected_names)}
+
+    def _forward_confirm_button_state(self, page: object) -> dict[str, object]:
+        return {"confirm_button_selector": "[data-confirm]"}
 
     def forward_message_to_contact(self, **kwargs: object) -> dict[str, object]:
-        self.forward_calls.append(kwargs)
-        selection_only = bool(kwargs.get("selection_only"))
-        return {
-            "success": True,
-            "confirm_button_selector": "[data-confirm]",
-            "final_send_control_visible": True,
-            "recipient_resolved": True,
-            "confirm_click_count": 0 if selection_only else 1,
-        }
+        self.forward_message_called += 1
+        raise AssertionError("standalone controlled path must not call legacy forward_message_to_contact")
 
     def forward_latest_channel_message(self, **kwargs: object) -> dict[str, object]:
         self.forward_latest_called += 1
@@ -210,8 +274,26 @@ def test_bale_adapter_uses_standalone_scenario_for_immutable_plan_and_not_legacy
     assert result["stopped_before_send"] is True
     assert result["confirm_click_count"] == 0
     assert plugin.forward_latest_called == 0
-    assert plugin.open_calls[0]["source_channel_uid"] == "source-b"
-    assert plugin.forward_calls[0]["display_name"] == "Bale-000001"
+    assert plugin.forward_message_called == 0
+    assert plugin.navigate_calls[0]["url"] == "https://web.bale.ai/chat?uid=source-b"
+    assert plugin.clicked == ['[data-clinicos-message-menu-candidate="0"]', "[data-recipient]"]
+    assert plugin.filled == [("[data-search]", "Bale-000001")]
+
+
+def test_missing_hover_forward_control_fails_at_open_forward_picker() -> None:
+    class MissingForwardControlPlugin(FakeBalePlugin):
+        def _message_forward_menu_candidates(self, page: object, latest_message_selector: str) -> dict[str, object]:
+            return {"message_menu_selector": "", "candidate_debug": [{"status": "observed"}]}
+
+    plugin = MissingForwardControlPlugin()
+    result = BaleDeliveryAdapter(plugin=plugin).controlled_live_no_send(_plan())
+
+    assert result["success"] is False
+    assert result["failed_step"] == "open_forward_picker"
+    assert result["error_code"] == "message_menu_not_found"
+    assert plugin.forward_latest_called == 0
+    assert plugin.forward_message_called == 0
+    assert "[data-confirm]" not in plugin.clicked
 
 
 def test_live_send_requires_explicit_authorization_before_mocked_confirmation() -> None:
@@ -225,8 +307,8 @@ def test_live_send_requires_explicit_authorization_before_mocked_confirmation() 
     assert blocked["confirm_click_count"] == 0
     assert allowed["success"] is True
     assert allowed["confirm_click_count"] == 1
-    assert len(allowed_plugin.forward_calls) == 2
-    assert allowed_plugin.forward_calls[-1]["selection_only"] is False
+    assert allowed_plugin.forward_message_called == 0
+    assert "[data-confirm]" in allowed_plugin.clicked
 
 
 if __name__ == "__main__":
@@ -236,5 +318,6 @@ if __name__ == "__main__":
     test_missing_source_recipient_and_readiness_fail_with_exact_step()
     test_commercial_layers_do_not_contain_bale_ui_selectors()
     test_bale_adapter_uses_standalone_scenario_for_immutable_plan_and_not_legacy_forward_latest()
+    test_missing_hover_forward_control_fails_at_open_forward_picker()
     test_live_send_requires_explicit_authorization_before_mocked_confirmation()
     print("Platform scenario runner tests passed")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,11 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
         self.source_verified = False
         self.forward_picker_open = False
         self.forward_boundary_result: dict[str, Any] | None = None
+        self._stack = ExitStack()
+        self.page: Any | None = None
+        self.latest_message_selector = ""
+        self.search_selector = ""
+        self.exact_recipient: dict[str, Any] | None = None
 
     def element_exists(self, name: str, element: dict[str, Any] | None = None) -> bool:
         if name == "source_timeline":
@@ -30,8 +36,23 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
         return False
 
     def navigate(self, url: str, timeout_ms: int | None = None) -> dict[str, Any]:
+        try:
+            self._ensure_page()
+            self.plugin._goto_with_timeout(self.page, url, timeout_ms=timeout_ms or 30000, wait_until="load")
+        except Exception as exc:
+            return {"ok": False, "error_code": "navigation_failed", "message": str(exc)}
         self.records["source_url"] = url
         return {"ok": True, "url": url, "timeout_ms": timeout_ms}
+
+    def close(self) -> None:
+        self._stack.close()
+
+    def _ensure_page(self) -> Any:
+        if self.page is None:
+            context = self.plugin._runtime_or_page_session(self.plan.account_id, provider_mode="native_chrome", runtime_session=self.runtime_session)
+            self.page, session_meta = self._stack.enter_context(context)
+            self.records["browser_session"] = session_meta
+        return self.page
 
     def call_platform_primitive(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         if name == "validate_operation_mode":
@@ -40,61 +61,167 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
                 return {"ok": False, "error_code": "unsupported_operation_mode", "message": "Unsupported Bale scenario operation_mode"}
             return {"ok": True}
         if name == "verify_source_chat":
-            result = self.plugin.open_bale_source_channel(
-                account_id=self.plan.account_id,
-                source_channel_uid=str(params.get("source_uid") or self.plan.source_channel_uid),
-                provider_mode="native_chrome",
-            )
-            self.source_verified = bool(result.get("success"))
+            source_uid = str(params.get("source_uid") or self.plan.source_channel_uid)
+            page = self._ensure_page()
+            current_url = ""
+            try:
+                current_url = str(page.url)
+            except Exception:
+                current_url = ""
+            readiness: dict[str, Any] = {}
+            for _ in range(10):
+                readiness = self.plugin._source_channel_readiness(page)
+                if readiness.get("ready"):
+                    break
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+            self.source_verified = bool(readiness.get("ready")) and f"uid={source_uid}" in current_url
             self.records.update({
                 "source_resolved": self.source_verified,
-                "source_timeline_detected": bool(result.get("message_stream_visible")),
-                "source_diagnostics": result,
+                "source_timeline_detected": bool(readiness.get("message_stream_visible")),
+                "source_header_text": str(readiness.get("target_channel_header_text") or ""),
+                "source_diagnostics": {"current_url": current_url, **readiness},
             })
-            return {"ok": self.source_verified, "error_code": result.get("error_code"), "message": result.get("error_message"), **result}
+            return {"ok": self.source_verified, "error_code": None if self.source_verified else "source_channel_not_ready", **readiness}
         if name == "select_source_message":
+            page = self._ensure_page()
+            latest = self.plugin._resolve_latest_forward_message_target(page)
+            self.latest_message_selector = str(latest.get("latest_message_selector") or "")
+            if not latest.get("message_found") or not self.latest_message_selector:
+                return {"ok": False, "error_code": "latest_message_not_found", **latest}
+            try:
+                locator = page.locator(self.latest_message_selector).first
+                locator.scroll_into_view_if_needed(timeout=1000)
+                locator.hover(timeout=1000)
+            except Exception as exc:
+                return {"ok": False, "error_code": "latest_message_hover_failed", "message": str(exc), **latest}
+            self.records.update({
+                "source_message_selected": True,
+                "selected_message_preview": str(latest.get("latest_message_text_preview") or ""),
+                "selected_message_signature": str(latest.get("latest_message_signature") or ""),
+            })
             return {"ok": True}
         if name == "open_forward_picker":
-            self.forward_picker_open = True
-            return {"ok": True}
+            page = self._ensure_page()
+            menu_state = self.plugin._message_forward_menu_candidates(page, self.latest_message_selector)
+            menu_selector = str(menu_state.get("message_menu_selector") or "")
+            if not menu_selector:
+                return {"ok": False, "error_code": "message_menu_not_found", **menu_state}
+            menu_click = self.plugin._click_selector_short(page, menu_selector, timeout_ms=1000)
+            if menu_click.get("status") != "success":
+                return {"ok": False, "error_code": "message_menu_open_failed", "click_result": menu_click}
+            try:
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+            picker_state = self.plugin._forward_picker_state(page)
+            if not picker_state.get("forward_picker_visible"):
+                forward_state = self.plugin._forward_option_candidates(page)
+                forward_selector = str(forward_state.get("forward_option_selector") or "")
+                if not forward_selector:
+                    return {"ok": False, "error_code": "forward_option_not_found", **forward_state}
+                forward_click = self.plugin._click_selector_short(page, forward_selector, timeout_ms=1000)
+                if forward_click.get("status") != "success":
+                    return {"ok": False, "error_code": "forward_option_click_failed", "click_result": forward_click}
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                picker_state = self.plugin._forward_picker_state(page)
+            self.forward_picker_open = bool(picker_state.get("forward_picker_visible"))
+            self.records["recipient_picker_visible"] = self.forward_picker_open
+            return {"ok": self.forward_picker_open, "error_code": None if self.forward_picker_open else "recipient_picker_not_found", **picker_state}
         return {"ok": False, "error_code": "platform_primitive_not_implemented", "primitive": name}
 
     def fill(self, element_name: str, element: dict[str, Any], value: str, timeout_ms: int | None = None) -> dict[str, Any]:
-        if element_name == "recipient_search" and self.forward_boundary_result is None:
-            result = self.plugin.forward_message_to_contact(
-                account_id=self.plan.account_id,
-                source_channel_uid=self.plan.source_channel_uid,
-                display_name=self.plan.display_name,
-                dry_run=False,
-                selection_only=True,
-                provider_mode="native_chrome",
-                runtime_session=self.runtime_session,
-                close_session_when_done=self.runtime_session is None,
-            )
-            self.forward_boundary_result = result
+        if element_name == "recipient_search":
+            page = self._ensure_page()
+            search_state = self.plugin._forward_recipient_search_state(page)
+            self.search_selector = str(search_state.get("recipient_search_selector") or "")
+            if not self.search_selector:
+                return {"ok": False, "error_code": "recipient_search_input_not_found", **search_state}
+            try:
+                self._type_recipient_search_value(page, self.search_selector, value)
+            except Exception as exc:
+                return {"ok": False, "error_code": "recipient_search_fill_failed", "message": str(exc), **search_state}
+            search_value = self.plugin._forward_search_input_value(page, self.search_selector)
             self.records.update({
-                "recipient_resolved": bool(result.get("success")),
-                "confirmation_visible": bool(result.get("confirm_button_selector")),
-                "stopped_before_send": True,
-                "forward_boundary_diagnostics": result,
+                "recipient_search_value": search_value,
             })
-            return {"ok": bool(result.get("success")), "error_code": result.get("error_code"), "message": result.get("error_message"), **result}
+            return {"ok": search_value == value, "error_code": None if search_value == value else "search_value_not_verified", "search_input_value": search_value, **search_state}
         return super().fill(element_name, element, value, timeout_ms)
+
+    def _type_recipient_search_value(self, page: Any, selector: str, value: str) -> None:
+        locator = page.locator(selector).first
+        keyboard = getattr(page, "keyboard", None)
+        if keyboard is None:
+            self.plugin._fill_or_type(page, selector, value)
+            return
+        try:
+            locator.click(timeout=1000)
+            keyboard.press("Control+A")
+            keyboard.press("Backspace")
+            locator.type(value, timeout=3000)
+            return
+        except Exception:
+            self.plugin._fill_or_type(page, selector, value)
+
+    def choose_from_list(self, element_name: str, element: dict[str, Any], exact_text: str, timeout_ms: int | None = None) -> dict[str, Any]:
+        if element_name == "recipient_result":
+            page = self._ensure_page()
+            stability = self.plugin._forward_recipient_results_stability(page, exact_text)
+            candidates = stability.get("recipient_candidates") if isinstance(stability.get("recipient_candidates"), list) else []
+            exact_matches = [item for item in candidates if isinstance(item, dict) and item.get("exact_match")]
+            if not stability.get("result_set_stable"):
+                return {"ok": False, "error_code": "recipient_results_not_stable", **stability}
+            if len(exact_matches) != 1:
+                return {"ok": False, "error_code": "recipient_not_found", **stability}
+            self.exact_recipient = exact_matches[0]
+            recipient_selector = str(self.exact_recipient.get("click_selector") or self.exact_recipient.get("selector") or "")
+            click_diagnostic = self.plugin._forward_recipient_click_diagnostic(page, recipient_selector, exact_text)
+            if not click_diagnostic.get("click_safe"):
+                return {"ok": False, "error_code": "destructive_click_blocked", **click_diagnostic, **stability}
+            selected_before = self.plugin._forward_selected_recipients_state(page)
+            if int(selected_before.get("selected_count") or 0) != 0:
+                return {"ok": False, "error_code": "multiple_recipients_selected", **selected_before}
+            select_click = self.plugin._click_selector_short(page, recipient_selector, timeout_ms=1000)
+            if select_click.get("status") != "success":
+                return {"ok": False, "error_code": "recipient_select_failed", "click_result": select_click}
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+            selected_after = self.plugin._forward_selected_recipients_state(page)
+            confirm_state = self.plugin._forward_confirm_button_state(page)
+            selected_names = selected_after.get("selected_names") if isinstance(selected_after.get("selected_names"), list) else []
+            resolved = selected_names == [exact_text]
+            self.forward_boundary_result = {
+                "success": resolved,
+                "confirm_button_selector": str(confirm_state.get("confirm_button_selector") or ""),
+                "selected_names": selected_names,
+                "recipient_candidates": candidates,
+            }
+            self.records.update({
+                "recipient_resolved": resolved,
+                "recipient_result_text": str(self.exact_recipient.get("row_name") or self.exact_recipient.get("exact_text") or exact_text),
+                "recipient_selected": resolved,
+                "confirmation_visible": bool(confirm_state.get("confirm_button_selector")),
+                "stopped_before_send": True,
+                "forward_boundary_diagnostics": {"selected_after": selected_after, "confirm_state": confirm_state, "candidates": candidates},
+            })
+            return {"ok": resolved, "error_code": None if resolved else "unexpected_selected_recipient", **self.forward_boundary_result}
+        return super().choose_from_list(element_name, element, exact_text, timeout_ms)
 
     def click(self, element_name: str, element: dict[str, Any], timeout_ms: int | None = None) -> dict[str, Any]:
         if element_name == "final_forward_confirmation":
             self.final_send_invoked = True
-            result = self.plugin.forward_message_to_contact(
-                account_id=self.plan.account_id,
-                source_channel_uid=self.plan.source_channel_uid,
-                display_name=self.plan.display_name,
-                dry_run=False,
-                selection_only=False,
-                provider_mode="native_chrome",
-                runtime_session=self.runtime_session,
-                close_session_when_done=self.runtime_session is None,
-            )
-            return {"ok": bool(result.get("success")), "error_code": result.get("error_code"), "message": result.get("error_message"), **result}
+            confirm_selector = str((self.forward_boundary_result or {}).get("confirm_button_selector") or "")
+            if not confirm_selector:
+                return {"ok": False, "error_code": "forward_confirm_button_not_found"}
+            click_result = self.plugin._click_selector_short(self._ensure_page(), confirm_selector, timeout_ms=1000)
+            return {"ok": click_result.get("status") == "success", "error_code": None if click_result.get("status") == "success" else "forward_confirm_failed", "click_result": click_result}
         return super().click(element_name, element, timeout_ms)
 
 
@@ -185,8 +312,11 @@ class BaleDeliveryAdapter:
             "campaign_id": plan.campaign_id,
             "recipient_id": plan.recipient_id,
         }
-        runner = ScenarioRunner(BaleScenarioActionExecutor(self.plugin, plan, runtime_session=runtime_session))
-        scenario_result = runner.run(scenario, context).to_dict()
+        executor = BaleScenarioActionExecutor(self.plugin, plan, runtime_session=runtime_session)
+        try:
+            scenario_result = ScenarioRunner(executor).run(scenario, context).to_dict()
+        finally:
+            executor.close()
         records = scenario_result.get("records") or {}
         final_send_invoked = bool(scenario_result.get("final_send_invoked"))
         if final_send_invoked and not allow_final_send:
