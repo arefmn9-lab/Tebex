@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -79,6 +81,8 @@ CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID = "6407382527"
 CONTROLLED_SINGLE_RECIPIENT_SOURCE_URL = "https://web.bale.ai/chat?uid=6407382527"
 CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID = "bale_09211690533"
 CONTROLLED_SINGLE_RECIPIENT_APPROVAL_SCOPE = "single_recipient_single_send"
+CONTROLLED_LIVE_NO_SEND_MODE = "controlled_live_no_send"
+CONTROLLED_LIVE_NO_SEND_ENV = "CLINICOS_CONTROLLED_LIVE_NO_SEND"
 
 CONFIGURATION_FIELDS: dict[str, dict[str, Any]] = {
     "source.platform": {"default": "bale", "critical": False},
@@ -2741,8 +2745,8 @@ class CommercialQueueService:
         selected_platforms: list[str] | None,
         allow_retry_state: bool = False,
     ) -> dict[str, Any]:
-        if mode != "mock_only":
-            raise CampaignLifecycleError("controlled_execution_disabled", "Controlled execution defaults to disabled and only mock_only is allowed in this phase", {"mode": mode})
+        if mode not in {"mock_only", CONTROLLED_LIVE_NO_SEND_MODE}:
+            raise CampaignLifecycleError("controlled_execution_disabled", "Controlled execution defaults to disabled and only mock_only or explicitly gated no-send mode are allowed", {"mode": mode})
         if not idempotency_key:
             raise CampaignLifecycleError("idempotency_key_required", "Execution request requires an explicit idempotency key", {"campaign_id": campaign_id})
         campaign = self.repository.get_campaign(campaign_id)
@@ -2789,6 +2793,8 @@ class CommercialQueueService:
                 health = self.get_account_health(str(account_id))
                 if not bool(settings.get("enabled")) or str(health.get("health_status") or "") in BLOCKING_STATES or bool(health.get("manual_review_required")):
                     raise CampaignLifecycleError("sender_account_unavailable", "A healthy sender account is required for controlled execution", {"platform": platform, "account_id": account_id})
+        if mode == CONTROLLED_LIVE_NO_SEND_MODE:
+            self._validate_controlled_live_no_send_scope(campaign_id, review, requested_platforms, platform_sources, sender_accounts)
         revision = review.get("configuration_revision") or {}
         return {
             "campaign_id": campaign_id,
@@ -2806,8 +2812,44 @@ class CommercialQueueService:
             "source_by_platform": platform_sources,
             "sender_accounts_by_platform": {platform: (sender_accounts.get(platform) or {}).get("sender_account_ids") or [] for platform in requested_platforms},
             "max_attempts": 3,
-            "metadata": {"preflight_ready": True, "controlled_live_enabled": False},
+            "metadata": {"preflight_ready": True, "controlled_live_enabled": False, "controlled_live_no_send": mode == CONTROLLED_LIVE_NO_SEND_MODE},
         }
+
+    def _validate_controlled_live_no_send_scope(
+        self,
+        campaign_id: str,
+        review: dict[str, Any],
+        requested_platforms: list[str],
+        platform_sources: dict[str, Any],
+        sender_accounts: dict[str, Any],
+    ) -> None:
+        if str(os.environ.get(CONTROLLED_LIVE_NO_SEND_ENV, "")).lower() not in {"1", "true", "yes", "enabled"}:
+            raise CampaignLifecycleError("controlled_live_no_send_disabled", "Controlled live no-send mode is disabled by default", {"env": CONTROLLED_LIVE_NO_SEND_ENV})
+        if requested_platforms != ["bale"]:
+            raise CampaignLifecycleError("controlled_live_no_send_single_bale_required", "No-send execution requires exactly one Bale platform run", {"platforms": requested_platforms})
+        recipients = self.repository.list_recipients(campaign_id, None, 100000, 0)
+        if len(recipients) != 1:
+            raise CampaignLifecycleError("controlled_live_no_send_single_recipient_required", "No-send execution is restricted to one materialized recipient", {"recipient_count": len(recipients)})
+        scenario_rows = self.repository.list_campaign_recipient_report_rows(campaign_id, 100000, 0)
+        platform_run_count = sum(len(row.get("selected_platforms") or []) for row in scenario_rows)
+        if len(scenario_rows) != 1 or platform_run_count != 1:
+            raise CampaignLifecycleError("controlled_live_no_send_single_recipient_required", "No-send execution is restricted to one recipient scenario and one Bale platform run", {"scenario_count": len(scenario_rows), "platform_run_count": platform_run_count})
+        recipient = recipients[0]
+        if str(recipient.get("phone_normalized") or "") != AUTHORIZED_PHASE5D_PHONE:
+            raise CampaignLifecycleError("controlled_live_no_send_recipient_not_authorized", "No-send execution requires the explicitly authorized test recipient", {"recipient_id": recipient.get("id")})
+        if str(recipient.get("stable_display_name") or recipient.get("display_name") or "") != AUTHORIZED_PHASE5D_NAME:
+            raise CampaignLifecycleError("controlled_live_no_send_recipient_name_mismatch", "No-send execution requires the expected stored Bale display name", {"recipient_id": recipient.get("id")})
+        source = platform_sources.get("bale") or {}
+        if source.get("source_uid") != CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID or source.get("source_url") != CONTROLLED_SINGLE_RECIPIENT_SOURCE_URL:
+            raise CampaignLifecycleError("controlled_live_no_send_source_mismatch", "No-send execution requires the approved immutable source", {"source_uid": source.get("source_uid"), "source_url": source.get("source_url")})
+        accounts = list((sender_accounts.get("bale") or {}).get("sender_account_ids") or [])
+        if accounts != [CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID]:
+            raise CampaignLifecycleError("controlled_live_no_send_single_account_required", "No-send execution requires exactly one approved sender account", {"accounts": accounts})
+        jobs = self.repository.list_campaign_jobs_all(campaign_id)
+        if any(str(job.get("id")) == "job_604f8484ee36" or str(job.get("display_name") or "") == CONTROLLED_SINGLE_RECIPIENT_NAME for job in jobs):
+            raise CampaignLifecycleError("controlled_live_no_send_historical_job_forbidden", "Historical Bale jobs are not eligible for no-send execution", {"campaign_id": campaign_id})
+        if any(str(job.get("status") or "") in {"queued", "assigned", "running", "succeeded"} for job in jobs):
+            raise CampaignLifecycleError("controlled_live_no_send_prior_job_forbidden", "No-send execution requires a fresh campaign without prior active or terminal jobs", {"campaign_id": campaign_id})
 
     def request_controlled_execution(
         self,
@@ -2902,9 +2944,12 @@ class CommercialQueueService:
         job = self.repository.get_job(job_id)
         if job is None:
             raise KeyError(job_id)
-        if not job.get("execution_batch_id") or job.get("adapter_mode") != "mock_only":
-            raise CampaignLifecycleError("trusted_worker_result_required", "Only controlled mock worker jobs may apply trusted results in this phase", {"job_id": job_id})
+        adapter_mode = str(job.get("adapter_mode") or "")
+        if not job.get("execution_batch_id") or adapter_mode not in {"mock_only", CONTROLLED_LIVE_NO_SEND_MODE}:
+            raise CampaignLifecycleError("trusted_worker_result_required", "Only controlled worker jobs may apply trusted results in this phase", {"job_id": job_id})
         normalized = dict(result)
+        if adapter_mode == CONTROLLED_LIVE_NO_SEND_MODE and normalized.get("outcome") == "sent":
+            raise CampaignLifecycleError("controlled_live_no_send_cannot_report_sent", "No-send worker results may not report sent", {"job_id": job_id})
         if normalized.get("error_category") == "sender_auth" and normalized.get("outcome") == "account_not_found":
             normalized["outcome"] = "failed_retryable" if normalized.get("retryable", True) else "failed_terminal"
             normalized["error_code"] = normalized.get("error_code") or "sender_auth_failed"
@@ -2944,6 +2989,57 @@ class CommercialQueueService:
                 },
             })
         return applied
+
+    def run_controlled_live_no_send_worker(
+        self,
+        account_id: str,
+        campaign_id: str,
+        max_jobs: int | None = 1,
+        runtime_session: Any | None = None,
+    ) -> dict[str, Any]:
+        assignment = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
+        processed: list[dict[str, Any]] = []
+        for job_id in assignment.get("assigned_job_ids") or []:
+            running = self.repository.mark_job_running(str(job_id))
+            if running is None:
+                continue
+            plan = json.loads(str(running.get("execution_plan_json") or "{}"))
+            if plan.get("adapter_mode") != CONTROLLED_LIVE_NO_SEND_MODE:
+                raise CampaignLifecycleError("controlled_live_no_send_plan_required", "No-send worker requires an immutable no-send execution plan", {"job_id": job_id})
+            plan_obj = SimpleNamespace(
+                **{
+                    **plan,
+                    "job_id": str(plan.get("job_id") or job_id),
+                    "campaign_id": str(plan.get("campaign_id") or running.get("campaign_id")),
+                    "account_id": str(plan.get("account_id") or plan.get("sender_account_id") or running.get("account_id")),
+                    "recipient_id": str(plan.get("recipient_id") or running.get("recipient_id")),
+                    "phone": str(plan.get("phone") or plan.get("phone_normalized") or running.get("phone_normalized")),
+                    "display_name": str(plan.get("display_name") or running.get("display_name") or ""),
+                    "source_channel_uid": str(plan.get("source_channel_uid") or (plan.get("source") or {}).get("source_uid") or running.get("source_channel_uid") or ""),
+                    "dry_run": False,
+                    "adapter_mode": CONTROLLED_LIVE_NO_SEND_MODE,
+                }
+            )
+            adapter = self.platform_adapters.get("bale")
+            if adapter is None or not hasattr(adapter, "controlled_live_no_send"):
+                raise CampaignLifecycleError("controlled_live_no_send_adapter_missing", "Bale adapter does not support no-send execution", {"job_id": job_id})
+            result = adapter.controlled_live_no_send(plan_obj, runtime_session=runtime_session)
+            if result.get("outcome") == "sent" or result.get("remote_message_id"):
+                raise CampaignLifecycleError("controlled_live_no_send_cannot_report_sent", "No-send adapter produced a delivery result", {"job_id": job_id})
+            trusted_result = {
+                "outcome": "cancelled",
+                "success": False,
+                "retryable": False,
+                "error_code": result.get("error_code") or "controlled_live_no_send_stopped_before_send",
+                "error_category": result.get("error_category") or "controlled_live_no_send",
+                "error_message": result.get("error_message") or "Controlled no-send preflight stopped before final send action",
+                "failed_step": result.get("failed_step") or "controlled_live_no_send_boundary",
+                "trusted_result_key": f"controlled-live-no-send:{job_id}",
+                "diagnostics": result,
+            }
+            applied = self.apply_trusted_adapter_result(str(job_id), trusted_result)
+            processed.append({"job_id": job_id, "execution_plan": plan, "adapter_result": result, "result": applied})
+        return {"account_id": account_id, "assignment": assignment, "processed_count": len(processed), "results": processed, "real_adapter_called": True, "stopped_before_send": True}
 
     def run_controlled_mock_worker(
         self,

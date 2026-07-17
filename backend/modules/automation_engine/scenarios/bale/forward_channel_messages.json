@@ -1,0 +1,176 @@
+{
+  "id": "bale.forward_channel_messages",
+  "platform": "bale",
+  "operation": "forward_channel_messages",
+  "required_context": [
+    "sender_account_id",
+    "source_url",
+    "source_uid",
+    "recipient_phone",
+    "recipient_display_name",
+    "operation_mode",
+    "allow_final_send"
+  ],
+  "context": {
+    "operation_mode": "inspect_only",
+    "allow_final_send": false
+  },
+  "elements": {
+    "source_timeline": {
+      "selectors": [
+        "#message_list_scroller_id",
+        "[data-testid*='message-list']",
+        "[data-testid*='messages']",
+        "[class*='message']",
+        "[aria-label='message-item']"
+      ],
+      "timeout_ms": 10000
+    },
+    "latest_source_message": {
+      "selectors": [
+        "[aria-label='message-item']",
+        ".message-item",
+        "._message-item",
+        ".message-block"
+      ],
+      "timeout_ms": 5000
+    },
+    "forward_picker": {
+      "selectors": [
+        "[role='dialog']",
+        "[class*='Modal']"
+      ],
+      "timeout_ms": 5000
+    },
+    "recipient_search": {
+      "selectors": [
+        "[role='dialog'] input[type='search']",
+        "[role='dialog'] [role='searchbox']",
+        "[role='dialog'] input"
+      ],
+      "timeout_ms": 5000
+    },
+    "recipient_result": {
+      "selectors": [
+        "[role='dialog'] [role='listitem']",
+        "[role='dialog'] [aria-label='dialog-item']",
+        "[role='dialog'] [role='button']"
+      ],
+      "timeout_ms": 5000
+    },
+    "final_forward_confirmation": {
+      "selectors": [
+        "[role='dialog'] [data-testid*='send']",
+        "[role='dialog'] [aria-label*='Send']",
+        "[role='dialog'] [aria-label*='Forward']"
+      ],
+      "timeout_ms": 5000,
+      "destructive": true
+    }
+  },
+  "steps": [
+    {
+      "id": "validate_operation_mode",
+      "action": "call_platform_primitive",
+      "name": "validate_operation_mode",
+      "params": {
+        "operation_mode": "{{operation_mode}}",
+        "allow_final_send": "{{allow_final_send}}"
+      }
+    },
+    {
+      "id": "open_exact_source",
+      "action": "navigate",
+      "url": "{{source_url}}",
+      "timeout_ms": 30000
+    },
+    {
+      "id": "verify_source_chat_selected",
+      "action": "call_platform_primitive",
+      "name": "verify_source_chat",
+      "params": {
+        "source_uid": "{{source_uid}}",
+        "source_url": "{{source_url}}"
+      }
+    },
+    {
+      "id": "verify_source_timeline",
+      "action": "wait_for",
+      "element": "source_timeline",
+      "timeout_ms": 10000
+    },
+    {
+      "id": "stop_after_inspection",
+      "action": "stop",
+      "when": "context.operation_mode == 'inspect_only'",
+      "stopped_before_send": true,
+      "reason": "inspect_only"
+    },
+    {
+      "id": "select_configured_source_message",
+      "action": "call_platform_primitive",
+      "name": "select_source_message",
+      "params": {
+        "selection_policy": "{{source_message_selector}}"
+      }
+    },
+    {
+      "id": "open_forward_picker",
+      "action": "call_platform_primitive",
+      "name": "open_forward_picker",
+      "params": {}
+    },
+    {
+      "id": "verify_forward_picker",
+      "action": "assert_visible",
+      "element": "forward_picker"
+    },
+    {
+      "id": "search_recipient_display_name",
+      "action": "fill",
+      "element": "recipient_search",
+      "value": "{{recipient_display_name}}"
+    },
+    {
+      "id": "choose_exact_recipient",
+      "action": "choose_from_list",
+      "element": "recipient_result",
+      "exact_text": "{{recipient_display_name}}"
+    },
+    {
+      "id": "record_recipient_selected",
+      "action": "record_result",
+      "name": "recipient_resolved",
+      "value": true
+    },
+    {
+      "id": "stop_after_selection",
+      "action": "stop",
+      "when": "context.operation_mode in ['selection_only', 'no_send']",
+      "stopped_before_send": true,
+      "reason": "non_send_mode"
+    },
+    {
+      "id": "fail_closed_without_final_send_authorization",
+      "action": "stop",
+      "when": "context.operation_mode == 'live_send' AND context.allow_final_send != true",
+      "ok": false,
+      "error_code": "final_send_not_authorized",
+      "stopped_before_send": true,
+      "reason": "final_send_not_authorized"
+    },
+    {
+      "id": "confirm_forward_send",
+      "action": "click",
+      "when": "context.operation_mode == 'live_send' AND context.allow_final_send == true",
+      "element": "final_forward_confirmation"
+    },
+    {
+      "id": "record_final_send_invoked",
+      "action": "record_result",
+      "when": "context.operation_mode == 'live_send' AND context.allow_final_send == true",
+      "name": "final_send_invoked",
+      "value": true
+    }
+  ]
+}

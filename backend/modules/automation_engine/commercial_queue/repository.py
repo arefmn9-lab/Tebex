@@ -124,7 +124,7 @@ def queue_claim_eligibility_where(job_alias: str = "job", recipient_alias: str =
                   AND batch.campaign_id = {job_alias}.campaign_id
                   AND batch.status IN ('queued','in_progress')
                   AND batch.mode = COALESCE({job_alias}.adapter_mode, 'mock_only')
-                  AND batch.mode = 'mock_only'
+                  AND batch.mode IN ('mock_only','controlled_live_no_send')
                   AND batch.cancellation_reason IS NULL
             )
         )
@@ -2395,8 +2395,13 @@ class CommercialQueueRepository:
                     "global_contact_id": row["global_contact_id"],
                     "platform": platform,
                     "sender_account_id": sender_account_id,
+                    "account_id": sender_account_id,
                     "source": source,
+                    "source_channel_uid": source.get("source_uid"),
+                    "source_channel_url": source.get("source_url"),
                     "phone_normalized": row["scenario_phone"],
+                    "phone": row["scenario_phone"],
+                    "display_name": row.get("recipient_display_name"),
                     "configuration_revision_id": payload.get("configuration_revision_id"),
                     "execution_snapshot_id": payload["execution_snapshot_id"],
                     "configuration_snapshot_hash": payload.get("configuration_snapshot_hash"),
@@ -2407,6 +2412,7 @@ class CommercialQueueRepository:
                     "attempt_number": attempt_number,
                     "previous_job_id": previous_job_id,
                     "adapter_mode": payload.get("mode") or "mock_only",
+                    "dry_run": False,
                     "timeout_policy": payload.get("timeout_policy") or {},
                 }
                 connection.execute(

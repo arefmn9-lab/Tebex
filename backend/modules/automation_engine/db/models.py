@@ -315,7 +315,7 @@ CREATE TABLE IF NOT EXISTS commercial_execution_batches (
     execution_snapshot_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     requested_by TEXT,
-    mode TEXT NOT NULL CHECK(mode IN ('disabled','mock_only','controlled_live')),
+    mode TEXT NOT NULL CHECK(mode IN ('disabled','mock_only','controlled_live','controlled_live_no_send')),
     status TEXT NOT NULL CHECK(status IN ('creating','queued','in_progress','completed','partially_completed','failed','cancelled')),
     selected_platforms_json TEXT NOT NULL,
     eligible_platform_run_count INTEGER NOT NULL,

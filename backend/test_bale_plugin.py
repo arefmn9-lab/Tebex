@@ -296,6 +296,20 @@ class SourceChannelReadinessPage(MockPage):
         return super().evaluate(script)
 
 
+class SequentialSourceChannelReadinessPage(SourceChannelReadinessPage):
+    def __init__(self, readiness_states: list[dict[str, object]]) -> None:
+        super().__init__(readiness_states[0] if readiness_states else {})
+        self.readiness_states = list(readiness_states)
+        self.readiness_index = 0
+
+    def evaluate(self, script: str) -> object:
+        if "clinicos_bale_source_channel_readiness" in script:
+            index = min(self.readiness_index, len(self.readiness_states) - 1)
+            self.readiness_index += 1
+            return self.readiness_states[index]
+        return super().evaluate(script)
+
+
 class LocateLatestChannelMessagePage(SourceChannelReadinessPage):
     def __init__(self, readiness: dict[str, object], locate_result: dict[str, object]) -> None:
         super().__init__(readiness)
@@ -3610,6 +3624,166 @@ def test_open_bale_source_channel_message_stream_visibility_is_required() -> Non
     assert result["error_code"] == "source_channel_not_ready"
 
 
+def test_open_bale_source_channel_timeline_without_semantic_header_is_accepted() -> None:
+    page = SourceChannelReadinessPage(
+        {
+            "ready": True,
+            "target_channel_panel_visible": True,
+            "target_channel_panel_selector": "message-timeline-parent",
+            "target_channel_header_text": "",
+            "target_channel_header_selector": "",
+            "message_stream_visible": True,
+            "message_stream_selector": "message-parent",
+            "message_count": 3,
+            "authentication_view_visible": False,
+            "loading_indicator_visible": False,
+            "empty_state_visible": False,
+            "center_panel_visible_text_sample": "کانال ایجاد شد بازارسال شده از ولورا",
+        }
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    assert result["success"] is True
+    assert result["message_stream_visible"] is True
+    assert result["message_count"] == 3
+    assert result["target_channel_header_text"] == ""
+
+
+def test_open_bale_source_channel_delayed_loading_polls_until_timeline_ready() -> None:
+    page = SequentialSourceChannelReadinessPage(
+        [
+            {
+                "ready": False,
+                "target_channel_panel_visible": True,
+                "message_stream_visible": False,
+                "message_stream_selector": "",
+                "message_count": 0,
+                "loading_indicator_visible": True,
+            },
+            {
+                "ready": True,
+                "target_channel_panel_visible": True,
+                "message_stream_visible": True,
+                "message_stream_selector": "message-parent",
+                "message_count": 1,
+                "loading_indicator_visible": False,
+            },
+        ]
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    attempts = [step for step in result["step_results"] if step["step"] == "wait_source_channel_ready"]
+    assert result["success"] is True
+    assert len(attempts) == 2
+    assert attempts[0]["status"] == "pending"
+    assert attempts[1]["status"] == "success"
+
+
+def test_open_bale_source_channel_authentication_view_is_reported_not_ready() -> None:
+    page = SourceChannelReadinessPage(
+        {
+            "ready": False,
+            "target_channel_panel_visible": False,
+            "message_stream_visible": False,
+            "message_stream_selector": "",
+            "message_count": 0,
+            "authentication_view_visible": True,
+            "center_panel_visible_text_sample": "ورود شماره تلفن",
+        }
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.open_bale_source_channel("bale_source", "5613544284")
+
+    assert result["success"] is False
+    assert result["error_code"] == "source_channel_not_ready"
+    assert result["authentication_view_visible"] is True
+
+
+def test_open_bale_source_channel_empty_or_wrong_view_times_out() -> None:
+    for readiness in [
+        {
+            "ready": False,
+            "target_channel_panel_visible": True,
+            "message_stream_visible": False,
+            "message_count": 0,
+            "empty_state_visible": True,
+            "center_panel_visible_text_sample": "هنوز پیامی نیست",
+        },
+        {
+            "ready": False,
+            "target_channel_panel_visible": True,
+            "message_stream_visible": True,
+            "message_stream_selector": "sidebar-message-parent",
+            "message_count": 0,
+            "center_panel_visible_text_sample": "گفتگو مخاطبین",
+        },
+    ]:
+        page = SourceChannelReadinessPage(readiness)
+        plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+        result = plugin.open_bale_source_channel("bale_source", "5613544284")
+        assert result["success"] is False
+        assert result["error_code"] == "source_channel_not_ready"
+        assert result["failed_step"] == "wait_source_channel_ready"
+
+
+def test_forward_latest_channel_message_controlled_no_send_uses_selection_only_boundary() -> None:
+    class NoSendPlugin(BalePlugin):
+        def __init__(self) -> None:
+            super().__init__(browser_manager=MockBrowserManager(MockPage(set())))
+            self.selection_only_seen = False
+
+        def forward_message_to_contact(self, *args: object, **kwargs: object) -> dict[str, object]:
+            self.selection_only_seen = bool(kwargs.get("selection_only"))
+            return {
+                "success": True,
+                "channel_uid_verified": True,
+                "recipient_picker_visible": True,
+                "confirm_button_selector": "[data-confirm]",
+                "confirm_click_count": 0,
+                "verified_forwarded_recipient_count": 0,
+                "final_forwarded_recipient_count": 0,
+                "forward_verified": False,
+                "diagnostics_consistent": True,
+                "failed_step": None,
+                "step_results": [
+                    {"step": "wait_source_channel_ready", "status": "success"},
+                    {"step": "locate_latest_channel_message", "status": "success"},
+                    {"step": "select_exact_recipient", "status": "success"},
+                    {"step": "selection_only_snapshot", "status": "success"},
+                ],
+            }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        from modules.automation_engine.plugins.bale import plugin as bale_plugin_module
+
+        plugin = NoSendPlugin()
+        original_account_store = bale_plugin_module.bale_account_store
+        class AccountStore:
+            def get_account(self, account_id: str) -> dict[str, object]:
+                return {"account_id": account_id, "browser_provider": "native_chrome"}
+            def get_source_channel(self, account_id: str) -> dict[str, object]:
+                return {"source_channel_uid": "5613544284"}
+        bale_plugin_module.bale_account_store = AccountStore()
+        try:
+            result = plugin.forward_latest_channel_message(
+                "bale_no_send",
+                "989304073331",
+                source_channel_uid="5613544284",
+                display_name="Bale-000001",
+                controlled_live_no_send=True,
+            )
+        finally:
+            bale_plugin_module.bale_account_store = original_account_store
+
+    assert result["success"] is True
+    assert result["stopped_before_send"] is True
+    assert result["confirm_click_count"] == 0
+    assert result["remote_message_id"] is None
+    assert plugin.selection_only_seen is True
+
+
 def test_open_bale_source_channel_route_persists_diagnostic_job_with_null_scenario_id() -> None:
     class OpenSourceChannelPlugin:
         def open_bale_source_channel(self, account_id: str, source_channel_uid: str, provider_mode: str | None = None) -> dict[str, object]:
@@ -6457,6 +6631,10 @@ if __name__ == "__main__":
     test_open_bale_source_channel_shell_only_page_is_rejected()
     test_open_bale_source_channel_center_channel_panel_is_accepted()
     test_open_bale_source_channel_message_stream_visibility_is_required()
+    test_open_bale_source_channel_timeline_without_semantic_header_is_accepted()
+    test_open_bale_source_channel_delayed_loading_polls_until_timeline_ready()
+    test_open_bale_source_channel_authentication_view_is_reported_not_ready()
+    test_open_bale_source_channel_empty_or_wrong_view_times_out()
     test_open_bale_source_channel_route_persists_diagnostic_job_with_null_scenario_id()
     test_locate_latest_channel_message_message_stream_required()
     test_locate_latest_channel_message_shell_only_page_rejected()
@@ -6509,6 +6687,7 @@ if __name__ == "__main__":
     test_forward_latest_channel_message_failed_contact_save_blocks_forwarding()
     test_forward_latest_channel_message_failed_channel_verification_blocks_forwarding()
     test_forward_latest_channel_message_failed_recipient_selection_blocks_confirm()
+    test_forward_latest_channel_message_controlled_no_send_uses_selection_only_boundary()
     test_forward_latest_channel_message_route_persists_diagnostics_and_metadata()
     test_bale_source_channel_save_load()
     test_bale_source_channel_change_overwrites_and_persists_uid()

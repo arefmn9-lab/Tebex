@@ -1946,6 +1946,7 @@ class BalePlugin:
         execution_plan: Any | None = None,
         runtime_session: Any | None = None,
         close_session_when_done: bool = True,
+        controlled_live_no_send: bool = False,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         action = "forward_latest_channel_message"
@@ -2006,6 +2007,10 @@ class BalePlugin:
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 "step_results": step_results,
                 "dry_run": bool(dry_run),
+                "controlled_live_no_send": bool(controlled_live_no_send),
+                "stopped_before_send": bool(controlled_live_no_send),
+                "remote_message_id": None,
+                "outcome": None if not controlled_live_no_send else "cancelled",
             }
             if extra:
                 payload.update(extra)
@@ -2049,7 +2054,12 @@ class BalePlugin:
         last_successful_step = "resolve_source_channel"
 
         try:
-            if dry_run:
+            if controlled_live_no_send:
+                if not resolved_display_name:
+                    self._add_step(step_results, "save_or_resolve_contact", "failed", error_code="controlled_live_no_send_display_name_required")
+                    return finish(False, "controlled_live_no_send_display_name_required", "No-send mode requires the immutable stored Bale display name", "save_or_resolve_contact")
+                resolved_contact, preexisting_contact = {"id": resolved_recipient_id, "phone_normalized": phone_text, "display_name": resolved_display_name}, False
+            elif dry_run:
                 existing_contact = self.contact_store.get_bale_contact(account_id, phone_text)
                 if existing_contact is None:
                     self._add_step(step_results, "save_or_resolve_contact", "skipped", reason="dry_run_no_stable_name_allocation")
@@ -2070,7 +2080,25 @@ class BalePlugin:
         resolved_recipient_id = resolved_recipient_id or str(resolved_contact.get("id") or "")
         contact_created = bool(preexisting_contact)
         contact_reused = not bool(preexisting_contact)
-        if not preexisting_contact:
+        if controlled_live_no_send:
+            contact_result = {
+                "success": True,
+                "ok": True,
+                "action": "resolve_bale_contact_no_send",
+                "account_id": account_id,
+                "phone": phone_text,
+                "phone_normalized": phone_text,
+                "display_name": resolved_display_name,
+                "contact_id": resolved_recipient_id,
+                "contact_store_status": "immutable_execution_plan",
+                "contact_save_status": "not_attempted",
+                "failed_step": None,
+                "last_successful_step": "resolve_contact_name",
+                "error_code": None,
+                "error_message": None,
+                "step_results": [{"step": "resolve_contact_name", "status": "success", "display_name": resolved_display_name, "contact_store_status": "immutable_execution_plan"}],
+            }
+        elif not preexisting_contact:
             contact_result = {
                 "success": True,
                 "ok": True,
@@ -2125,6 +2153,7 @@ class BalePlugin:
             source_channel_uid=effective_source_channel_uid,
             display_name=resolved_display_name,
             dry_run=dry_run,
+            selection_only=bool(controlled_live_no_send),
             provider_mode=provider_mode or "native_chrome",
             runtime_session=runtime_session,
             close_session_when_done=close_session_when_done,
@@ -2178,6 +2207,39 @@ class BalePlugin:
                 failed_public_step = public_step
 
         success = bool(forward_result.get("success"))
+        if success and controlled_live_no_send:
+            forward_extra.update(
+                {
+                    "diagnostics_consistent": True,
+                    "diagnostics_consistency_errors": [],
+                    "forward_verified": False,
+                    "confirm_click_count": 0,
+                    "verified_forwarded_recipient_count": 0,
+                    "final_forwarded_recipient_count": 0,
+                    "source_resolved": bool(forward_result.get("channel_uid_verified")),
+                    "recipient_resolved": True,
+                    "composer_visible": bool(forward_result.get("recipient_picker_visible")),
+                    "final_send_control_visible": bool(forward_result.get("confirm_button_selector")),
+                    "authentication_state": "authenticated",
+                    "sender_account_state": "available",
+                    "recipient_account_state": "resolved",
+                    "stopped_before_send": True,
+                    "remote_message_id": None,
+                    "outcome": "cancelled",
+                }
+            )
+            step_results.append({"step": "controlled_live_no_send_boundary", "status": "success", "stopped_before_send": True})
+            last_successful_step = "controlled_live_no_send_boundary"
+            final_extra = {
+                "phone": str(contact_result.get("phone_normalized") or phone_text),
+                "display_name": resolved_display_name,
+                "recipient_id": resolved_recipient_id,
+                "contact_result": contact_result,
+                **forward_extra,
+            }
+            step_results.append({"step": "persist_result", "status": "success"})
+            last_successful_step = "persist_result"
+            return finish(True, None, None, None, final_extra)
         if success and not dry_run and int(forward_result.get("verified_forwarded_recipient_count") or 0) != 1:
             success = False
             failed_public_step = "verify_forward"
@@ -3005,6 +3067,22 @@ class BalePlugin:
               }
             }
           }
+          const messageSelector = '[aria-label="message-item"], .message-item, ._message-item, .message-block, [data-testid*="message"]';
+          if (!panelNode) {
+            const messageLike = Array.from(document.querySelectorAll(messageSelector)).filter(visible);
+            if (messageLike.length) {
+              const message = messageLike[messageLike.length - 1];
+              const parent = message.closest(".main-section-container, [class*='Conversation'], [class*='ChatPanel'], [role='main']") || message.parentElement;
+              if (parent && visible(parent)) {
+                const box = boxOf(parent);
+                const sidebarLike = parent.id === "sidebar_wrapper" || box.x > window.innerWidth * 0.58 || box.w < 300;
+                if (!sidebarLike) {
+                  panelCandidates.push({node: parent, selector: "message-timeline-parent", box, text: textOf(parent)});
+                }
+              }
+            }
+          }
+          const effectivePanel = panelNode || (panelCandidates[0] ? panelCandidates[0].node : null);
           const streamSelectors = [
             "#message_list_scroller_id",
             "[data-testid*='message-list']",
@@ -3016,9 +3094,9 @@ class BalePlugin:
           ];
           let stream = null;
           let streamSelector = "";
-          if (panelNode) {
+          if (effectivePanel) {
             for (const selector of streamSelectors) {
-              const nodes = Array.from(panelNode.querySelectorAll(selector)).filter((node) => {
+              const nodes = Array.from(effectivePanel.querySelectorAll(selector)).filter((node) => {
                 if (!visible(node)) return false;
                 const box = boxOf(node);
                 return box.h > 120 && box.w > 250;
@@ -3030,25 +3108,34 @@ class BalePlugin:
               }
             }
             if (!stream) {
-              const messageLike = Array.from(panelNode.querySelectorAll("[data-testid*='message'], [class*='message'], [class*='Message'], article")).filter(visible);
+              const messageLike = Array.from(effectivePanel.querySelectorAll(messageSelector)).filter(visible);
               if (messageLike.length >= 1) {
-                stream = messageLike[messageLike.length - 1].parentElement;
+                stream = messageLike[messageLike.length - 1].parentElement || effectivePanel;
                 streamSelector = selectorOf(stream, "message-parent");
               }
             }
           }
           const headerText = textOf(header).slice(0, 500);
-          const panelText = textOf(panelNode).slice(0, 1000);
-          const ready = Boolean(panelNode && header && headerText && stream);
+          const panelText = textOf(effectivePanel).slice(0, 1000);
+          const messageCount = effectivePanel ? Array.from(effectivePanel.querySelectorAll(messageSelector)).filter(visible).length : 0;
+          const pageText = textOf(document.body).slice(0, 1000);
+          const authVisible = /ورود|login|log in|phone|شماره|کد تایید|otp/i.test(pageText);
+          const loadingVisible = /loading|در حال|لطفا صبر|please wait/i.test(pageText);
+          const emptyVisible = /empty|پیامی|هنوز/i.test(pageText) && messageCount === 0;
+          const ready = Boolean(effectivePanel && stream && messageCount > 0 && !authVisible);
           return {
             marker: "clinicos_bale_source_channel_readiness",
             ready,
-            target_channel_panel_visible: Boolean(panelNode),
-            target_channel_panel_selector: panel ? selectorOf(panelNode, panel.selector) : "",
+            target_channel_panel_visible: Boolean(effectivePanel),
+            target_channel_panel_selector: effectivePanel ? selectorOf(effectivePanel, panel ? panel.selector : "message-timeline-parent") : "",
             target_channel_header_text: headerText,
             target_channel_header_selector: headerSelector,
             message_stream_visible: Boolean(stream),
             message_stream_selector: streamSelector,
+            message_count: messageCount,
+            authentication_view_visible: authVisible,
+            loading_indicator_visible: loadingVisible,
+            empty_state_visible: emptyVisible,
             center_panel_visible_text_sample: panelText,
           };
         }
@@ -3067,14 +3154,18 @@ class BalePlugin:
             "target_channel_header_selector": str(raw.get("target_channel_header_selector") or ""),
             "message_stream_visible": bool(raw.get("message_stream_visible")),
             "message_stream_selector": str(raw.get("message_stream_selector") or ""),
+            "message_count": int(raw.get("message_count") or 0),
+            "authentication_view_visible": bool(raw.get("authentication_view_visible")),
+            "loading_indicator_visible": bool(raw.get("loading_indicator_visible")),
+            "empty_state_visible": bool(raw.get("empty_state_visible")),
             "center_panel_visible_text_sample": str(raw.get("center_panel_visible_text_sample") or ""),
         }
 
     def _locate_latest_channel_message_in_stream(self, page: Any) -> dict[str, Any]:
         script = """
         () => {
-          const streamSelector = "#message_list_scroller_id";
-          const stream = document.querySelector(streamSelector);
+          const streamSelectorCandidates = ["#message_list_scroller_id", "[data-testid*='message-list']", "[data-testid*='messages']", "[class*='MessageList']", "[class*='message-list']", "[class*='Messages']", "[role='list']"];
+          const messageSelector = '[aria-label="message-item"], .message-item, ._message-item, .message-block';
           const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
           const visible = (node) => {
             if (!node) return false;
@@ -3082,6 +3173,23 @@ class BalePlugin:
             const style = window.getComputedStyle(node);
             return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
           };
+          let stream = null;
+          let streamSelector = "";
+          for (const selector of streamSelectorCandidates) {
+            const nodes = Array.from(document.querySelectorAll(selector)).filter(visible);
+            if (nodes.length) {
+              stream = nodes[nodes.length - 1];
+              streamSelector = selector;
+              break;
+            }
+          }
+          if (!stream) {
+            const messageLike = Array.from(document.querySelectorAll(messageSelector)).filter(visible);
+            if (messageLike.length) {
+              stream = messageLike[messageLike.length - 1].parentElement || document.body;
+              streamSelector = "message-parent";
+            }
+          }
           const boxOf = (node) => {
             const rect = node.getBoundingClientRect();
             return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
@@ -3111,7 +3219,6 @@ class BalePlugin:
           if (!stream) {
             return {marker: "clinicos_bale_latest_channel_message", message_found: false, candidate_count: 0, message_selector_used: streamSelector, candidate_debug: [{status: "rejected", reason: "message_stream_missing", selector: streamSelector}]};
           }
-          const messageSelector = '[aria-label="message-item"], .message-item';
           const rawNodes = Array.from(stream.querySelectorAll(messageSelector));
           const accepted = [];
           rawNodes.forEach((node, index) => {
@@ -3186,8 +3293,8 @@ class BalePlugin:
     def _resolve_latest_forward_message_target(self, page: Any) -> dict[str, Any]:
         script = """
         () => {
-          const streamSelector = "#message_list_scroller_id";
-          const stream = document.querySelector(streamSelector);
+          const streamSelectorCandidates = ["#message_list_scroller_id", "[data-testid*='message-list']", "[data-testid*='messages']", "[class*='MessageList']", "[class*='message-list']", "[class*='Messages']", "[role='list']"];
+          const messageSelector = '[aria-label="message-item"], .message-item, ._message-item, .message-block';
           const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
           const visible = (node) => {
             if (!node) return false;
@@ -3195,6 +3302,23 @@ class BalePlugin:
             const style = window.getComputedStyle(node);
             return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
           };
+          let stream = null;
+          let streamSelector = "";
+          for (const selector of streamSelectorCandidates) {
+            const nodes = Array.from(document.querySelectorAll(selector)).filter(visible);
+            if (nodes.length) {
+              stream = nodes[nodes.length - 1];
+              streamSelector = selector;
+              break;
+            }
+          }
+          if (!stream) {
+            const messageLike = Array.from(document.querySelectorAll(messageSelector)).filter(visible);
+            if (messageLike.length) {
+              stream = messageLike[messageLike.length - 1].parentElement || document.body;
+              streamSelector = "message-parent";
+            }
+          }
           const boxOf = (node) => {
             const rect = node.getBoundingClientRect();
             return {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)};
@@ -3210,7 +3334,6 @@ class BalePlugin:
             return {marker: "clinicos_bale_forward_latest_message_target", message_found: false, candidate_count: 0, message_selector_used: streamSelector, candidate_debug: [{status: "rejected", reason: "message_stream_missing", selector: streamSelector}]};
           }
           stream.querySelectorAll("[data-clinicos-latest-channel-message]").forEach((node) => node.removeAttribute("data-clinicos-latest-channel-message"));
-          const messageSelector = '[aria-label="message-item"], .message-item';
           const rawNodes = Array.from(stream.querySelectorAll(messageSelector));
           const accepted = [];
           rawNodes.forEach((node, index) => {

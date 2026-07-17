@@ -1,0 +1,45 @@
+{
+  "id": "bale.save_contact",
+  "platform": "bale",
+  "operation": "save_contact",
+  "required_context": [
+    "sender_account_id",
+    "recipient_phone",
+    "recipient_display_name",
+    "operation_mode"
+  ],
+  "context": {
+    "operation_mode": "inspect_only"
+  },
+  "elements": {
+    "add_contact_button": {
+      "selectors": [
+        "[role='button']"
+      ],
+      "timeout_ms": 5000
+    },
+    "contact_phone": {
+      "selectors": [
+        "input[type='tel']",
+        "input[name*='phone']"
+      ],
+      "timeout_ms": 5000
+    },
+    "contact_name": {
+      "selectors": [
+        "input[name*='name']"
+      ],
+      "timeout_ms": 5000
+    }
+  },
+  "steps": [
+    {
+      "id": "fail_closed_unless_explicit_save_contact",
+      "action": "call_platform_primitive",
+      "name": "validate_save_contact_mode",
+      "params": {
+        "operation_mode": "{{operation_mode}}"
+      }
+    }
+  ]
+}
