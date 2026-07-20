@@ -147,6 +147,91 @@ class MockMouse:
         self.page.mouse_click(x, y)
 
 
+class OverlayBlockedClickPage:
+    def __init__(self, postcondition_selector: str | None = None, enable_postcondition_on_dom_click: bool = False) -> None:
+        self.visible_selectors = {"[data-action]"}
+        self.postcondition_selector = postcondition_selector
+        self.enable_postcondition_on_dom_click = enable_postcondition_on_dom_click
+        self.clicked: list[tuple[str, int]] = []
+        self.dom_clicked: list[tuple[str, str]] = []
+
+    def locator(self, selector: str) -> "OverlayBlockedClickLocator":
+        return OverlayBlockedClickLocator(selector, self)
+
+    def click(self, selector: str, timeout: int) -> None:
+        if timeout > 0:
+            raise TimeoutError("ReactModal__Overlay intercepts pointer events")
+        self.clicked.append((selector, timeout))
+
+
+class OverlayBlockedClickLocator:
+    def __init__(self, selector: str, page: OverlayBlockedClickPage) -> None:
+        self.selector = selector
+        self.page = page
+        self.first = self
+
+    def click(self, timeout: int) -> None:
+        self.page.click(self.selector, timeout)
+
+    def evaluate(self, script: str) -> None:
+        self.page.dom_clicked.append((self.selector, script))
+        if self.page.enable_postcondition_on_dom_click and self.page.postcondition_selector:
+            self.page.visible_selectors.add(self.page.postcondition_selector)
+        self.page.click(self.selector, timeout=0)
+
+    def wait_for(self, state: str, timeout: int) -> None:
+        if state != "visible" or self.selector not in self.page.visible_selectors:
+            raise TimeoutError(f"Selector not visible: {self.selector}")
+
+
+def test_click_selector_short_dom_click_requires_postcondition_success() -> None:
+    page = OverlayBlockedClickPage(
+        postcondition_selector="[data-next-state]",
+        enable_postcondition_on_dom_click=True,
+    )
+    plugin = BalePlugin()
+
+    result = plugin._click_selector_short(
+        page,
+        "[data-action]",
+        timeout_ms=1,
+        postcondition_selector="[data-next-state]",
+        postcondition_timeout_ms=50,
+    )
+
+    assert result["status"] == "success"
+    assert result["click_method"] == "dom_click"
+    assert result["postcondition_selector"] == "[data-next-state]"
+
+
+def test_click_selector_short_dom_click_without_postcondition_fails() -> None:
+    page = OverlayBlockedClickPage()
+    plugin = BalePlugin()
+
+    result = plugin._click_selector_short(page, "[data-action]", timeout_ms=1)
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "click_postcondition_not_met"
+    assert result["dom_click_attempted"] is True
+
+
+def test_click_selector_short_dom_click_unmet_postcondition_fails() -> None:
+    page = OverlayBlockedClickPage(postcondition_selector="[data-next-state]")
+    plugin = BalePlugin()
+
+    result = plugin._click_selector_short(
+        page,
+        "[data-action]",
+        timeout_ms=1,
+        postcondition_selector="[data-next-state]",
+        postcondition_timeout_ms=50,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "click_postcondition_not_met"
+    assert result["postcondition_selector"] == "[data-next-state]"
+
+
 class MockPage:
     def __init__(
         self,
@@ -232,6 +317,26 @@ class MockPage:
         Path(path).write_bytes(b"mock screenshot")
 
 
+class DelayedVisibleLocator(MockLocator):
+    def wait_for(self, state: str, timeout: int) -> None:
+        self.page.timeouts.append(timeout)
+        self.page.wait_attempts += 1
+        if self.page.wait_attempts >= self.page.visible_after_attempts:
+            self.page.visible_selectors.add(self.selector)
+        if state != "visible" or self.selector not in self.page.visible_selectors:
+            raise TimeoutError(f"Selector not visible: {self.selector}")
+
+
+class DelayedVisiblePage(MockPage):
+    def __init__(self, visible_after_attempts: int) -> None:
+        super().__init__(visible_selectors=set())
+        self.visible_after_attempts = visible_after_attempts
+        self.wait_attempts = 0
+
+    def locator(self, selector: str) -> DelayedVisibleLocator:
+        return DelayedVisibleLocator(selector, self)
+
+
 class MockSessionManager:
     def has_storage_state(self, account_id: str) -> bool:
         return True
@@ -258,6 +363,26 @@ class MockBrowserManager:
 
     def save_session(self, account_id: str) -> None:
         self.saved_accounts.append(account_id)
+
+
+def test_first_visible_selector_honors_configured_timeout_for_delayed_spa_visibility() -> None:
+    page = DelayedVisiblePage(visible_after_attempts=5)
+    plugin = BalePlugin()
+
+    result = plugin._first_visible_selector(page, ['[aria-label="message-item"]'], timeout_ms=7000)
+
+    assert result == '[aria-label="message-item"]'
+    assert page.wait_attempts == 5
+    assert max(page.timeouts) <= 150
+
+
+def test_first_visible_selector_returns_none_on_deterministic_timeout() -> None:
+    page = MockPage(visible_selectors=set())
+    plugin = BalePlugin()
+
+    result = plugin._first_visible_selector(page, ['[aria-label="message-item"]'], timeout_ms=0)
+
+    assert result is None
 
 
 class PreviewChannelPage(MockPage):
@@ -335,7 +460,7 @@ class OpenMessageForwardPage(SourceChannelReadinessPage):
     picker_selector = '[role="dialog"]'
     recipient_search_selector = '[data-clinicos-recipient-search="0"]'
     recipient_result_selector = '[data-clinicos-recipient-result="0"]'
-    confirm_selector = '[data-clinicos-forward-confirm="0"]'
+    confirm_selector = '.ReactModal__Overlay [role="button"][aria-label="send-button-forward-messages"][data-testid="bold-send2-icon"]'
 
     def __init__(
         self,
@@ -351,7 +476,7 @@ class OpenMessageForwardPage(SourceChannelReadinessPage):
         search_input_found: bool = True,
         confirm_found: bool = True,
         verify_success: bool = True,
-        success_toast_text: str = "sent to 1 chat",
+        success_toast_text: str = "Post forwarded to Bale-000001.",
         footer_chips_outside_picker: bool = False,
         click_diagnostic_safe: bool = True,
         delayed_extra_selected_after_target: list[str] | None = None,
@@ -642,18 +767,26 @@ class OpenMessageForwardPage(SourceChannelReadinessPage):
             return {
                 "marker": "clinicos_bale_forward_confirm_button_state",
                 "confirm_button_selector": self.confirm_selector if self.confirm_found else "",
-                "candidate_debug": [{"text": "Forward", "aria_label": "Forward", "role": "button", "className": "send", "enabled": self.confirm_found, "status": "candidate"}],
+                "final_forward_dom_count": 1 if self.confirm_found else 0,
+                "final_forward_visible_count": 1 if self.confirm_found else 0,
+                "final_forward_enabled_count": 1 if self.confirm_found else 0,
+                "final_forward_hit_testable_count": 1 if self.confirm_found else 0,
+                "candidate_debug": [{"text": "", "aria_label": "send-button-forward-messages", "data_testid": "bold-send2-icon", "role": "button", "className": "BXzXRs MP1wNu RD47nz rW9kCA", "icon_aria_label": "BoldSend2-icon", "enabled": self.confirm_found, "status": "candidate"}],
             }
         if "clinicos_bale_forward_success_state" in script:
-            multi_recipient = "2 chat" in self.success_toast_text or "2 chats" in self.success_toast_text
-            one_recipient = "1 chat" in self.success_toast_text or "1 chats" in self.success_toast_text
+            expected_name = str(args[0] if args else "Bale-000001")
+            expected_text = f"Post forwarded to {expected_name}."
+            explicit_success = bool(self.confirm_clicked and self.verify_success and expected_text in self.success_toast_text)
             return {
                 "marker": "clinicos_bale_forward_success_state",
                 "recipient_picker_visible": False if self.confirm_clicked and self.verify_success else self.picker_visible,
-                "forward_verified": bool(self.confirm_clicked and self.verify_success and not multi_recipient),
-                "verification_method": "recipient_picker_closed" if self.confirm_clicked and self.verify_success else "",
+                "forward_verified": explicit_success,
+                "send_success_verified": explicit_success,
+                "verification_method": "explicit_success_toast" if explicit_success else "",
+                "verification_evidence": expected_text if explicit_success else "",
+                "remote_message_id": None,
                 "success_toast_text": self.success_toast_text if self.confirm_clicked and self.verify_success else "",
-                "verified_forward_recipient_count": 2 if multi_recipient else (1 if one_recipient else 0),
+                "verified_forward_recipient_count": 1 if explicit_success else 0,
             }
         return super().evaluate(script)
 
@@ -4181,7 +4314,7 @@ def test_forward_message_to_contact_exact_recipient_confirmed_and_verified() -> 
     assert result["confirm_button_selector"] == OpenMessageForwardPage.confirm_selector
     assert result["confirm_clicked"] is True
     assert result["forward_verified"] is True
-    assert result["verification_method"] == "recipient_picker_closed"
+    assert result["verification_method"] == "explicit_success_toast"
     assert result["clicks_before_search"] == 0
     assert result["search_input_value"] == "Bale-000001"
     assert result["search_input_selector"] == OpenMessageForwardPage.recipient_search_selector
@@ -4207,7 +4340,7 @@ def test_forward_message_to_contact_exact_recipient_confirmed_and_verified() -> 
     assert result["diagnostics_consistency_errors"] == []
     assert [item["category"] for item in result["click_classifications"]] == ["exact_recipient_select", "forward_confirm"]
     assert result["destructive_click_classifications"] == result["click_classifications"]
-    assert result["success_toast_text"] == "sent to 1 chat"
+    assert result["success_toast_text"] == "Post forwarded to Bale-000001."
     assert result["verified_forward_recipient_count"] == 1
     assert result["effective_source_channel_uid"] == "5613544284"
     assert page.final_forwarded_recipients == ["Bale-000001"]
@@ -4454,33 +4587,34 @@ def test_forward_message_to_contact_forward_success_verification_required() -> N
     assert result["forward_verified"] is False
 
 
-def test_forward_message_to_contact_success_toast_for_two_chats_rejected() -> None:
-    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="sent to 2 chats")
+def test_forward_message_to_contact_toast_naming_another_recipient_rejected() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="Post forwarded to Bale-000002.")
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
     result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
 
     assert result["success"] is False
-    assert result["error_code"] == "unexpected_forward_recipient_count"
+    assert result["error_code"] == "forward_not_verified"
     assert result["confirm_clicked"] is True
     assert result["confirm_click_count"] == 1
-    assert result["success_toast_text"] == "sent to 2 chats"
-    assert result["verified_forward_recipient_count"] == 2
-    assert result["verified_forwarded_recipient_count"] == 2
-    assert result["final_forwarded_recipient_count"] == 2
+    assert result["success_toast_text"] == "Post forwarded to Bale-000002."
+    assert result["verified_forward_recipient_count"] == 0
 
 
-def test_forward_message_to_contact_one_recipient_success_toast_accepted() -> None:
-    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="sent to 1 chat")
+def test_forward_message_to_contact_exact_success_toast_accepted() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="Post forwarded to Bale-000001.")
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
     result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
 
     assert result["success"] is True
     assert result["confirm_click_count"] == 1
-    assert result["success_toast_text"] == "sent to 1 chat"
+    assert result["success_toast_text"] == "Post forwarded to Bale-000001."
     assert result["diagnostics_consistent"] is True
     assert result["verified_forwarded_recipient_count"] == 1
     assert result["verified_forward_recipient_count"] == 1
     assert result["final_forwarded_recipient_count"] == 1
+    assert result["verification_method"] == "explicit_success_toast"
+    assert result["verification_evidence"] == "Post forwarded to Bale-000001."
+    assert result["remote_message_id"] is None
     assert result["selected_names_before_confirm"] == ["Bale-000001"]
     assert page.final_forwarded_recipients == ["Bale-000001"]
 
@@ -4490,14 +4624,51 @@ def test_forward_message_to_contact_picker_closure_alone_does_not_count_verified
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
     result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000001")
 
-    assert result["success"] is True
-    assert result["forward_verified"] is True
+    assert result["success"] is False
+    assert result["error_code"] == "forward_not_verified"
+    assert result["forward_verified"] is False
     assert result["success_toast_text"] == ""
-    assert result["verified_forwarded_recipient_count"] == 0
+
+
+def test_forward_success_state_rejects_click_or_dialog_closure_without_explicit_signal() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="")
+    page.confirm_clicked = True
+    page.picker_visible = False
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._forward_success_state(page, "Bale-000001")
+
+    assert result["send_success_verified"] is False
+    assert result["verification_method"] == ""
     assert result["verified_forward_recipient_count"] == 0
-    assert result["final_forwarded_recipient_count"] == 0
-    assert result["diagnostics_consistent"] is False
-    assert "forward_verified_without_single_verified_recipient_count" in result["diagnostics_consistency_errors"]
+
+
+def test_forward_success_state_accepts_explicit_success_toast() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="Post forwarded to Bale-000001.")
+    page.confirm_clicked = True
+    page.picker_visible = False
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._forward_success_state(page, "Bale-000001")
+
+    assert result["send_success_verified"] is True
+    assert result["verification_method"] == "explicit_success_toast"
+    assert result["verification_evidence"] == "Post forwarded to Bale-000001."
+    assert result["remote_message_id"] is None
+
+
+def test_forward_success_state_rejects_non_toast_evidence() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000001"], success_toast_text="")
+    page.confirm_clicked = True
+    page.picker_visible = False
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin._forward_success_state(page, "Bale-000001")
+
+    assert result["send_success_verified"] is False
+    assert result["verification_method"] == ""
+    assert result["verification_evidence"] == ""
+    assert result["remote_message_id"] is None
 
 
 def test_forward_message_to_contact_diagnostics_report_missing_channel_verification() -> None:
@@ -4511,7 +4682,7 @@ def test_forward_message_to_contact_diagnostics_report_missing_channel_verificat
         "effective_source_channel_uid": "5613544284",
         "channel_uid_verified": False,
         "selected_names_before_confirm": ["Bale-000001"],
-        "success_toast_text": "sent to 1 chat",
+        "success_toast_text": "Post forwarded to Bale-000001.",
         "step_results": [],
     }
 
@@ -4851,7 +5022,7 @@ def test_forward_latest_channel_message_action5_guards_and_confirm_once_remain_a
         account_store.save_source_channel("bale_orchestrator", "5613544284")
         previous_account_store = bale_plugin_module.bale_account_store
         bale_plugin_module.bale_account_store = account_store
-        page = _forward_latest_page(recipients=["Bale-000001"], success_toast_text="sent to 2 chats")
+        page = _forward_latest_page(recipients=["Bale-000001"], success_toast_text="Post forwarded to Bale-000002.")
         plugin = BalePlugin(browser_manager=MockBrowserManager(page))
         plugin.contact_store = BaleContactStore(Path(tmp_dir) / "contacts.json")
         try:
@@ -4860,9 +5031,9 @@ def test_forward_latest_channel_message_action5_guards_and_confirm_once_remain_a
             bale_plugin_module.bale_account_store = previous_account_store
 
     assert result["success"] is False
-    assert result["error_code"] == "unexpected_forward_recipient_count"
+    assert result["error_code"] == "forward_not_verified"
     assert result["confirm_click_count"] == 1
-    assert result["verified_forwarded_recipient_count"] == 2
+    assert result["verified_forwarded_recipient_count"] == 0
 
 
 def test_forward_latest_channel_message_failed_contact_save_blocks_forwarding() -> None:
@@ -4949,7 +5120,7 @@ def test_forward_latest_channel_message_route_persists_diagnostics_and_metadata(
                 "exact_match_count": 1,
                 "selected_names_before_confirm": ["Bale-000001"],
                 "confirm_click_count": 1,
-                "success_toast_text": "sent to 1 chat",
+                "success_toast_text": "Post forwarded to Bale-000001.",
                 "verified_forwarded_recipient_count": 1,
                 "forward_verified": True,
                 "diagnostics_consistent": True,
@@ -6551,6 +6722,8 @@ def test_can_account_run_scenario_returns_reason() -> None:
 
 
 if __name__ == "__main__":
+    test_first_visible_selector_honors_configured_timeout_for_delayed_spa_visibility()
+    test_first_visible_selector_returns_none_on_deterministic_timeout()
     test_bale_plugin_loads()
     test_scenario_files_parse()
     test_selectors_exist()
@@ -6699,9 +6872,12 @@ if __name__ == "__main__":
     test_forward_message_to_contact_preselected_recipient_blocks_target_selection_and_confirm()
     test_forward_message_to_contact_confirmation_button_required()
     test_forward_message_to_contact_forward_success_verification_required()
-    test_forward_message_to_contact_success_toast_for_two_chats_rejected()
-    test_forward_message_to_contact_one_recipient_success_toast_accepted()
+    test_forward_message_to_contact_toast_naming_another_recipient_rejected()
+    test_forward_message_to_contact_exact_success_toast_accepted()
     test_forward_message_to_contact_picker_closure_alone_does_not_count_verified_recipient()
+    test_forward_success_state_rejects_click_or_dialog_closure_without_explicit_signal()
+    test_forward_success_state_accepts_explicit_success_toast()
+    test_forward_success_state_rejects_non_toast_evidence()
     test_forward_message_to_contact_diagnostics_report_missing_channel_verification()
     test_forward_message_to_contact_selection_only_click_element_belongs_to_target_row()
     test_forward_message_to_contact_selection_only_resets_preselected_without_cleanup_clicks()

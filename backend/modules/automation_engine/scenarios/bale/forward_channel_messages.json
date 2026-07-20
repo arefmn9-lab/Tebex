@@ -1,5 +1,5 @@
 {
-  "id": "bale.forward_channel_messages",
+  "id": "bale.forward_channel_message.linear.v1",
   "platform": "bale",
   "operation": "forward_channel_messages",
   "required_context": [
@@ -11,66 +11,32 @@
     "operation_mode",
     "allow_final_send"
   ],
-  "context": {
-    "operation_mode": "inspect_only",
-    "allow_final_send": false
-  },
   "elements": {
-    "source_timeline": {
-      "selectors": [
-        "#message_list_scroller_id",
-        "[data-testid*='message-list']",
-        "[data-testid*='messages']",
-        "[class*='message']",
-        "[aria-label='message-item']"
-      ],
-      "timeout_ms": 10000
+    "source_message_items": {
+      "selector": "[aria-label=\"message-item\"]",
+      "timeout_ms": 7000
     },
-    "latest_source_message": {
-      "selectors": [
-        "[aria-label='message-item']",
-        ".message-item",
-        "._message-item",
-        ".message-block"
-      ],
-      "timeout_ms": 5000
+    "message_forward_control": {
+      "selector": "[data-testid=\"message-side-option-forward\"]",
+      "timeout_ms": 3000
     },
-    "forward_picker": {
-      "selectors": [
-        "[role='dialog']",
-        "[class*='Modal']"
-      ],
-      "timeout_ms": 5000
+    "recipient_search_input": {
+      "selector": ".ReactModal__Overlay input[placeholder=\"\u062c\u0633\u062a\u062c\u0648\u06cc \u0645\u062e\u0627\u0637\u0628\u060c \u06af\u0631\u0648\u0647\u060c \u06a9\u0627\u0646\u0627\u0644 \u0648 \u0646\u0627\u0645\u200c\u06a9\u0627\u0631\u0628\u0631\u06cc...\"]",
+      "timeout_ms": 4000
     },
-    "recipient_search": {
-      "selectors": [
-        "[role='dialog'] input[type='search']",
-        "[role='dialog'] [role='searchbox']",
-        "[role='dialog'] input"
-      ],
-      "timeout_ms": 5000
+    "recipient_result_rows": {
+      "selector": ".ReactModal__Overlay .qHFpb6",
+      "timeout_ms": 4000
     },
-    "recipient_result": {
-      "selectors": [
-        "[role='dialog'] [role='listitem']",
-        "[role='dialog'] [aria-label='dialog-item']",
-        "[role='dialog'] [role='button']"
-      ],
-      "timeout_ms": 5000
-    },
-    "final_forward_confirmation": {
-      "selectors": [
-        "[role='dialog'] [data-testid*='send']",
-        "[role='dialog'] [aria-label*='Send']",
-        "[role='dialog'] [aria-label*='Forward']"
-      ],
-      "timeout_ms": 5000,
+    "final_forward_button": {
+      "selector": ".ReactModal__Overlay [role=\"button\"][aria-label=\"send-button-forward-messages\"][data-testid=\"bold-send2-icon\"]",
+      "timeout_ms": 4000,
       "destructive": true
     }
   },
   "steps": [
     {
-      "id": "validate_operation_mode",
+      "id": "validate_context",
       "action": "call_platform_primitive",
       "name": "validate_operation_mode",
       "params": {
@@ -79,79 +45,90 @@
       }
     },
     {
-      "id": "open_exact_source",
+      "id": "open_source",
       "action": "navigate",
       "url": "{{source_url}}",
-      "timeout_ms": 30000
-    },
-    {
-      "id": "verify_source_chat_selected",
-      "action": "call_platform_primitive",
-      "name": "verify_source_chat",
-      "params": {
-        "source_uid": "{{source_uid}}",
-        "source_url": "{{source_url}}"
-      }
-    },
-    {
-      "id": "verify_source_timeline",
-      "action": "wait_for",
-      "element": "source_timeline",
       "timeout_ms": 10000
     },
     {
-      "id": "stop_after_inspection",
+      "id": "wait_source_message",
+      "action": "wait_for",
+      "element": "source_message_items",
+      "timeout_ms": 7000
+    },
+    {
+      "id": "inspect_only_stop",
       "action": "stop",
       "when": "context.operation_mode == 'inspect_only'",
       "stopped_before_send": true,
-      "reason": "inspect_only"
+      "reason": "inspect_only_complete"
     },
     {
-      "id": "select_configured_source_message",
+      "id": "select_latest_message",
       "action": "call_platform_primitive",
-      "name": "select_source_message",
-      "params": {
-        "selection_policy": "{{source_message_selector}}"
-      }
-    },
-    {
-      "id": "open_forward_picker",
-      "action": "call_platform_primitive",
-      "name": "open_forward_picker",
+      "name": "select_latest_message",
       "params": {}
     },
     {
-      "id": "verify_forward_picker",
-      "action": "assert_visible",
-      "element": "forward_picker"
+      "id": "hover_latest_message",
+      "action": "call_platform_primitive",
+      "name": "hover_latest_message",
+      "params": {}
     },
     {
-      "id": "search_recipient_display_name",
+      "id": "open_forward_picker",
+      "action": "click",
+      "element": "message_forward_control",
+      "timeout_ms": 3000
+    },
+    {
+      "id": "wait_recipient_search",
+      "action": "wait_for",
+      "element": "recipient_search_input",
+      "timeout_ms": 4000
+    },
+    {
+      "id": "type_recipient_name",
       "action": "fill",
-      "element": "recipient_search",
-      "value": "{{recipient_display_name}}"
+      "element": "recipient_search_input",
+      "value": "{{recipient_display_name}}",
+      "timeout_ms": 4000
     },
     {
-      "id": "choose_exact_recipient",
+      "id": "wait_recipient_results",
+      "action": "wait_for",
+      "element": "recipient_result_rows",
+      "timeout_ms": 4000
+    },
+    {
+      "id": "select_first_recipient_result",
       "action": "choose_from_list",
-      "element": "recipient_result",
-      "exact_text": "{{recipient_display_name}}"
+      "element": "recipient_result_rows",
+      "exact_text": "{{recipient_display_name}}",
+      "timeout_ms": 4000
     },
     {
-      "id": "record_recipient_selected",
-      "action": "record_result",
-      "name": "recipient_resolved",
-      "value": true
-    },
-    {
-      "id": "stop_after_selection",
+      "id": "selection_only_stop",
       "action": "stop",
-      "when": "context.operation_mode in ['selection_only', 'no_send']",
+      "when": "context.operation_mode == 'selection_only'",
       "stopped_before_send": true,
-      "reason": "non_send_mode"
+      "reason": "selection_only_complete"
     },
     {
-      "id": "fail_closed_without_final_send_authorization",
+      "id": "wait_final_confirmation",
+      "action": "wait_for",
+      "element": "final_forward_button",
+      "timeout_ms": 4000
+    },
+    {
+      "id": "no_send_stop",
+      "action": "stop",
+      "when": "context.operation_mode == 'no_send'",
+      "stopped_before_send": true,
+      "reason": "no_send_boundary_reached"
+    },
+    {
+      "id": "authorize_live_send",
       "action": "stop",
       "when": "context.operation_mode == 'live_send' AND context.allow_final_send != true",
       "ok": false,
@@ -160,13 +137,14 @@
       "reason": "final_send_not_authorized"
     },
     {
-      "id": "confirm_forward_send",
+      "id": "click_final_forward_once",
       "action": "click",
       "when": "context.operation_mode == 'live_send' AND context.allow_final_send == true",
-      "element": "final_forward_confirmation"
+      "element": "final_forward_button",
+      "timeout_ms": 4000
     },
     {
-      "id": "record_final_send_invoked",
+      "id": "complete",
       "action": "record_result",
       "when": "context.operation_mode == 'live_send' AND context.allow_final_send == true",
       "name": "final_send_invoked",

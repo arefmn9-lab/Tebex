@@ -477,7 +477,7 @@ class BalePlugin:
                     return finish(
                         False,
                         "bale_install_prompt",
-                        "صفحه راهنمای نصب بله نمایش داده شده است. روی «متوجه شدم» بزنید و وارد بله شوید.",
+                        "ØµÙØ­Ù‡ Ø±Ø§Ù‡Ù†Ù…Ø§ÛŒ Ù†ØµØ¨ Ø¨Ù„Ù‡ Ù†Ù…Ø§ÛŒØ´ Ø¯Ø§Ø¯Ù‡ Ø´Ø¯Ù‡ Ø§Ø³Øª. Ø±ÙˆÛŒ Â«Ù…ØªÙˆØ¬Ù‡ Ø´Ø¯Ù…Â» Ø¨Ø²Ù†ÛŒØ¯ Ùˆ ÙˆØ§Ø±Ø¯ Ø¨Ù„Ù‡ Ø´ÙˆÛŒØ¯.",
                         "verify_login",
                         diagnostics,
                     )
@@ -1895,7 +1895,7 @@ class BalePlugin:
                         error_code = "target_selection_not_verified"
                     return finish(False, error_code, "Forward confirmation blocked because the selected recipient set was not exactly the requested target", "verify_target_recipient_before_confirm", {"recipient_picker_visible": True, "recipient_search_selector": search_selector, "search_input_selector": search_selector, "exact_recipient_found": True, "exact_match_count": len(exact_matches), "recipient_result_selector": recipient_selector, "recipient_selected": bool(selected_count_before_confirm), "confirm_button_selector": confirm_selector, "selected_count_before_target": selected_count_before_target, "selected_count_after_target": selected_count_after_target, "selected_names_after_target": selected_names_after_target, "selected_count_before_confirm": selected_count_before_confirm, "selected_names_before_confirm": selected_names_before_confirm, "screenshot_path": screenshot_path, "final_page_url": _safe_page_url(page), **self._forward_failure_debug(page), "recipient_candidates": candidates})
 
-                if not confirm_selector.startswith('[data-clinicos-forward-confirm='):
+                if confirm_selector != '.ReactModal__Overlay [role="button"][aria-label="send-button-forward-messages"][data-testid="bold-send2-icon"]':
                     return finish(False, "destructive_click_blocked", "Confirm click selector was not classified as forward_confirm", "click_forward_confirm", {"confirm_button_selector": confirm_selector})
                 click_classifications.append({"category": "forward_confirm", "selector": confirm_selector, "status": "allowed"})
                 destructive_clicks_attempted += 1
@@ -1913,7 +1913,7 @@ class BalePlugin:
 
                 last_successful_step = "click_forward_confirm"
                 _safe_wait_for_timeout(page, 800)
-                verify_state = self._forward_success_state(page)
+                verify_state = self._forward_success_state(page, display_name)
                 verified_forward_recipient_count = int(verify_state.get("verified_forward_recipient_count") or 0)
                 if verified_forward_recipient_count > 1:
                     screenshot_path = _save_login_debug_screenshot(page, account_id)
@@ -2306,8 +2306,8 @@ class BalePlugin:
         selected_before_confirm = payload.get("selected_names_before_confirm") if isinstance(payload.get("selected_names_before_confirm"), list) else []
         selected_single_target = len(selected_before_confirm) == 1 and str(selected_before_confirm[0]).strip() == target
         toast = str(payload.get("success_toast_text") or "")
-        multi_toast = bool(re.search(r"(?:\b[2-9]\b|[۲-۹٢-٩]|two|three|four|five|six|seven|eight|nine|دو|سه|چند)\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)", toast, re.IGNORECASE))
-        single_toast = bool(target and target in toast) or bool(re.search(r"(?:\b1\b|[۱١]|one|یک)\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)", toast, re.IGNORECASE))
+        multi_toast = bool(re.search(r"(?:\b[2-9]\b|[Û²-Û¹Ù¢-Ù©]|two|three|four|five|six|seven|eight|nine|Ø¯Ùˆ|Ø³Ù‡|Ú†Ù†Ø¯)\s*(?:chat|chats|Ú¯ÙØªÚ¯Ùˆ|Ú¯ÙØªâ€ŒÙˆÚ¯Ùˆ|Ú†Øª)", toast, re.IGNORECASE))
+        single_toast = bool(target and target in toast) or bool(re.search(r"(?:\b1\b|[Û±Ù¡]|one|ÛŒÚ©)\s*(?:chat|chats|Ú¯ÙØªÚ¯Ùˆ|Ú¯ÙØªâ€ŒÙˆÚ¯Ùˆ|Ú†Øª)", toast, re.IGNORECASE))
         canonical_count = 0
         if multi_toast:
             canonical_count = 2
@@ -2454,7 +2454,7 @@ class BalePlugin:
             )
             raise BalePluginError(
                 "bale_install_prompt",
-                "صفحه راهنمای نصب بله نمایش داده شده است. روی «متوجه شدم» بزنید و وارد بله شوید.",
+                "ØµÙØ­Ù‡ Ø±Ø§Ù‡Ù†Ù…Ø§ÛŒ Ù†ØµØ¨ Ø¨Ù„Ù‡ Ù†Ù…Ø§ÛŒØ´ Ø¯Ø§Ø¯Ù‡ Ø´Ø¯Ù‡ Ø§Ø³Øª. Ø±ÙˆÛŒ Â«Ù…ØªÙˆØ¬Ù‡ Ø´Ø¯Ù…Â» Ø¨Ø²Ù†ÛŒØ¯ Ùˆ ÙˆØ§Ø±Ø¯ Ø¨Ù„Ù‡ Ø´ÙˆÛŒØ¯.",
                 {"login_check": login_check, **self._page_debug_info(page, account_id)},
             )
         if not login_check["logged_in"]:
@@ -2597,7 +2597,7 @@ class BalePlugin:
             if not health.get("ok"):
                 raise BalePluginError(
                     "adspower_unavailable",
-                    "AdsPower در دسترس نیست. برای تست محلی از Chrome معمولی استفاده کنید.",
+                    "AdsPower Ø¯Ø± Ø¯Ø³ØªØ±Ø³ Ù†ÛŒØ³Øª. Ø¨Ø±Ø§ÛŒ ØªØ³Øª Ù…Ø­Ù„ÛŒ Ø§Ø² Chrome Ù…Ø¹Ù…ÙˆÙ„ÛŒ Ø§Ø³ØªÙØ§Ø¯Ù‡ Ú©Ù†ÛŒØ¯.",
                 )
         profile_metadata = {**account, "browser_provider": effective_provider}
         if effective_provider == "native_chrome":
@@ -2860,13 +2860,13 @@ class BalePlugin:
         if contacts_ui_available:
             evidence.append("contacts_ui_available")
 
-        if "qr" in text_lower or "بارکد" in visible_text or "کیوآر" in visible_text:
+        if "qr" in text_lower or "Ø¨Ø§Ø±Ú©Ø¯" in visible_text or "Ú©ÛŒÙˆØ¢Ø±" in visible_text:
             auth_state = "qr_login_required"
             error_code = "authentication_required"
-        elif "کد" in visible_text and ("تایید" in visible_text or "تأیید" in visible_text or "verification" in text_lower):
+        elif "Ú©Ø¯" in visible_text and ("ØªØ§ÛŒÛŒØ¯" in visible_text or "ØªØ£ÛŒÛŒØ¯" in visible_text or "verification" in text_lower):
             auth_state = "verification_code_required"
             error_code = "authentication_required"
-        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["مسدود", "محدود"]):
+        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["Ù…Ø³Ø¯ÙˆØ¯", "Ù…Ø­Ø¯ÙˆØ¯"]):
             auth_state = "account_restricted"
             error_code = "account_restricted"
         elif install_prompt:
@@ -3119,9 +3119,9 @@ class BalePlugin:
           const panelText = textOf(effectivePanel).slice(0, 1000);
           const messageCount = effectivePanel ? Array.from(effectivePanel.querySelectorAll(messageSelector)).filter(visible).length : 0;
           const pageText = textOf(document.body).slice(0, 1000);
-          const authVisible = /ورود|login|log in|phone|شماره|کد تایید|otp/i.test(pageText);
-          const loadingVisible = /loading|در حال|لطفا صبر|please wait/i.test(pageText);
-          const emptyVisible = /empty|پیامی|هنوز/i.test(pageText) && messageCount === 0;
+          const authVisible = /ÙˆØ±ÙˆØ¯|login|log in|phone|Ø´Ù…Ø§Ø±Ù‡|Ú©Ø¯ ØªØ§ÛŒÛŒØ¯|otp/i.test(pageText);
+          const loadingVisible = /loading|Ø¯Ø± Ø­Ø§Ù„|Ù„Ø·ÙØ§ ØµØ¨Ø±|please wait/i.test(pageText);
+          const emptyVisible = /empty|Ù¾ÛŒØ§Ù…ÛŒ|Ù‡Ù†ÙˆØ²/i.test(pageText) && messageCount === 0;
           const ready = Boolean(effectivePanel && stream && messageCount > 0 && !authVisible);
           return {
             marker: "clinicos_bale_source_channel_readiness",
@@ -3205,14 +3205,14 @@ class BalePlugin:
           const isDateRow = (text, node) => {
             const cls = String(node.className || "");
             if (/Wqgb2D|date|Date/i.test(cls)) return true;
-            if (/^(امروز|دیروز|پریروز)$/.test(text)) return true;
+            if (/^(Ø§Ù…Ø±ÙˆØ²|Ø¯ÛŒØ±ÙˆØ²|Ù¾Ø±ÛŒØ±ÙˆØ²)$/.test(text)) return true;
             if (/^\\d{1,2}\\s+\\S+$/.test(text) && text.length < 32) return true;
             return false;
           };
           const isServiceRow = (text, node) => {
             const cls = String(node.className || "");
             if (/service|system/i.test(cls)) return true;
-            const serviceMarkers = ["عضو شد", "خارج شد", "پیام سنجاق", "created", "joined", "left", "pinned"];
+            const serviceMarkers = ["Ø¹Ø¶Ùˆ Ø´Ø¯", "Ø®Ø§Ø±Ø¬ Ø´Ø¯", "Ù¾ÛŒØ§Ù… Ø³Ù†Ø¬Ø§Ù‚", "created", "joined", "left", "pinned"];
             return serviceMarkers.some((marker) => text.toLowerCase().includes(marker.toLowerCase())) && text.length < 180;
           };
           const debug = [];
@@ -3443,11 +3443,11 @@ class BalePlugin:
             '[data-testid="message-side-option-forward"]',
             '[data-testid*="message-side-option-forward"]',
             '[data-testid*="forward"]',
-            '[aria-label="بیشتر"]',
-            '[aria-label*="بیشتر"]',
+            '[aria-label="Ø¨ÛŒØ´ØªØ±"]',
+            '[aria-label*="Ø¨ÛŒØ´ØªØ±"]',
             '[aria-label*="More"]',
             '[title*="Forward"]',
-            '[title*="بیشتر"]',
+            '[title*="Ø¨ÛŒØ´ØªØ±"]',
             '[role="button"]',
             'button',
             'svg'
@@ -3472,7 +3472,7 @@ class BalePlugin:
                 const text = textOf(node);
                 const box = visible(node) ? boxOf(node) : null;
                 const label = `${aria} ${title} ${role} ${testid} ${text}`.trim();
-                const looksLikeMenu = /بیشتر|More|more|menu|Menu|options|Options|ellipsis|Forward/i.test(label) || node.tagName === "SVG";
+                const looksLikeMenu = /Ø¨ÛŒØ´ØªØ±|More|more|menu|Menu|options|Options|ellipsis|Forward/i.test(label) || node.tagName === "SVG";
                 const item = {
                   selector,
                   text: text.slice(0, 120),
@@ -3536,7 +3536,7 @@ class BalePlugin:
           };
           document.querySelectorAll("[data-clinicos-forward-option]").forEach((node) => node.removeAttribute("data-clinicos-forward-option"));
           const nodes = Array.from(document.querySelectorAll('[role="menuitem"], [role="button"], button, li, div, span'));
-          const labels = [/^Forward$/i, /فوروارد/, /ارسال\\s*به/, /^ارسال$/];
+          const labels = [/^Forward$/i, /ÙÙˆØ±ÙˆØ§Ø±Ø¯/, /Ø§Ø±Ø³Ø§Ù„\\s*Ø¨Ù‡/, /^Ø§Ø±Ø³Ø§Ù„$/];
           const debug = [];
           let selected = null;
           for (const node of nodes) {
@@ -3610,7 +3610,7 @@ class BalePlugin:
             '[class*="Forward"]',
             'input[type="search"]',
             'input[placeholder*="Search"]',
-            'input[placeholder*="جست"]'
+            'input[placeholder*="Ø¬Ø³Øª"]'
           ];
           const scopedPickerSelectors = ['div.anWA5J'];
           const debug = [];
@@ -3626,7 +3626,7 @@ class BalePlugin:
               }
               const placeholder = search.getAttribute("placeholder") || "";
               const label = `${text} ${placeholder} ${node.getAttribute("aria-label") || ""}`;
-              const pickerLike = /Forward|forward|فوروارد|ارسال|Search|search|جست|انتخاب/.test(label) || selector.includes("input");
+              const pickerLike = /Forward|forward|ÙÙˆØ±ÙˆØ§Ø±Ø¯|Ø§Ø±Ø³Ø§Ù„|Search|search|Ø¬Ø³Øª|Ø§Ù†ØªØ®Ø§Ø¨/.test(label) || selector.includes("input");
               debug.push({selector, text: text.slice(0, 200), placeholder, status: pickerLike ? "candidate" : "observed"});
               if (!selected && pickerLike) selected = node.closest('[role="dialog"], [class*="Modal"], [class*="modal"]') || node;
             }
@@ -3772,12 +3772,12 @@ class BalePlugin:
             const value = normalize(text);
             if (value.length < 3) return {ok: false, reason: "name_too_short"};
             if (/^[\\d\\u06F0-\\u06F9]+$/.test(value)) return {ok: false, reason: "numeric_only"};
-            if (/^(avatar|icon|close|remove|delete|×|x)$/i.test(value)) return {ok: false, reason: "icon_label"};
+            if (/^(avatar|icon|close|remove|delete|Ã—|x)$/i.test(value)) return {ok: false, reason: "icon_label"};
             return {ok: true, reason: ""};
           };
           const picker = Array.from(document.querySelectorAll('div.anWA5J')).find(visible);
           const bodyText = normalize(document.body ? document.body.innerText || document.body.textContent || "" : "");
-          const successToast = /sent to|Forwarded|ارسال شد|بازارسال شد/i.test(bodyText);
+          const successToast = /sent to|Forwarded|Ø§Ø±Ø³Ø§Ù„ Ø´Ø¯|Ø¨Ø§Ø²Ø§Ø±Ø³Ø§Ù„ Ø´Ø¯/i.test(bodyText);
           if (!picker) {
             return {picker_verified: false, picker_structure: {has_picker: false, has_search_input: false, has_list_or_empty_state: false, success_toast_visible: successToast}, selected_row_candidates: [], selected_chip_candidates: [], rejected_selected_candidates: []};
           }
@@ -3789,7 +3789,7 @@ class BalePlugin:
             return {selector: selectorFor(node, ""), tag: node.tagName.toLowerCase(), placeholder: node.getAttribute("placeholder") || "", role: node.getAttribute("role") || "", enabled: !node.disabled, editable: !node.readOnly, bounding_box: boxOf(node)};
           });
           const rows = Array.from(modalRoot.querySelectorAll('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"]')).filter(visible);
-          const hasListOrEmpty = rows.length > 0 || /no result|empty|نتیجه|یافت نشد/i.test(normalize(picker.innerText || picker.textContent || ""));
+          const hasListOrEmpty = rows.length > 0 || /no result|empty|Ù†ØªÛŒØ¬Ù‡|ÛŒØ§ÙØª Ù†Ø´Ø¯/i.test(normalize(picker.innerText || picker.textContent || ""));
           const selectedRows = [];
           const selectedChips = [];
           const rejected = [];
@@ -3827,10 +3827,10 @@ class BalePlugin:
           });
           const chips = chipCandidates.filter((node) => !chipCandidates.some((other) => other !== node && other.contains(node)));
           for (const chip of chips) {
-            const text = normalize(chip.innerText || chip.textContent || "").replace(/^[×xX]\\s*/, "").replace(/\\s*[×xX]$/, "");
+            const text = normalize(chip.innerText || chip.textContent || "").replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, "");
             const name = validName(text);
             const controls = Array.from(chip.querySelectorAll('button, [role="button"], [aria-label], svg')).filter((node) => node instanceof Element && visible(node));
-            const remove = controls.find((node) => /remove|delete|deselect|clear|close|حذف|پاک/i.test(`${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""} ${normalize(node.innerText || node.textContent || "")}`));
+            const remove = controls.find((node) => /remove|delete|deselect|clear|close|Ø­Ø°Ù|Ù¾Ø§Ú©/i.test(`${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""} ${normalize(node.innerText || node.textContent || "")}`));
             if (!name.ok) {
               reject(chip, name.reason, "selected_chip");
               continue;
@@ -3895,20 +3895,6 @@ class BalePlugin:
             const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
             return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
           };
-          const rowParent = (node) => {
-            if (!(node instanceof HTMLElement)) return node;
-            return node.closest('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"], button, a') || node;
-          };
-          const clickableParent = (node) => {
-            let current = node;
-            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
-              if (!(current instanceof HTMLElement)) continue;
-              const role = current.getAttribute("role") || "";
-              const style = window.getComputedStyle(current);
-              if (current.tagName === "BUTTON" || current.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer") return current;
-            }
-            return node;
-          };
           const selectedLike = (node) => {
             if (!(node instanceof HTMLElement)) return false;
             const ariaSelected = node.getAttribute("aria-selected") || "";
@@ -3933,7 +3919,7 @@ class BalePlugin:
             const text = normalize(value);
             if (text.length < 3) return false;
             if (/^[\\d\\u06F0-\\u06F9\\u0660-\\u0669]+$/.test(text)) return false;
-            if (/^[×xX+\\-–—•·\\.،,؛:;!?\\s]+$/.test(text)) return false;
+            if (/^[Ã—xX+\\-â€“â€”â€¢Â·\\.ØŒ,Ø›:;!?\\s]+$/.test(text)) return false;
             if (/^(close|remove|delete|clear|cancel|back|forward|send|confirm)$/i.test(text)) return false;
             return true;
           };
@@ -3999,17 +3985,17 @@ class BalePlugin:
               const horizontallyInsideModal = rect.left >= pickerRect.left - 8 && rect.right <= pickerRect.right + 8;
               if (!horizontallyInsideModal) return false;
               const text = normalize(node.innerText || node.textContent || "");
-              if (/حذف|رونوشت|اشتراک|افزودن|پیوند|copy|share|link|story/i.test(text)) return false;
+              if (/Ø­Ø°Ù|Ø±ÙˆÙ†ÙˆØ´Øª|Ø§Ø´ØªØ±Ø§Ú©|Ø§ÙØ²ÙˆØ¯Ù†|Ù¾ÛŒÙˆÙ†Ø¯|copy|share|link|story/i.test(text)) return false;
               if (!text || text.length > 120) return false;
               if (rect.y < pickerRect.bottom - 140 || rect.y > pickerRect.bottom - 35) return false;
               if (rect.width < 40 || rect.width > 260 || rect.height < 18 || rect.height > 60) return false;
-              if (/جستجو|نوشتن|توضیحات|بازارسال|Forward|Send|Confirm/i.test(text)) return false;
-              return validRecipientName(text.replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, ""));
+              if (/Ø¬Ø³ØªØ¬Ùˆ|Ù†ÙˆØ´ØªÙ†|ØªÙˆØ¶ÛŒØ­Ø§Øª|Ø¨Ø§Ø²Ø§Ø±Ø³Ø§Ù„|Forward|Send|Confirm/i.test(text)) return false;
+              return validRecipientName(text.replace(/^[Ãƒâ€”xX]\\s*/, "").replace(/\\s*[Ãƒâ€”xX]$/, ""));
             });
             const chipNodes = chipCandidates.filter((node) => !chipCandidates.some((other) => other !== node && other.contains(node)));
             for (const node of chipNodes) {
-              const text = normalize(node.innerText || node.textContent || "").replace(/^×\\s*/, "").replace(/\\s*×$/, "");
-              const chipText = normalize(text.replace(/^[×xX]\\s*/, "").replace(/\\s*[×xX]$/, ""));
+              const text = normalize(node.innerText || node.textContent || "").replace(/^Ã—\\s*/, "").replace(/\\s*Ã—$/, "");
+              const chipText = normalize(text.replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, ""));
               if (!chipText || chipText.length > 120 || !validRecipientName(chipText)) continue;
               const childControls = Array.from(node.querySelectorAll('svg, button, [role="button"], [aria-label]')).filter((child) => child instanceof HTMLElement && visible(child));
               const click = childControls.find((child) => {
@@ -4023,7 +4009,7 @@ class BalePlugin:
               if (!(node instanceof Element) || !visible(node)) return false;
               const rect = node.getBoundingClientRect();
               const label = `${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""} ${normalize(node.innerText || node.textContent || "")}`;
-              return rect.y >= pickerRect.bottom - 150 && rect.y <= pickerRect.bottom - 20 && /close|remove|delete|deselect|clear|Ã—|x|Ø­Ø°Ù|Ù¾Ø§Ú©/i.test(label);
+              return rect.y >= pickerRect.bottom - 150 && rect.y <= pickerRect.bottom - 20 && /close|remove|delete|deselect|clear|Ãƒâ€”|x|Ã˜Â­Ã˜Â°Ã™Â|Ã™Â¾Ã˜Â§ÃšÂ©/i.test(label);
             });
             for (const control of removeControls) {
               let chip = control.parentElement;
@@ -4031,7 +4017,7 @@ class BalePlugin:
                 if (!(chip instanceof HTMLElement) || !visible(chip)) continue;
                 const rect = chip.getBoundingClientRect();
                 if (rect.width < 40 || rect.width > 280 || rect.height < 18 || rect.height > 80) continue;
-                const chipText = normalize(chip.innerText || chip.textContent || "").replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, "");
+                const chipText = normalize(chip.innerText || chip.textContent || "").replace(/^[Ãƒâ€”xX]\\s*/, "").replace(/\\s*[Ãƒâ€”xX]$/, "");
                 if (!chipText || chipText.length > 120 || !validRecipientName(chipText)) continue;
                 pushSelected(chip, control, chipText, "selected_chip", control);
                 break;
@@ -4089,20 +4075,6 @@ class BalePlugin:
             const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
             return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
           };
-          const rowParent = (node) => {
-            if (!(node instanceof HTMLElement)) return node;
-            return node.closest('.qHFpb6, .dialog-item-content, [role="listitem"], [role="button"], button, a') || node;
-          };
-          const clickableParent = (node) => {
-            let current = node;
-            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
-              if (!(current instanceof HTMLElement)) continue;
-              const role = current.getAttribute("role") || "";
-              const style = window.getComputedStyle(current);
-              if (current.tagName === "BUTTON" || current.tagName === "A" || role === "button" || role === "listitem" || style.cursor === "pointer") return current;
-            }
-            return node;
-          };
           const nameElementFor = (row) => {
             if (!(row instanceof HTMLElement)) return null;
             const preferredSelectors = [
@@ -4135,39 +4107,39 @@ class BalePlugin:
           const loadingIndicatorVisible = Boolean(picker && Array.from(picker.querySelectorAll('[class*="loading"], [class*="Loading"], [data-testid*="loading"], [aria-label*="loading"], svg, img')).find((node) => {
             if (!visible(node)) return false;
             const label = `${node.getAttribute("aria-label") || ""} ${node.getAttribute("data-testid") || ""} ${String(node.className || "")} ${normalize(node.innerText || node.textContent || "")}`;
-            return /loading|spinner|progress|در حال|بارگذاری/i.test(label);
+            return /loading|spinner|progress|Ø¯Ø± Ø­Ø§Ù„|Ø¨Ø§Ø±Ú¯Ø°Ø§Ø±ÛŒ/i.test(label);
           }));
-          const broadNodes = picker ? Array.from(picker.querySelectorAll('[role="listitem"], [role="button"], button, a, div')) : [];
-          const rowNodes = picker ? Array.from(picker.querySelectorAll('.qHFpb6, [role="listitem"], [role="button"], button, a')) : [];
-          const nodes = rowNodes.length ? rowNodes : broadNodes;
+          const rowSelector = '.ReactModal__Overlay .qHFpb6';
+          const allRows = Array.from(document.querySelectorAll(rowSelector));
+          const nodes = allRows.filter((node) => picker && picker.contains(node) && visible(node));
           const target = normalize(displayName);
           const candidates = [];
           const seen = new Set();
-          for (const node of nodes) {
-            if (!visible(node)) continue;
-            const text = normalize(node.innerText || node.textContent || "");
-            const aria = normalize(node.getAttribute("aria-label") || "");
-            const title = normalize(node.getAttribute("title") || "");
+          for (const [visibleIndex, row] of nodes.entries()) {
+            const rowIndex = allRows.indexOf(row);
+            const text = normalize(row.innerText || row.textContent || "");
+            const aria = normalize(row.getAttribute("aria-label") || "");
+            const title = normalize(row.getAttribute("title") || "");
             const combined = normalize(`${text} ${aria} ${title}`);
             if (!combined || combined.length > 500) continue;
             const hasTarget = text === target || aria === target || title === target || combined.includes(target);
             if (!hasTarget) continue;
-            const row = rowParent(node);
             const rowText = normalize(row.innerText || row.textContent || text);
             const rowAria = normalize(row.getAttribute("aria-label") || aria);
             const rowTitle = normalize(row.getAttribute("title") || title);
             const nameElement = nameElementFor(row);
             const rowName = nameElement ? target : "";
             const exactWithinRow = rowName === target;
-            const click = nameElement || clickableParent(row);
-            const key = selectorFor(click, "") || `${rowText}|${rowAria}|${rowTitle}`;
+            const key = `${rowIndex}|${rowText}|${rowAria}|${rowTitle}`;
             if (seen.has(key)) continue;
             seen.add(key);
-            const index = candidates.length;
-            click.setAttribute("data-clinicos-recipient-result", String(index));
+            const rowClickSelector = `${rowSelector}:has(.oUKPfP:text-is(${JSON.stringify(target)}))`;
             candidates.push({
-              selector: selectorFor(row, ""),
-              click_selector: selectorFor(click, `[data-clinicos-recipient-result="${index}"]`),
+              selector: rowClickSelector,
+              click_selector: rowClickSelector,
+              row_selector: rowSelector,
+              row_index: rowIndex,
+              visible_index: visibleIndex,
               text: rowText,
               row_name: rowName,
               normalized_name: rowName,
@@ -4215,6 +4187,75 @@ class BalePlugin:
             return str(page.evaluate(script, search_selector) or "")
         except Exception:
             return ""
+
+    def _select_last_visible_fixed(self, page: Any, selector: str) -> dict[str, Any]:
+        script = """
+        (selector) => {
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          document.querySelectorAll("[data-clinicos-linear-latest-message]").forEach((node) => node.removeAttribute("data-clinicos-linear-latest-message"));
+          const nodes = Array.from(document.querySelectorAll(selector)).filter(visible);
+          const selected = nodes[nodes.length - 1] || null;
+          if (!selected) return {ok: false, selector, visible_count: 0, text: ""};
+          selected.setAttribute("data-clinicos-linear-latest-message", "true");
+          return {
+            ok: true,
+            selector: '[data-clinicos-linear-latest-message="true"]',
+            visible_count: nodes.length,
+            text: textOf(selected).slice(0, 500)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script, selector)
+        except Exception as exc:
+            raw = {"ok": False, "message": str(exc)}
+        return raw if isinstance(raw, dict) else {"ok": False, "message": "invalid_select_last_visible_result"}
+
+    def _first_visible_fixed_result(self, page: Any, selector: str, timeout_ms: int = 4000) -> dict[str, Any]:
+        started = time.perf_counter()
+        state: dict[str, Any] = {}
+        while (time.perf_counter() - started) * 1000 <= max(0, timeout_ms):
+            state = self._first_visible_fixed_result_state(page, selector)
+            if state.get("ok"):
+                return state
+            _safe_wait_for_timeout(page, 150)
+        return state or {"ok": False, "visible_result_count": 0, "first_result_text": "", "selector": selector}
+
+    def _first_visible_fixed_result_state(self, page: Any, selector: str) -> dict[str, Any]:
+        script = """
+        (selector) => {
+          const visible = (node) => {
+            if (!node) return false;
+            const rect = node.getBoundingClientRect();
+            const style = window.getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
+          };
+          const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
+          document.querySelectorAll("[data-clinicos-linear-recipient-result]").forEach((node) => node.removeAttribute("data-clinicos-linear-recipient-result"));
+          const nodes = Array.from(document.querySelectorAll(selector)).filter(visible);
+          const first = nodes[0] || null;
+          if (!first) return {ok: false, selector, visible_result_count: 0, first_result_text: ""};
+          first.setAttribute("data-clinicos-linear-recipient-result", "0");
+          return {
+            ok: true,
+            selector: '[data-clinicos-linear-recipient-result="0"]',
+            visible_result_count: nodes.length,
+            first_result_text: textOf(first),
+            visible_result_texts: nodes.slice(0, 20).map(textOf)
+          };
+        }
+        """
+        try:
+            raw = page.evaluate(script, selector)
+        except Exception as exc:
+            raw = {"ok": False, "message": str(exc), "visible_result_count": 0, "first_result_text": ""}
+        return raw if isinstance(raw, dict) else {"ok": False, "visible_result_count": 0, "first_result_text": ""}
 
     def _forward_recipient_results_stability(self, page: Any, display_name: str) -> dict[str, Any]:
         first = self._forward_recipient_candidates(page, display_name)
@@ -4372,38 +4413,56 @@ class BalePlugin:
             return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
           };
           const textOf = (node) => String((node && (node.innerText || node.textContent)) || "").replace(/\\s+/g, " ").trim();
-          const selectorFor = (node, fallback) => {
-            if (!node) return "";
-            const marker = node.getAttribute("data-clinicos-forward-confirm");
-            if (marker) return `[data-clinicos-forward-confirm="${marker}"]`;
-            if (node.id) return `#${CSS.escape(node.id)}`;
-            const aria = node.getAttribute("aria-label");
-            if (aria) return `${node.tagName.toLowerCase()}[aria-label="${aria.replace(/"/g, "\\\\\\"")}"]`;
-            const role = node.getAttribute("role");
-            if (role) return `${node.tagName.toLowerCase()}[role="${role}"]`;
-            const cls = String(node.className || "").split(/\\s+/).filter(Boolean)[0];
-            return cls ? `${node.tagName.toLowerCase()}.${CSS.escape(cls)}` : fallback;
+          const boxOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)};
           };
-          const picker = Array.from(document.querySelectorAll('div.anWA5J, [role="dialog"], [class*="Modal"], [class*="modal"]')).find(visible);
-          const nodes = picker ? Array.from(picker.querySelectorAll('button, [role="button"], [aria-label], div')) : [];
-          const debug = [];
-          let selected = null;
-          for (const node of nodes) {
-            if (!visible(node)) continue;
+          const hitOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            const points = [
+              [rect.x + rect.width / 2, rect.y + rect.height / 2],
+              [rect.x + Math.min(6, rect.width / 3), rect.y + Math.min(6, rect.height / 3)],
+              [rect.right - Math.min(6, rect.width / 3), rect.y + Math.min(6, rect.height / 3)],
+              [rect.x + Math.min(6, rect.width / 3), rect.bottom - Math.min(6, rect.height / 3)],
+              [rect.right - Math.min(6, rect.width / 3), rect.bottom - Math.min(6, rect.height / 3)]
+            ];
+            return points.map(([x, y]) => {
+              const hit = document.elementFromPoint(x, y);
+              return {tag: hit ? hit.tagName.toLowerCase() : "", className: hit ? String(hit.className || "").slice(0, 120) : "", aria_label: hit ? hit.getAttribute("aria-label") || "" : "", contained: Boolean(hit && (hit === node || node.contains(hit)))};
+            });
+          };
+          const picker = Array.from(document.querySelectorAll('.ReactModal__Overlay')).find(visible);
+          const selector = '.ReactModal__Overlay [role="button"][aria-label="send-button-forward-messages"][data-testid="bold-send2-icon"]';
+          const nodes = Array.from(document.querySelectorAll(selector)).filter((node) => picker && picker.contains(node));
+          const visibleNodes = nodes.filter(visible);
+          const enabledNodes = visibleNodes.filter((node) => !node.disabled && node.getAttribute("aria-disabled") !== "true" && !node.closest("[disabled], [aria-disabled='true']"));
+          const hitTestableNodes = enabledNodes.filter((node) => {
+            const hits = hitOf(node);
+            return Boolean(hits[0] && hits[0].contained);
+          });
+          const debug = nodes.map((node, index) => {
             const text = textOf(node);
             const aria = node.getAttribute("aria-label") || "";
             const role = node.getAttribute("role") || "";
             const className = String(node.className || "").slice(0, 160);
             const enabled = !node.disabled && node.getAttribute("aria-disabled") !== "true";
-            const label = `${text} ${aria} ${role} ${className}`;
-            const looksConfirm = /Forward|Send|Done|Confirm|Ø§Ø±Ø³Ø§Ù„|ÙÙˆØ±ÙˆØ§Ø±Ø¯|ØªØ§ÛŒÛŒØ¯/.test(label);
-            debug.push({text, aria_label: aria, role, className, enabled, status: looksConfirm ? "candidate" : "observed"});
-            if (!selected && looksConfirm && enabled) selected = node;
+            const isVisible = visible(node);
+            const icon = node.querySelector('svg[aria-label="BoldSend2-icon"]');
+            const descriptionField = picker ? Array.from(picker.querySelectorAll('textarea, input, [contenteditable="true"], [placeholder]')).find((item) => /نوشتن توضیحات/.test(item.getAttribute("placeholder") || textOf(item))) : null;
+            const badgeText = normalizeBadgeText(textOf(node.parentElement || node));
+            const hits = hitOf(node);
+            return {index, text, aria_label: aria, role, className, data_testid: node.getAttribute("data-testid") || "", visible: isVisible, enabled, hit_testable: Boolean(hits[0] && hits[0].contained), icon_aria_label: icon ? icon.getAttribute("aria-label") || "" : "", description_field_present: Boolean(descriptionField), recipient_count_badge: badgeText, bounding_box: boxOf(node), hit_tests: hits, outer_html: node.outerHTML.slice(0, 700), status: isVisible && enabled ? "candidate" : "observed"};
+          });
+          function normalizeBadgeText(value) {
+            return String(value || "").replace(/[۰٠]/g, "0").replace(/[۱١]/g, "1").replace(/[۲٢]/g, "2").replace(/[۳٣]/g, "3").replace(/[۴٤]/g, "4").replace(/[۵٥]/g, "5").replace(/[۶٦]/g, "6").replace(/[۷٧]/g, "7").replace(/[۸٨]/g, "8").replace(/[۹٩]/g, "9").replace(/\\s+/g, " ").trim();
           }
-          if (selected) selected.setAttribute("data-clinicos-forward-confirm", "0");
           return {
             marker: "clinicos_bale_forward_confirm_button_state",
-            confirm_button_selector: selected ? selectorFor(selected, '[data-clinicos-forward-confirm="0"]') : "",
+            confirm_button_selector: hitTestableNodes.length === 1 ? selector : "",
+            final_forward_dom_count: nodes.length,
+            final_forward_visible_count: visibleNodes.length,
+            final_forward_enabled_count: enabledNodes.length,
+            final_forward_hit_testable_count: hitTestableNodes.length,
             candidate_debug: debug.slice(0, 60)
           };
         }
@@ -4416,42 +4475,46 @@ class BalePlugin:
             raw = {}
         return {
             "confirm_button_selector": str(raw.get("confirm_button_selector") or ""),
+            "final_forward_dom_count": int(raw.get("final_forward_dom_count") or 0),
+            "final_forward_visible_count": int(raw.get("final_forward_visible_count") or 0),
+            "final_forward_enabled_count": int(raw.get("final_forward_enabled_count") or 0),
+            "final_forward_hit_testable_count": int(raw.get("final_forward_hit_testable_count") or 0),
             "candidate_debug": raw.get("candidate_debug") if isinstance(raw.get("candidate_debug"), list) else [],
         }
 
-    def _forward_success_state(self, page: Any) -> dict[str, Any]:
+    def _forward_success_state(self, page: Any, expected_recipient_name: str = "") -> dict[str, Any]:
         script = """
-        () => {
+        (expectedRecipientName) => {
           const visible = (node) => {
             if (!node) return false;
             const rect = node.getBoundingClientRect();
             const style = window.getComputedStyle(node);
             return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity) !== 0;
           };
-          const pickerVisible = Boolean(Array.from(document.querySelectorAll('div.anWA5J, [role="dialog"], [class*="Modal"], [class*="modal"]')).find(visible));
-          const bodyText = String((document.body && (document.body.innerText || document.body.textContent)) || "");
           const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
-          const successText = /Forwarded|sent|Ø§Ø±Ø³Ø§Ù„ Ø´Ø¯|ÙÙˆØ±ÙˆØ§Ø±Ø¯ Ø´Ø¯/.test(bodyText);
-          const toastText = normalize((Array.from(document.querySelectorAll('[role="status"], [role="alert"], [class*="toast"], [class*="Toast"], .Toastify__toast, div'))
-            .filter(visible)
-            .map((node) => normalize(node.innerText || node.textContent || ""))
-            .find((text) => /Forwarded|sent|chat|chats|ارسال|فوروارد|بازارسال|گفتگو|گفت‌وگو|چت/i.test(text)) || ""));
-          const observedText = toastText || normalize(bodyText);
-          const multiRecipient = /(?:\\b[2-9]\\b|[۲-۹٢-٩]|two|three|four|five|six|seven|eight|nine|دو|سه|چند)\\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)/i.test(observedText);
-          const oneRecipient = /(?:\\b1\\b|[۱١]|one|یک)\\s*(?:chat|chats|گفتگو|گفت‌وگو|چت)/i.test(observedText);
-          const verifiedCount = multiRecipient ? 2 : (oneRecipient ? 1 : ((!pickerVisible && successText) ? 1 : 0));
+          const expectedText = `Post forwarded to ${String(expectedRecipientName || "")}.`;
+          const pickerVisible = Boolean(Array.from(document.querySelectorAll('div.anWA5J, [role="dialog"], [class*="Modal"], [class*="modal"]')).find(visible));
+          const alerts = Array.from(document.querySelectorAll('[role="alert"]')).filter(visible);
+          const toastText = normalize(alerts.map((node) => normalize(node.innerText || node.textContent || "")).find((text) => text.includes(expectedText)) || "");
+          const tickVisible = Boolean(alerts.find((node) => toastText && node.querySelector('[aria-label="TickDone-icon"]')));
+          const verified = Boolean(toastText);
           return {
             marker: "clinicos_bale_forward_success_state",
             recipient_picker_visible: pickerVisible,
-            forward_verified: !multiRecipient && (!pickerVisible || successText),
-            verification_method: !pickerVisible ? "recipient_picker_closed" : (successText ? "success_text_visible" : ""),
+            forward_verified: verified,
+            send_success_verified: verified,
+            verification_method: verified ? "explicit_success_toast" : "",
+            verification_evidence: verified ? expectedText : "",
+            remote_message_id: null,
             success_toast_text: toastText,
-            verified_forward_recipient_count: verifiedCount
+            expected_success_toast_text: expectedText,
+            success_tick_visible: tickVisible,
+            verified_forward_recipient_count: verified ? 1 : 0
           };
         }
         """
         try:
-            raw = page.evaluate(script)
+            raw = page.evaluate(script, expected_recipient_name)
         except Exception:
             raw = {}
         if not isinstance(raw, dict):
@@ -4459,10 +4522,27 @@ class BalePlugin:
         return {
             "recipient_picker_visible": bool(raw.get("recipient_picker_visible")),
             "forward_verified": bool(raw.get("forward_verified")),
+            "send_success_verified": bool(raw.get("send_success_verified") or raw.get("forward_verified")),
             "verification_method": str(raw.get("verification_method") or ""),
+            "verification_evidence": str(raw.get("verification_evidence") or ""),
+            "remote_message_id": None,
             "success_toast_text": str(raw.get("success_toast_text") or ""),
+            "expected_success_toast_text": str(raw.get("expected_success_toast_text") or ""),
+            "success_tick_visible": bool(raw.get("success_tick_visible")),
             "verified_forward_recipient_count": int(raw.get("verified_forward_recipient_count") or 0),
         }
+
+    def _wait_forward_success_state(self, page: Any, expected_recipient_name: str = "", timeout_ms: int = 1500) -> dict[str, Any]:
+        started = time.perf_counter()
+        state: dict[str, Any] = {}
+        while (time.perf_counter() - started) * 1000 <= max(0, timeout_ms):
+            state = self._forward_success_state(page, expected_recipient_name)
+            if state.get("send_success_verified"):
+                break
+            _safe_wait_for_timeout(page, 150)
+        if not state:
+            state = self._forward_success_state(page, expected_recipient_name)
+        return state
 
     def _forward_failure_debug(self, page: Any) -> dict[str, Any]:
         picker_text = ""
@@ -5635,7 +5715,7 @@ class BalePlugin:
         step_started = time.perf_counter()
         install_ack = self._first_visible_selector(
             page,
-            ["text=متوجه شدم", "button:has-text('متوجه شدم')"],
+            ["text=Ù…ØªÙˆØ¬Ù‡ Ø´Ø¯Ù…", "button:has-text('Ù…ØªÙˆØ¬Ù‡ Ø´Ø¯Ù…')"],
             timeout_ms=750,
         )
         if install_ack:
@@ -5894,7 +5974,7 @@ class BalePlugin:
             if selector == exclude_selector:
                 continue
             placeholder = item.get("placeholder", "")
-            if any(token in placeholder for token in ("Name", "required", "نام")):
+            if any(token in placeholder for token in ("Name", "required", "Ù†Ø§Ù…")):
                 return selector
         remaining = [item.get("selector", "") for item in modal_inputs if item.get("selector") != exclude_selector]
         if len(remaining) >= 2:
@@ -5903,17 +5983,17 @@ class BalePlugin:
 
     def _click_enabled_add_contact_button(self, page: Any) -> dict[str, Any]:
         button_selectors = [
-            '.ReactModal__Overlay button:has-text("افزودن")',
+            '.ReactModal__Overlay button:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '.ReactModal__Overlay button:has-text("Add")',
-            '.ReactModal__Overlay [role="button"]:has-text("افزودن")',
+            '.ReactModal__Overlay [role="button"]:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '.ReactModal__Overlay [role="button"]:has-text("Add")',
-            '.ReactModal__Content button:has-text("افزودن")',
+            '.ReactModal__Content button:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '.ReactModal__Content button:has-text("Add")',
-            '.ReactModal__Content [role="button"]:has-text("افزودن")',
+            '.ReactModal__Content [role="button"]:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '.ReactModal__Content [role="button"]:has-text("Add")',
-            '[role="dialog"] button:has-text("افزودن")',
+            '[role="dialog"] button:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '[role="dialog"] button:has-text("Add")',
-            '[role="dialog"] [role="button"]:has-text("افزودن")',
+            '[role="dialog"] [role="button"]:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '[role="dialog"] [role="button"]:has-text("Add")',
         ]
         button_count = 0
@@ -6013,9 +6093,9 @@ class BalePlugin:
         duplicate_selectors = [
             'text=/.*already.*exists.*/i',
             'text=/.*duplicate.*/i',
-            'text=/.*قبلا.*/',
-            'text=/.*موجود.*/',
-            'text=/.*تکراری.*/',
+            'text=/.*Ù‚Ø¨Ù„Ø§.*/',
+            'text=/.*Ù…ÙˆØ¬ÙˆØ¯.*/',
+            'text=/.*ØªÚ©Ø±Ø§Ø±ÛŒ.*/',
         ]
         contact_selectors = [
             f"text={contact_name}",
@@ -6071,9 +6151,9 @@ class BalePlugin:
             page,
             [
                 ".ReactModal__Content button[aria-label*='Close']",
-                ".ReactModal__Content button:has-text('×')",
+                ".ReactModal__Content button:has-text('Ã—')",
                 ".ReactModal__Content button:has-text('Cancel')",
-                ".ReactModal__Content button:has-text('لغو')",
+                ".ReactModal__Content button:has-text('Ù„ØºÙˆ')",
                 "[role='dialog'] button[aria-label*='Close']",
             ],
             timeout_ms=500,
@@ -6159,14 +6239,16 @@ class BalePlugin:
                 result.update({"status": "success", "search_input_selector": search_input, "duration_ms": int((time.perf_counter() - started) * 1000)})
                 return result
 
+        recovered_from_contacts = False
         for shortcut in ["Control+K", "Control+F"]:
-            if int((time.perf_counter() - started) * 1000) >= 1500:
+            if int((time.perf_counter() - started) * 1000) >= 1500 and not recovered_from_contacts:
                 break
             try:
                 self._press_key(page, shortcut)
                 attempts.append({"mode": "keyboard_shortcut", "status": "success", "shortcut": shortcut})
             except Exception as exc:
                 attempts.append({"mode": "keyboard_shortcut", "status": "failed", "shortcut": shortcut, "error": str(exc)})
+            url_after_shortcut = _safe_page_url(page).lower()
             if ensure_chat_ready is not None and not ensure_chat_ready(f"after_{shortcut}"):
                 result.update(
                     {
@@ -6176,6 +6258,7 @@ class BalePlugin:
                     }
                 )
                 return result
+            recovered_from_contacts = bool("/contacts" in url_after_shortcut and "/contacts" not in _safe_page_url(page).lower())
             search_input = check_input(f"after_{shortcut}", timeout_ms=300)
             if search_input:
                 result.update({"status": "success", "search_input_selector": search_input, "duration_ms": int((time.perf_counter() - started) * 1000)})
@@ -6337,10 +6420,10 @@ class BalePlugin:
                         return tag === "INPUT" || tag === "TEXTAREA" || role === "searchbox" || el.isContentEditable || cls.includes("e8AzTv");
                     };
                     const hasBroadText = (text) => {
-                        return text.includes("برای شروع یکی از گفتگوها را انتخاب کنید")
-                            || text.includes("Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯")
-                            || text.includes("گفتگوها")
-                            || text.includes("Ú¯ÙØªÚ¯ÙˆÙ‡Ø§");
+                        return text.includes("Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯")
+                            || text.includes("Ã˜Â¨Ã˜Â±Ã˜Â§Ã›Å’ Ã˜Â´Ã˜Â±Ã™Ë†Ã˜Â¹ Ã›Å’ÃšÂ©Ã›Å’ Ã˜Â§Ã˜Â² ÃšÂ¯Ã™ÂÃ˜ÂªÃšÂ¯Ã™Ë†Ã™â€¡Ã˜Â§ Ã˜Â±Ã˜Â§ Ã˜Â§Ã™â€ Ã˜ÂªÃ˜Â®Ã˜Â§Ã˜Â¨ ÃšÂ©Ã™â€ Ã›Å’Ã˜Â¯")
+                            || text.includes("Ú¯ÙØªÚ¯ÙˆÙ‡Ø§")
+                            || text.includes("ÃšÂ¯Ã™ÂÃ˜ÂªÃšÂ¯Ã™Ë†Ã™â€¡Ã˜Â§");
                     };
                     const boxOf = (el) => {
                         const rect = el.getBoundingClientRect();
@@ -6506,7 +6589,7 @@ class BalePlugin:
                         return style && style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
                     };
                     const textOf = (el) => (el.innerText || el.textContent || "").trim();
-                    const broadWords = ["گفتگو", "مجله", "خدمات", "مخاطبین"];
+                    const broadWords = ["Ú¯ÙØªÚ¯Ùˆ", "Ù…Ø¬Ù„Ù‡", "Ø®Ø¯Ù…Ø§Øª", "Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†"];
                     const selectorFor = (el) => {
                         if (!el) return "";
                         const tag = el.tagName ? el.tagName.toLowerCase() : "*";
@@ -6660,7 +6743,7 @@ class BalePlugin:
                         return style && style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
                     };
                     const textOf = (el) => (el.innerText || el.textContent || "").trim();
-                    const broadWords = ["گفتگو", "مجله", "خدمات", "مخاطبین"];
+                    const broadWords = ["Ú¯ÙØªÚ¯Ùˆ", "Ù…Ø¬Ù„Ù‡", "Ø®Ø¯Ù…Ø§Øª", "Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†"];
                     const rows = [];
                     const rejected = [];
                     for (const row of Array.from(document.querySelectorAll(".qHFpb6, [class*='qHFpb6']"))) {
@@ -6813,7 +6896,7 @@ class BalePlugin:
                     const needle = String(query || "").trim().toLowerCase();
                     const viewportW = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
                     const viewportH = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
-                    const broadWords = ["گفتگو", "مجله", "خدمات", "مخاطبین"];
+                    const broadWords = ["Ú¯ÙØªÚ¯Ùˆ", "Ù…Ø¬Ù„Ù‡", "Ø®Ø¯Ù…Ø§Øª", "Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†"];
                     const badTags = new Set(["INPUT", "TEXTAREA", "SCRIPT", "STYLE", "SVG", "PATH"]);
                     const textOf = (el) => (el.innerText || el.textContent || "").trim();
                     const boxOf = (el) => {
@@ -6886,7 +6969,7 @@ class BalePlugin:
                         if (seen.has(key)) continue;
                         seen.add(key);
                         const exact = normalized(text) === needle || normalized(clickText) === needle;
-                        const picture = text.includes("تصویر") || clickText.includes("تصویر");
+                        const picture = text.includes("ØªØµÙˆÛŒØ±") || clickText.includes("ØªØµÙˆÛŒØ±");
                         rows.push({
                             text: clickText.slice(0, 220),
                             box: baseBox,
@@ -6952,12 +7035,12 @@ class BalePlugin:
         if not normalized:
             return False
         broad_markers = [
-            "برای شروع یکی از گفتگوها را انتخاب کنید",
-            "همه پیام‌ها",
-            "گفتگوها",
-            "مخاطبین",
-            "خدمات",
-            "مجله",
+            "Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯",
+            "Ù‡Ù…Ù‡ Ù¾ÛŒØ§Ù…â€ŒÙ‡Ø§",
+            "Ú¯ÙØªÚ¯ÙˆÙ‡Ø§",
+            "Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†",
+            "Ø®Ø¯Ù…Ø§Øª",
+            "Ù…Ø¬Ù„Ù‡",
         ]
         if _is_broad_chat_text(text):
             return True
@@ -6969,6 +7052,10 @@ class BalePlugin:
         if len(text) > 220 and marker_count >= 2:
             return True
         if line_count >= 8 and marker_count >= 2:
+            return True
+        if len(text) > 220 and line_count >= 8:
+            return True
+        if len(text) > 120 and line_count >= 12:
             return True
         if width > 650 or height > 260:
             return True
@@ -7237,8 +7324,8 @@ class BalePlugin:
                         if (rect.x < 500 || rect.y > 180 || rect.height > 140 || rect.width > 520) return false;
                         const text = (el.innerText || el.textContent || "").trim();
                         if (!text || text.length > 180) return false;
-                        if (text.includes("برای شروع یکی از گفتگوها را انتخاب کنید")) return false;
-                        if (text.includes("همه پیام‌ها") || text.includes("گفتگوها")) return false;
+                        if (text.includes("Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯")) return false;
+                        if (text.includes("Ù‡Ù…Ù‡ Ù¾ÛŒØ§Ù…â€ŒÙ‡Ø§") || text.includes("Ú¯ÙØªÚ¯ÙˆÙ‡Ø§")) return false;
                         return true;
                     });
                     return nodes.map((el) => (el.innerText || el.textContent || "").trim()).filter(Boolean).slice(0, 10).join("\\n").slice(0, 500);
@@ -7527,7 +7614,7 @@ class BalePlugin:
 
     def _click_contacts_header_or_panel(self, page: Any) -> dict[str, Any]:
         selectors_to_try = [
-            'text=مخاطبین',
+            'text=Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†',
             '[aria-label="Contacts-icon"]',
             'svg[aria-label="Contacts-icon"]',
             'input[type="search"]',
@@ -7570,7 +7657,7 @@ class BalePlugin:
                     const panel = Array.from(document.querySelectorAll("body *")).filter(visible).find((el) => {
                         const text = (el.innerText || el.textContent || "");
                         const rect = el.getBoundingClientRect();
-                        return text.includes("مخاطبین") && rect.width > 200 && rect.height > 200;
+                        return text.includes("Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†") && rect.width > 200 && rect.height > 200;
                     });
                     const box = panel ? panel.getBoundingClientRect() : null;
                     return {
@@ -7611,16 +7698,44 @@ class BalePlugin:
             pass
         locator.type(text, timeout=500)
 
-    def _click_selector_short(self, page: Any, selector: str, timeout_ms: int = 500) -> dict[str, Any]:
+    def _click_selector_short(
+        self,
+        page: Any,
+        selector: str,
+        timeout_ms: int = 500,
+        postcondition_selector: str | None = None,
+        postcondition_timeout_ms: int = 0,
+    ) -> dict[str, Any]:
         try:
             page.locator(selector).first.click(timeout=timeout_ms)
             return {"status": "success", "click_method": "playwright_click", "selector": selector}
         except Exception as click_error:
             try:
                 page.locator(selector).first.evaluate("(el) => el.click()")
-                return {"status": "success", "click_method": "dom_click", "selector": selector, "playwright_click_error": str(click_error)}
             except Exception as dom_error:
                 return {"status": "failed", "selector": selector, "click_error": str(click_error), "dom_click_error": str(dom_error)}
+            if postcondition_selector:
+                postcondition_found = self._first_visible_selector(
+                    page,
+                    [postcondition_selector],
+                    timeout_ms=postcondition_timeout_ms,
+                )
+                if postcondition_found:
+                    return {
+                        "status": "success",
+                        "click_method": "dom_click",
+                        "selector": selector,
+                        "playwright_click_error": str(click_error),
+                        "postcondition_selector": postcondition_selector,
+                    }
+            return {
+                "status": "failed",
+                "selector": selector,
+                "click_error": str(click_error),
+                "dom_click_attempted": True,
+                "error_code": "click_postcondition_not_met",
+                "postcondition_selector": postcondition_selector or "",
+            }
 
     def _visible_contacts_result_candidates(self, page: Any) -> list[dict[str, Any]]:
         try:
@@ -7662,8 +7777,8 @@ class BalePlugin:
                         if (!text || text.length > 500) continue;
                         const rect = el.getBoundingClientRect();
                         if (rect.x > 500 || rect.width > 500 || rect.height > 180) continue;
-                        if (/گفتگو\\s+مجله\\s+خدمات\\s+مخاطبین/.test(text)) continue;
-                        if (/ساخت گروه|ساخت کانال|افزودن مخاطب|مرتب‌شده/.test(text) && text.length > 120) continue;
+                        if (/Ú¯ÙØªÚ¯Ùˆ\\s+Ù…Ø¬Ù„Ù‡\\s+Ø®Ø¯Ù…Ø§Øª\\s+Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†/.test(text)) continue;
+                        if (/Ø³Ø§Ø®Øª Ú¯Ø±ÙˆÙ‡|Ø³Ø§Ø®Øª Ú©Ø§Ù†Ø§Ù„|Ø§ÙØ²ÙˆØ¯Ù† Ù…Ø®Ø§Ø·Ø¨|Ù…Ø±ØªØ¨â€ŒØ´Ø¯Ù‡/.test(text) && text.length > 120) continue;
                         const click = clickableParent(el);
                         const selector = selectorFor(el);
                         const clickSelector = selectorFor(click) || selector;
@@ -7706,9 +7821,9 @@ class BalePlugin:
         value = str(text or "").strip()
         if not value or len(value) > 500:
             return False
-        if "گفتگو" in value and "مجله" in value and "مخاطبین" in value:
+        if "Ú¯ÙØªÚ¯Ùˆ" in value and "Ù…Ø¬Ù„Ù‡" in value and "Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†" in value:
             return False
-        if len(value) > 120 and any(token in value for token in ["ساخت گروه", "ساخت کانال", "افزودن مخاطب", "مرتب‌شده"]):
+        if len(value) > 120 and any(token in value for token in ["Ø³Ø§Ø®Øª Ú¯Ø±ÙˆÙ‡", "Ø³Ø§Ø®Øª Ú©Ø§Ù†Ø§Ù„", "Ø§ÙØ²ÙˆØ¯Ù† Ù…Ø®Ø§Ø·Ø¨", "Ù…Ø±ØªØ¨â€ŒØ´Ø¯Ù‡"]):
             return False
         return True
 
@@ -7764,7 +7879,7 @@ class BalePlugin:
             return ""
 
     def _visible_no_result_text(self, page: Any) -> str:
-        for selector in ['text=/.*not found.*/i', 'text=/.*no result.*/i', 'text=/.*یافت نشد.*/', 'text=/.*نتیجه.*/']:
+        for selector in ['text=/.*not found.*/i', 'text=/.*no result.*/i', 'text=/.*ÛŒØ§ÙØª Ù†Ø´Ø¯.*/', 'text=/.*Ù†ØªÛŒØ¬Ù‡.*/']:
             try:
                 locator = page.locator(selector).first
                 locator.wait_for(state="visible", timeout=100)
@@ -7985,11 +8100,10 @@ class BalePlugin:
         timeout_ms: int | None = None,
     ) -> str | None:
         total_timeout = timeout_ms if timeout_ms is not None else min(self.default_timeout_ms, 1500)
-        total_timeout = max(0, min(int(total_timeout), 2000))
+        total_timeout = max(0, int(total_timeout))
         deadline = time.monotonic() + (total_timeout / 1000)
-        probe_timeout = min(150, max(25, total_timeout))
-        max_passes = max(1, min(3, (total_timeout // 300) + 1))
-        for pass_index in range(max_passes):
+        probe_timeout = min(150, max(25, total_timeout or 25))
+        while True:
             for selector in selector_list:
                 remaining_ms = int((deadline - time.monotonic()) * 1000)
                 if remaining_ms < 0:
@@ -8000,7 +8114,7 @@ class BalePlugin:
                     return selector
                 except Exception:
                     continue
-            if pass_index >= max_passes - 1 or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 return None
             time.sleep(0.05)
         return None
@@ -8204,13 +8318,15 @@ _LOGIN_FORM_SELECTORS = [
     "input[autocomplete='tel']",
     "[data-testid*='login']",
     "[class*='login']",
-    "text=ورود",
-    "text=شماره موبایل",
+    "text=ÙˆØ±ÙˆØ¯",
+    "text=Ø´Ù…Ø§Ø±Ù‡ Ù…ÙˆØ¨Ø§ÛŒÙ„",
 ]
 
 _INSTALL_PROMPT_SELECTORS = [
     "text=متوجه شدم",
     "text=نصب",
+    "text=Ù…ØªÙˆØ¬Ù‡ Ø´Ø¯Ù…",
+    "text=Ù†ØµØ¨",
     "text=install",
     "text=Install",
     "[data-testid*='install']",
@@ -8269,9 +8385,9 @@ def _visible_text_sample(page: Any, limit: int = 500) -> str:
 
 
 def _is_broad_chat_text(text: str) -> bool:
-    if "برای شروع یکی از گفتگوها را انتخاب کنید" in text:
+    if "Ø¨Ø±Ø§ÛŒ Ø´Ø±ÙˆØ¹ ÛŒÚ©ÛŒ Ø§Ø² Ú¯ÙØªÚ¯ÙˆÙ‡Ø§ Ø±Ø§ Ø§Ù†ØªØ®Ø§Ø¨ Ú©Ù†ÛŒØ¯" in text:
         return True
-    markers = ["همه پیام‌ها", "گفتگوها", "مخاطبین", "خدمات", "مجله"]
+    markers = ["Ù‡Ù…Ù‡ Ù¾ÛŒØ§Ù…â€ŒÙ‡Ø§", "Ú¯ÙØªÚ¯ÙˆÙ‡Ø§", "Ù…Ø®Ø§Ø·Ø¨ÛŒÙ†", "Ø®Ø¯Ù…Ø§Øª", "Ù…Ø¬Ù„Ù‡"]
     marker_count = sum(1 for marker in markers if marker in text)
     line_count = len([line for line in text.splitlines() if line.strip()])
     return bool((len(text) > 220 or line_count >= 8) and marker_count >= 2)
