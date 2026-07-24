@@ -1,7 +1,7 @@
 import { ChevronDown, FileSpreadsheet, FileText, Instagram, MessageCircle, PauseCircle, Plus, Radio, RefreshCw, Save, Send, SendHorizontal, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { listPlatformAccounts } from "../api/accountRegistry";
 import { createCampaign, listCampaigns, pauseCampaign, queueCampaign, updateCampaign } from "../api/campaigns";
-import { listPlatformAccounts } from "../api/platforms";
 import {
   ContentCard,
   EmptyState,
@@ -216,7 +216,7 @@ export default function CommercialCampaigns() {
   const connectedPlatforms = useMemo(() => {
     const map = {};
     for (const platform of platformOptions) {
-      map[platform.id] = platform.supported && (accountsByPlatform[platform.id] || []).length > 0;
+      map[platform.id] = (accountsByPlatform[platform.id] || []).length > 0;
     }
     return map;
   }, [accountsByPlatform]);
@@ -239,11 +239,17 @@ export default function CommercialCampaigns() {
     try {
       const [campaignData, baleAccounts] = await Promise.all([
         listCampaigns({ limit: 100, offset: 0 }),
-        listPlatformAccounts("bale").catch(() => []),
+        Promise.all(platformOptions.map((platform) => listPlatformAccounts(platform.id).catch(() => []))),
       ]);
       const rows = Array.isArray(campaignData) ? campaignData : campaignData?.items || [];
+      const accountsMap = Object.fromEntries(
+        platformOptions.map((platform, index) => {
+          const payload = baleAccounts[index];
+          return [platform.id, Array.isArray(payload) ? payload : payload?.items || []];
+        }),
+      );
       setCampaigns(rows);
-      setAccountsByPlatform({ bale: Array.isArray(baleAccounts) ? baleAccounts : baleAccounts?.items || [] });
+      setAccountsByPlatform(accountsMap);
     } catch (err) {
       setError(err.message || "دریافت کمپین‌ها انجام نشد.");
     } finally {
@@ -286,7 +292,9 @@ export default function CommercialCampaigns() {
   }
 
   function setPlatformAllocation(platformId, value) {
-    updateDraft({ accountAllocations: { ...draft.accountAllocations, [platformId]: Number(value || 0) } });
+    const requested = Math.max(0, Number(value || 0));
+    const available = statsForPlatform(platformId).available;
+    updateDraft({ accountAllocations: { ...draft.accountAllocations, [platformId]: Math.min(requested, available) } });
   }
 
   function handleNumberFile(file) {
@@ -352,6 +360,21 @@ export default function CommercialCampaigns() {
   useEffect(() => {
     load();
   }, []);
+
+  useEffect(() => {
+    if (!Object.keys(accountsByPlatform).length) return;
+    const nextAllocations = { ...draft.accountAllocations };
+    let changed = false;
+    for (const platformId of draft.platforms) {
+      const available = statsForPlatform(platformId).available;
+      const current = Number(nextAllocations[platformId] || 0);
+      if (current > available) {
+        nextAllocations[platformId] = available;
+        changed = true;
+      }
+    }
+    if (changed) updateDraft({ accountAllocations: nextAllocations });
+  }, [accountsByPlatform, draft.platforms, draft.accountAllocations]);
 
   return (
     <section className="campaign-builder-page" dir="rtl">
@@ -502,7 +525,7 @@ export default function CommercialCampaigns() {
                       <p><span>آماده</span><b>{stats.available}</b></p>
                     </div>
                     <FormField label="اختصاص به این کمپین">
-                      <NumberInput min="0" value={draft.accountAllocations[platformId] || 0} onChange={(event) => setPlatformAllocation(platformId, event.target.value)} />
+                      <NumberInput min="0" max={stats.available} value={draft.accountAllocations[platformId] || 0} onChange={(event) => setPlatformAllocation(platformId, event.target.value)} />
                     </FormField>
                   </article>
                 );
