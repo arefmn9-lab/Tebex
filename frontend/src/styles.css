@@ -2290,6 +2290,585 @@ textarea.campaign-message-editor {
   }
 }
 
+/* ClinicOS UI redesign phase 8: premium SaaS polish */
+.campaign-builder-page {
+  --premium-shadow-sm: 0 10px 26px rgba(20, 31, 58, 0.06);
+  --premium-shadow-md: 0 18px 46px rgba(20, 31, 58, 0.10);
+  --premium-shadow-lg: 0 30px 80px rgba(20, 31, 58, 0.14);
+  --premium-ring: 0 0 0 4px rgba(41, 71, 182, 0.10);
+  animation: campaignPageIn 260ms ease-out both;
+}
+
+.premium-campaign-hero {
+  border-radius: 28px;
+  background:
+    radial-gradient(circle at 86% 12%, rgba(41, 71, 182, 0.14), transparent 28%),
+    radial-gradient(circle at 20% 72%, rgba(124, 58, 237, 0.12), transparent 34%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.98), #f7f9ff 54%, #edf4ff 100%);
+  box-shadow: var(--premium-shadow-lg);
+}
+
+.premium-campaign-hero::after {
+  content: "";
+  position: absolute;
+  inset: auto 28px 0 28px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(41, 71, 182, 0.35), transparent);
+}
+
+.premium-campaign-hero h1 {
+  letter-spacing: 0;
+  font-weight: 950;
+}
+
+.campaign-eyebrow {
+  background: linear-gradient(135deg, #eef3ff, #f6f1ff);
+  box-shadow: inset 0 0 0 1px rgba(41, 71, 182, 0.08);
+}
+
+.premium-campaign-stats article,
+.campaign-workspace-column .content-card,
+.campaign-overview-column .content-card,
+.simple-campaign-item,
+.platform-pool-card,
+.platform-source-list article.platform-source-card,
+.number-upload-card,
+.number-file-summary {
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+
+.premium-campaign-stats article:hover,
+.simple-campaign-item:hover,
+.platform-pool-card:hover,
+.platform-source-list article.platform-source-card:hover,
+.number-upload-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--premium-shadow-md);
+}
+
+.campaign-workspace-column .content-card,
+.campaign-overview-column .content-card {
+  background:
+    linear-gradient(#ffffff, #ffffff) padding-box,
+    linear-gradient(135deg, rgba(41, 71, 182, 0.16), rgba(124, 58, 237, 0.10), rgba(34, 160, 107, 0.10)) border-box;
+  border: 1px solid transparent;
+}
+
+.panel-header .panel-title,
+.content-card .panel-title {
+  font-size: 17px;
+  font-weight: 950;
+}
+
+.content-card .page-copy {
+  max-width: 760px;
+  line-height: 1.9;
+}
+
+.simple-campaign-item {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.98), rgba(250,252,255,0.98)) padding-box,
+    linear-gradient(135deg, rgba(41, 71, 182, 0.12), rgba(223, 230, 245, 0.8)) border-box;
+  border: 1px solid transparent;
+}
+
+.simple-campaign-main strong {
+  font-weight: 950;
+}
+
+.campaign-platform-icons span,
+.platform-logo {
+  position: relative;
+  overflow: hidden;
+}
+
+.campaign-platform-icons span::after,
+.platform-logo::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(255,255,255,0.42), transparent 48%);
+  pointer-events: none;
+}
+
+.campaign-inline-actions button,
+.builder-save-actions button,
+.premium-hero-actions button {
+  box-shadow: 0 10px 22px rgba(23, 34, 59, 0.07);
+}
+
+.campaign-inline-actions button:hover,
+.builder-save-actions button:hover,
+.premium-hero-actions button:hover {
+  transform: translateY(-1px);
+}
+
+.platform-checkbox-grid button {
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(#ffffff, #ffffff) padding-box,
+    linear-gradient(135deg, rgba(223, 230, 245, 0.9), rgba(255,255,255,0.4)) border-box;
+  border: 1px solid transparent;
+}
+
+.platform-checkbox-grid button::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  background: radial-gradient(circle at 18% 24%, color-mix(in srgb, var(--platform-accent) 14%, transparent), transparent 38%);
+  transition: opacity 160ms ease;
+}
+
+.platform-checkbox-grid button:hover::before,
+.platform-checkbox-grid button.selected::before {
+  opacity: 1;
+}
+
+.platform-checkbox-grid button > * {
+  position: relative;
+  z-index: 1;
+}
+
+.platform-checkbox-grid input {
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px rgba(23, 34, 59, 0.12);
+}
+
+.platform-pool-card {
+  background:
+    linear-gradient(180deg, #ffffff, #fbfcff) padding-box,
+    linear-gradient(135deg, color-mix(in srgb, var(--platform-accent) 34%, #dfe6f5), #eef3ff) border-box;
+  border: 1px solid transparent;
+  border-top: 4px solid var(--platform-accent);
+}
+
+.platform-pool-stats p {
+  background:
+    linear-gradient(180deg, #ffffff, #f8faff);
+  box-shadow: inset 0 0 0 1px rgba(223, 230, 245, 0.75);
+}
+
+.platform-pool-stats b {
+  font-weight: 950;
+}
+
+.platform-source-list article.platform-source-card {
+  background:
+    linear-gradient(180deg, #ffffff, #fbfcff) padding-box,
+    linear-gradient(135deg, color-mix(in srgb, var(--platform-accent) 28%, #dfe6f5), rgba(223, 230, 245, 0.7)) border-box;
+  border: 1px solid transparent;
+  border-top: 3px solid var(--platform-accent);
+}
+
+.platform-source-card .text-input,
+.business-form-grid .text-input,
+.business-settings-grid .text-input {
+  min-height: 46px;
+  border-color: #d9e4f5;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9);
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+
+.platform-source-card .text-input:focus-visible,
+.business-form-grid .text-input:focus-visible,
+.business-settings-grid .text-input:focus-visible {
+  border-color: #9db4ff;
+  box-shadow: var(--premium-ring);
+}
+
+.number-upload-card {
+  background:
+    radial-gradient(circle at 16% 18%, rgba(41, 71, 182, 0.09), transparent 34%),
+    linear-gradient(180deg, #ffffff, #f8faff);
+}
+
+.number-upload-card svg {
+  padding: 8px;
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  background: #eef3ff;
+}
+
+.number-file-summary {
+  background: linear-gradient(135deg, #ffffff, #f7f9ff);
+}
+
+.business-settings-grid {
+  border: 1px solid #e3eaf8;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+
+@keyframes campaignPageIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .campaign-builder-page,
+  .premium-campaign-stats article,
+  .campaign-workspace-column .content-card,
+  .campaign-overview-column .content-card,
+  .simple-campaign-item,
+  .platform-pool-card,
+  .platform-source-list article.platform-source-card,
+  .number-upload-card,
+  .number-file-summary,
+  .platform-checkbox-grid button {
+    animation: none;
+    transition: none;
+  }
+}
+
+/* ClinicOS UI redesign phase 8: global SaaS system */
+.commercial-page,
+.simple-accounts-page,
+.operations-logs-page,
+.diagnostics-page,
+.platform-workspace,
+.bale-bulk-page {
+  --global-surface-shadow: 0 18px 48px rgba(20, 31, 58, 0.08);
+  --global-surface-shadow-hover: 0 24px 64px rgba(20, 31, 58, 0.12);
+  --global-soft-border: #dfe7f6;
+  --global-card-radius: 22px;
+  animation: globalPageIn 240ms ease-out both;
+}
+
+.commercial-page .page-header,
+.simple-accounts-page .page-header,
+.operations-logs-page .page-header,
+.diagnostics-page .page-header,
+.platform-workspace .page-header,
+.bale-bulk-page .page-header {
+  position: relative;
+  overflow: hidden;
+  padding: 24px;
+  border: 1px solid var(--global-soft-border);
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at 88% 18%, rgba(41, 71, 182, 0.12), transparent 30%),
+    radial-gradient(circle at 16% 80%, rgba(124, 58, 237, 0.10), transparent 34%),
+    linear-gradient(135deg, #ffffff, #f8faff 58%, #eef4ff);
+  box-shadow: var(--global-surface-shadow);
+}
+
+.commercial-page .page-title,
+.simple-accounts-page .page-title,
+.operations-logs-page .page-title,
+.diagnostics-page .page-title {
+  font-size: 28px;
+  font-weight: 950;
+  letter-spacing: 0;
+}
+
+.commercial-page .page-copy,
+.simple-accounts-page .page-copy,
+.operations-logs-page .page-copy,
+.diagnostics-page .page-copy {
+  max-width: 780px;
+  color: var(--text-muted);
+  line-height: 1.9;
+}
+
+.commercial-page .panel,
+.commercial-page .status-card,
+.simple-accounts-page .content-card,
+.operations-logs-page .content-card,
+.diagnostics-panel,
+.diagnostics-preview-panel,
+.bale-bulk-page .panel,
+.platform-workspace .panel {
+  border: 1px solid transparent;
+  border-radius: var(--global-card-radius);
+  background:
+    linear-gradient(#ffffff, #ffffff) padding-box,
+    linear-gradient(135deg, rgba(41, 71, 182, 0.14), rgba(223, 231, 246, 0.9), rgba(124, 58, 237, 0.08)) border-box;
+  box-shadow: var(--global-surface-shadow);
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.commercial-page .panel:hover,
+.simple-accounts-page .content-card:hover,
+.operations-logs-page .content-card:hover,
+.diagnostics-panel:hover,
+.diagnostics-preview-panel:hover {
+  box-shadow: var(--global-surface-shadow-hover);
+}
+
+.commercial-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+
+.metric-card {
+  position: relative;
+  overflow: hidden;
+  min-height: 108px;
+  padding: 18px;
+  border: 1px solid transparent;
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, #ffffff, #fbfcff) padding-box,
+    linear-gradient(135deg, #dfe7f6, rgba(41, 71, 182, 0.18)) border-box;
+  box-shadow: 0 16px 36px rgba(20, 31, 58, 0.075);
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.metric-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: linear-gradient(180deg, var(--primary), #7c3aed);
+}
+
+.metric-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 22px 52px rgba(20, 31, 58, 0.11);
+}
+
+.metric-card span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.metric-card strong {
+  color: var(--text);
+  font-size: 28px;
+  font-weight: 950;
+}
+
+.commercial-page .panel-header,
+.content-card .panel-header,
+.diagnostics-panel .panel-header,
+.diagnostics-preview-panel .panel-header {
+  padding-bottom: 10px;
+  border-bottom: 1px solid #edf1f8;
+}
+
+.commercial-page .panel-title,
+.simple-accounts-page .panel-title,
+.operations-logs-page .panel-title,
+.diagnostics-page .panel-title {
+  font-size: 17px;
+  font-weight: 950;
+}
+
+.filter-bar,
+.operations-filter-grid,
+.scheduler-actions {
+  border-radius: 18px;
+  background: linear-gradient(180deg, #f8faff, #ffffff);
+}
+
+.filter-bar {
+  border-color: #e2e9f7;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.commercial-page input,
+.commercial-page select,
+.commercial-page textarea,
+.simple-accounts-page input,
+.simple-accounts-page select,
+.simple-accounts-page textarea,
+.operations-logs-page input,
+.operations-logs-page select,
+.operations-logs-page textarea {
+  min-height: 44px;
+  border-color: #d9e4f5;
+  border-radius: 12px;
+  background: #ffffff;
+  color: var(--text);
+}
+
+.table-scroll,
+.workspace-table-wrap {
+  overflow: hidden;
+  border: 1px solid #dfe7f6;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 14px 34px rgba(20, 31, 58, 0.06);
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.table th,
+.table td {
+  padding: 13px 12px;
+}
+
+.table th {
+  background: #f6f8fc;
+  color: #61708d;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.table tbody tr {
+  transition: background 130ms ease;
+}
+
+.table tbody tr:hover {
+  background: #f8faff;
+}
+
+.compact-row,
+.timeline-item,
+.operations-event-list article,
+.mobile-data-card,
+.diagnostics-list-item {
+  border: 1px solid #e2e9f7;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #ffffff, #fbfcff);
+  box-shadow: 0 10px 24px rgba(20, 31, 58, 0.055);
+  transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+}
+
+.compact-row:hover,
+.timeline-item:hover,
+.operations-event-list article:hover,
+.diagnostics-list-item:hover,
+.diagnostics-list-item.active {
+  transform: translateY(-1px);
+  border-color: #b9c8ff;
+  box-shadow: 0 16px 34px rgba(41, 71, 182, 0.10);
+}
+
+.ops-list {
+  gap: 10px;
+}
+
+.ops-list p,
+.status-stack p {
+  padding: 12px 14px;
+  border: 1px solid #e5ebf8;
+  border-radius: 14px;
+  background: #f8faff;
+}
+
+.operations-summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.operations-event-list article {
+  padding: 14px;
+  border-bottom: 0;
+}
+
+.simple-accounts-page .bale-table td strong,
+.simple-accounts-page .bale-table td small {
+  line-height: 1.7;
+}
+
+.simple-accounts-page .row-actions .icon-button,
+.diagnostics-preview-actions .secondary-button,
+.diagnostics-page .secondary-button {
+  border-radius: 12px;
+}
+
+.diagnostics-grid {
+  gap: 18px;
+}
+
+.diagnostics-list-item {
+  padding: 12px;
+}
+
+.diagnostics-list-item.active {
+  background:
+    linear-gradient(#f7f9ff, #f7f9ff) padding-box,
+    linear-gradient(135deg, #9db4ff, #dcd6ff) border-box;
+  border: 1px solid transparent;
+}
+
+.diagnostics-file-preview,
+.diagnostics-pre {
+  border: 1px solid #1e2f52;
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 16px 36px rgba(20, 31, 58, 0.14);
+}
+
+.empty-state,
+.loading-state,
+.error-state {
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(248, 250, 255, 0.95));
+  box-shadow: 0 12px 28px rgba(20, 31, 58, 0.055);
+}
+
+.primary-button,
+.secondary-button,
+.success-button,
+.danger-button,
+.icon-button {
+  transition: transform 130ms ease, box-shadow 130ms ease, background 130ms ease, border-color 130ms ease;
+}
+
+.primary-button:hover,
+.secondary-button:hover,
+.success-button:hover,
+.danger-button:hover,
+.icon-button:hover {
+  transform: translateY(-1px);
+}
+
+@keyframes globalPageIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 760px) {
+  .commercial-page .page-header,
+  .simple-accounts-page .page-header,
+  .operations-logs-page .page-header,
+  .diagnostics-page .page-header {
+    padding: 18px;
+    border-radius: 20px;
+  }
+
+  .commercial-page .page-title,
+  .simple-accounts-page .page-title,
+  .operations-logs-page .page-title,
+  .diagnostics-page .page-title {
+    font-size: 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .commercial-page,
+  .simple-accounts-page,
+  .operations-logs-page,
+  .diagnostics-page,
+  .metric-card,
+  .compact-row,
+  .timeline-item,
+  .operations-event-list article,
+  .mobile-data-card,
+  .diagnostics-list-item {
+    animation: none;
+    transition: none;
+  }
+}
+
 /* Bale Workspace phase 2 */
 .bale-workspace {
   display: grid;
