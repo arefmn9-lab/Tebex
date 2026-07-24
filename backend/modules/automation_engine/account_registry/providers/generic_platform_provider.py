@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from modules.automation_engine.account_registry.models import PlatformAccountRecord, utc_now
+from modules.automation_engine.account_registry.models import OperationalState, PlatformAccountRecord, utc_now
 from modules.automation_engine.account_registry.repository import JsonAccountRegistryRepository
 
 
@@ -44,6 +44,7 @@ class GenericPlatformAccountRegistryProvider:
         active = bool(payload.get("active", status == "active"))
         created_at = str(payload.get("created_at") or utc_now())
         daily_limit = payload.get("daily_limit")
+        operational_state = _operational_state_from_payload(payload)
         return PlatformAccountRecord(
             account_id=account_id,
             platform_id=platform_id,
@@ -57,5 +58,20 @@ class GenericPlatformAccountRegistryProvider:
             created_at=created_at,
             updated_at=str(payload.get("updated_at") or created_at),
             metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
-            alerts=[],
+            operational_state=operational_state,
+            alerts=operational_state.alerts,
         )
+
+
+def _operational_state_from_payload(payload: dict[str, Any]) -> OperationalState:
+    raw_state = payload.get("operational_state") if isinstance(payload.get("operational_state"), dict) else {}
+    alerts = raw_state.get("alerts") if isinstance(raw_state.get("alerts"), list) else payload.get("alerts")
+    capabilities = raw_state.get("capabilities") if isinstance(raw_state.get("capabilities"), dict) else payload.get("capabilities")
+    limits = raw_state.get("limits") if isinstance(raw_state.get("limits"), dict) else payload.get("limits")
+    return OperationalState(
+        connection_status=raw_state.get("connection_status") if "connection_status" in raw_state else payload.get("connection_status"),
+        last_error=raw_state.get("last_error") if "last_error" in raw_state else payload.get("last_error"),
+        capabilities=capabilities if isinstance(capabilities, dict) else {},
+        limits=limits if isinstance(limits, dict) else {},
+        alerts=alerts if isinstance(alerts, list) else [],
+    )

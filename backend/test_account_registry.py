@@ -130,6 +130,10 @@ def test_unsupported_health_ban_usage_fields_are_not_fabricated(tmp_path):
     assert "health_score" not in account
     assert "used_today" not in account
     assert account["alerts"] == []
+    assert account["operational_state"]["connection_status"] is None
+    assert account["operational_state"]["last_error"] is None
+    assert account["operational_state"]["capabilities"] == {}
+    assert account["operational_state"]["limits"] == {}
 
 
 def test_existing_platform_account_api_response_shape_remains_compatible(tmp_path):
@@ -138,6 +142,68 @@ def test_existing_platform_account_api_response_shape_remains_compatible(tmp_pat
 
     for key in ["account_id", "platform", "phone", "status", "daily_limit", "active"]:
         assert key in account
+
+
+def test_old_accounts_load_without_operational_state(tmp_path):
+    repository = JsonAccountRegistryRepository(tmp_path / "registry.json")
+    repository.create_platform_account(
+        {
+            "account_id": "telegram_legacy",
+            "platform_id": "telegram",
+            "platform": "telegram",
+            "display_name": "Legacy Telegram",
+            "identifier": "09120000001",
+            "phone": "09120000001",
+            "active": True,
+            "status": "active",
+            "daily_limit": 50,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "metadata": {},
+        }
+    )
+    service = AccountRegistryService(
+        bale_provider=BaleAccountRegistryProvider(FakeBaleAccountStore()),
+        generic_provider=GenericPlatformAccountRegistryProvider(repository),
+    )
+
+    account = service.list_platform_accounts("telegram")[0]
+
+    assert account["account_id"] == "telegram_legacy"
+    assert account["operational_state"] == {
+        "connection_status": None,
+        "last_error": None,
+        "capabilities": {},
+        "limits": {},
+        "alerts": [],
+    }
+    assert account["alerts"] == []
+
+
+def test_optional_operational_state_fields_persist(tmp_path):
+    service = make_service(tmp_path)
+    service.create_platform_account(
+        "telegram",
+        {
+            "phone": "09120000001",
+            "operational_state": {
+                "connection_status": "manual_review",
+                "last_error": "explicit_operator_note",
+                "capabilities": {"browser_open": False},
+                "limits": {"daily": 25},
+                "alerts": [{"category": "authentication_required", "label": "ورود لازم است"}],
+            },
+        },
+    )
+
+    recreated = make_service(tmp_path)
+    account = recreated.list_platform_accounts("telegram")[0]
+
+    assert account["operational_state"]["connection_status"] == "manual_review"
+    assert account["operational_state"]["last_error"] == "explicit_operator_note"
+    assert account["operational_state"]["capabilities"] == {"browser_open": False}
+    assert account["operational_state"]["limits"] == {"daily": 25}
+    assert account["alerts"] == [{"category": "authentication_required", "label": "ورود لازم است"}]
 
 
 def test_protected_forwarding_scenario_hash_is_unchanged():

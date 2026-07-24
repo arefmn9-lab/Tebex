@@ -23,6 +23,18 @@ class IdentityRecord:
 
 
 @dataclass
+class OperationalState:
+    connection_status: str | None = None
+    last_error: str | None = None
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    limits: dict[str, Any] = field(default_factory=dict)
+    alerts: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class PlatformAccountRecord:
     account_id: str
     platform_id: str
@@ -36,10 +48,13 @@ class PlatformAccountRecord:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    operational_state: OperationalState = field(default_factory=OperationalState)
     alerts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["platform"] = self.platform_id
         data["username_or_number"] = self.identifier
+        data["operational_state"] = self.operational_state.to_dict()
+        data["alerts"] = self.operational_state.alerts
         return data
