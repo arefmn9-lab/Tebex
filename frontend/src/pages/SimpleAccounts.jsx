@@ -76,8 +76,69 @@ function statusLabel(account) {
   return labels[status] || status;
 }
 
+function operationalState(account) {
+  return account?.operational_state && typeof account.operational_state === "object" ? account.operational_state : {};
+}
+
+function connectionStatus(account) {
+  const status = operationalState(account).connection_status;
+  return typeof status === "string" && status.trim() ? status.trim() : "";
+}
+
+function connectionStatusLabel(status) {
+  const labels = {
+    connected: "متصل",
+    disconnected: "قطع ارتباط",
+    requires_action: "نیازمند اقدام",
+    unknown: "نامشخص",
+  };
+  return labels[status] || status;
+}
+
+function connectionTone(status) {
+  if (status === "connected") return "success";
+  if (status === "requires_action" || status === "disconnected") return "warning";
+  return "neutral";
+}
+
 function explicitAlerts(account) {
-  return Array.isArray(account.alerts) ? account.alerts.filter(Boolean) : [];
+  const topLevelAlerts = Array.isArray(account.alerts) ? account.alerts : [];
+  const operationalAlerts = Array.isArray(operationalState(account).alerts) ? operationalState(account).alerts : [];
+  const seen = new Set();
+  return [...topLevelAlerts, ...operationalAlerts].filter((alert) => {
+    if (!alert) return false;
+    const key = typeof alert === "string" ? alert : alert.code || alert.category || alert.label || JSON.stringify(alert);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function alertLabel(alert) {
+  return typeof alert === "string" ? alert : alert.label || alert.category || alert.code || "";
+}
+
+function explicitObjectEntries(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== "");
+}
+
+function formatOperationalValue(value) {
+  if (typeof value === "boolean") return value ? "فعال" : "غیرفعال";
+  if (Array.isArray(value)) return value.join("، ");
+  if (typeof value === "object" && value !== null) return Object.entries(value).map(([key, item]) => `${key}: ${item}`).join("، ");
+  return String(value);
+}
+
+function operationalDetails(account) {
+  const state = operationalState(account);
+  return {
+    connection: connectionStatus(account),
+    alerts: explicitAlerts(account),
+    capabilities: explicitObjectEntries(state.capabilities),
+    limits: explicitObjectEntries(state.limits),
+    lastError: typeof state.last_error === "string" && state.last_error.trim() ? state.last_error.trim() : "",
+  };
 }
 
 function summaryForPlatform(summary, platformId) {
@@ -327,6 +388,14 @@ export default function SimpleAccounts() {
     ["اکانت‌های غیرفعال", summary?.inactive_accounts ?? 0],
     ["پیام‌رسان‌های دارای اکانت", summary?.platforms_with_accounts ?? 0],
   ];
+  const detailOperation = details ? operationalDetails(details) : null;
+  const hasDetailOperation = Boolean(
+    detailOperation?.connection ||
+    detailOperation?.alerts.length ||
+    detailOperation?.capabilities.length ||
+    detailOperation?.limits.length ||
+    detailOperation?.lastError
+  );
 
   return (
     <section className="simple-accounts-page" dir="rtl">
@@ -432,6 +501,7 @@ export default function SimpleAccounts() {
                 const meta = platformInfo(platformId);
                 const Icon = meta.icon;
                 const alerts = explicitAlerts(account);
+                const operation = operationalDetails(account);
                 const visibleAlerts = alerts.slice(0, 2);
                 const extraAlertCount = Math.max(0, alerts.length - visibleAlerts.length);
                 return (
@@ -450,16 +520,21 @@ export default function SimpleAccounts() {
                       <span>{meta.name}</span>
                       {accountIdentifier(account) !== "ثبت نشده" ? <b>{accountIdentifier(account)}</b> : null}
                     </div>
-                    {(account.daily_limit !== undefined && account.daily_limit !== null) || alerts.length ? (
+                    {(account.daily_limit !== undefined && account.daily_limit !== null) || operation.connection || alerts.length || operation.limits.length || operation.capabilities.length ? (
                       <div className="account-card-meta">
                         {account.daily_limit !== undefined && account.daily_limit !== null ? (
                           <span className="account-card-pill">محدودیت روزانه: {account.daily_limit}</span>
                         ) : null}
                         {alerts.length ? <StatusBadge tone="warning">نیازمند اقدام</StatusBadge> : null}
+                        {operation.connection ? (
+                          <StatusBadge tone={connectionTone(operation.connection)}>{connectionStatusLabel(operation.connection)}</StatusBadge>
+                        ) : null}
                         {visibleAlerts.map((alert) => (
-                          <StatusBadge key={alert.code || alert.category || alert.label} tone="warning">{alert.label || alert.category}</StatusBadge>
+                          <StatusBadge key={typeof alert === "string" ? alert : alert.code || alert.category || alert.label} tone="warning">{alertLabel(alert)}</StatusBadge>
                         ))}
                         {extraAlertCount ? <span className="account-card-pill">+{extraAlertCount}</span> : null}
+                        {operation.limits.length ? <span className="account-card-pill">محدودیت عملیاتی: {operation.limits.length}</span> : null}
+                        {operation.capabilities.length ? <span className="account-card-pill">قابلیت: {operation.capabilities.length}</span> : null}
                       </div>
                     ) : null}
                     {renderAccountActions(account)}
@@ -519,9 +594,38 @@ export default function SimpleAccounts() {
                   <span>هشدارها</span>
                   <div>
                     {explicitAlerts(details).map((alert) => (
-                      <StatusBadge key={alert.code || alert.category || alert.label} tone="warning">{alert.label || alert.category}</StatusBadge>
+                      <StatusBadge key={typeof alert === "string" ? alert : alert.code || alert.category || alert.label} tone="warning">{alertLabel(alert)}</StatusBadge>
                     ))}
                   </div>
+                </div>
+              ) : null}
+              {hasDetailOperation ? (
+                <div className="account-operational-section">
+                  <div className="account-operational-heading">
+                    <span>وضعیت عملیاتی</span>
+                  </div>
+                  {detailOperation.connection ? (
+                    <p><span>ارتباط</span><b>{connectionStatusLabel(detailOperation.connection)}</b></p>
+                  ) : null}
+                  {detailOperation.lastError ? (
+                    <p className="is-warning"><span>آخرین خطا</span><b>{detailOperation.lastError}</b></p>
+                  ) : null}
+                  {detailOperation.limits.length ? (
+                    <div className="account-operational-list">
+                      <span>محدودیت‌ها</span>
+                      {detailOperation.limits.map(([key, value]) => (
+                        <p key={key}><span>{key}</span><b>{formatOperationalValue(value)}</b></p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {detailOperation.capabilities.length ? (
+                    <div className="account-operational-list">
+                      <span>قابلیت‌ها</span>
+                      {detailOperation.capabilities.map(([key, value]) => (
+                        <p key={key}><span>{key}</span><b>{formatOperationalValue(value)}</b></p>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>
