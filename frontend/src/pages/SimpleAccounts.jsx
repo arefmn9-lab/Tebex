@@ -1,4 +1,4 @@
-import { Edit3, Eye, Info, MessageCircle, Plus, RefreshCw, SendHorizontal, Trash2, UsersRound } from "lucide-react";
+import { ArrowRight, Edit3, Eye, Info, MessageCircle, Plus, RefreshCw, SendHorizontal, Trash2, UsersRound, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import {
   createPlatformAccount,
@@ -10,6 +10,7 @@ import {
 import { openBaleLogin } from "../api/platforms";
 import {
   ContentCard,
+  DangerButton,
   FormField,
   IconButton,
   InlineError,
@@ -105,6 +106,9 @@ export default function SimpleAccounts() {
   const [editing, setEditing] = useState(null);
   const [creating, setCreating] = useState(false);
   const [details, setDetails] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [busyAccount, setBusyAccount] = useState("");
   const [form, setForm] = useState(emptyForm("bale"));
 
   const selectedMeta = platformInfo(selectedPlatform);
@@ -196,6 +200,7 @@ export default function SimpleAccounts() {
       return;
     }
     setError("");
+    setSaving(true);
     try {
       if (editing) {
         await updatePlatformAccount(platformId, form.account_id, payload);
@@ -209,21 +214,57 @@ export default function SimpleAccounts() {
       await load(platformId);
     } catch (err) {
       setError(err.message || "ذخیره اکانت انجام نشد");
+    } finally {
+      setSaving(false);
     }
   }
 
-  async function remove(account) {
+  async function confirmDelete() {
+    const account = pendingDelete;
+    if (!account) return;
     const id = accountId(account);
     const platformId = accountPlatform(account);
-    if (!id || !window.confirm("حذف این اکانت انجام شود؟")) return;
+    if (!id) return;
     setError("");
+    setBusyAccount(`delete:${id}`);
     try {
       await deletePlatformAccount(platformId, id);
       setNotice("اکانت حذف شد.");
       if (details && accountId(details) === id) setDetails(null);
+      setEditing(null);
+      setCreating(false);
+      setPendingDelete(null);
       await load(platformId);
     } catch (err) {
       setError(err.message || "حذف اکانت انجام نشد");
+    } finally {
+      setBusyAccount("");
+    }
+  }
+
+  async function toggleActive(account) {
+    const id = accountId(account);
+    const platformId = accountPlatform(account);
+    if (!id) return;
+    setError("");
+    setBusyAccount(`active:${id}`);
+    try {
+      await updatePlatformAccount(platformId, id, {
+        display_name: accountLabel(account),
+        username_or_number: accountIdentifier(account),
+        identifier: accountIdentifier(account),
+        phone: account.phone || accountIdentifier(account),
+        status: isActive(account) ? "disabled" : "active",
+        active: !isActive(account),
+        daily_limit: account.daily_limit ?? null,
+      });
+      setNotice(isActive(account) ? "اکانت غیرفعال شد." : "اکانت فعال شد.");
+      if (details && accountId(details) === id) setDetails(null);
+      await load(platformId);
+    } catch (err) {
+      setError(err.message || "تغییر وضعیت اکانت انجام نشد");
+    } finally {
+      setBusyAccount("");
     }
   }
 
@@ -241,6 +282,17 @@ export default function SimpleAccounts() {
 
   useEffect(() => {
     load("");
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") {
+        setDetails(null);
+        setPendingDelete(null);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   const selectedSummary = summaryForPlatform(summary, selectedPlatform);
@@ -265,6 +317,13 @@ export default function SimpleAccounts() {
 
       {!loading ? (
         <>
+          <div className="account-hq-section-head">
+            <div>
+              <span>نمای کل رجیستری</span>
+              <h2>حساب‌های ثبت‌شده در همه پیام‌رسان‌ها</h2>
+            </div>
+          </div>
+
           <div className="account-hq-overview">
             {totalSummaryCards.map(([label, value]) => (
               <article key={label}>
@@ -309,6 +368,17 @@ export default function SimpleAccounts() {
             title={`مرکز اکانت‌های ${selectedMeta.name}`}
             description={`کل: ${selectedSummary.total || 0} · فعال: ${selectedSummary.active || 0} · غیرفعال: ${selectedSummary.inactive || 0}`}
           >
+            <div className="platform-hq-title" style={{ "--platform-accent": selectedMeta.accent }}>
+              <button type="button" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
+                <ArrowRight size={16} />
+                نمای کل
+              </button>
+              <span className="platform-logo"><SelectedIcon size={22} /></span>
+              <div>
+                <strong>مرکز اکانت‌های {selectedMeta.name}</strong>
+                <small>{selectedMeta.label}</small>
+              </div>
+            </div>
             <div className="account-hq-toolbar">
               <SecondaryButton onClick={() => selectPlatform(selectedPlatform)} disabled={platformLoading}>
                 <RefreshCw size={16} />
@@ -357,8 +427,9 @@ export default function SimpleAccounts() {
                     <div className="account-card-actions">
                       <IconButton label="جزئیات" onClick={() => setDetails(account)}><Info size={16} /></IconButton>
                       {platformId === "bale" ? <IconButton label="مشاهده مرورگر" onClick={() => openBrowser(account)}><Eye size={16} /></IconButton> : null}
-                      <IconButton label="ویرایش" onClick={() => openEdit(account)}><Edit3 size={16} /></IconButton>
-                      <IconButton label="حذف" onClick={() => remove(account)}><Trash2 size={16} /></IconButton>
+                      <IconButton label={isActive(account) ? "غیرفعال‌کردن" : "فعال‌کردن"} onClick={() => toggleActive(account)} disabled={Boolean(busyAccount)}><RefreshCw size={16} /></IconButton>
+                      <IconButton label="ویرایش" onClick={() => openEdit(account)} disabled={Boolean(busyAccount)}><Edit3 size={16} /></IconButton>
+                      <IconButton label="حذف" onClick={() => setPendingDelete(account)} disabled={Boolean(busyAccount)}><Trash2 size={16} /></IconButton>
                     </div>
                   </article>
                 );
@@ -388,27 +459,52 @@ export default function SimpleAccounts() {
             </FormField>
           </div>
           <div className="modal-actions">
-            <PrimaryButton onClick={saveAccount}>ذخیره</PrimaryButton>
-            <SecondaryButton onClick={() => { setCreating(false); setEditing(null); }}>انصراف</SecondaryButton>
+            <PrimaryButton onClick={saveAccount} disabled={saving}>{saving ? "در حال ذخیره" : "ذخیره"}</PrimaryButton>
+            <SecondaryButton onClick={() => { setCreating(false); setEditing(null); }} disabled={saving}>انصراف</SecondaryButton>
           </div>
         </Modal>
       ) : null}
 
       {details ? (
-        <Modal title="جزئیات اکانت" onClose={() => setDetails(null)}>
-          <div className="account-details-panel">
-            <p><span>نام ذخیره‌شده</span><b>{accountLabel(details)}</b></p>
-            <p><span>پیام‌رسان</span><b>{platformInfo(accountPlatform(details)).name}</b></p>
-            <p><span>شماره یا شناسه</span><b>{accountIdentifier(details)}</b></p>
-            <p><span>وضعیت</span><b>{statusLabel(details)}</b></p>
-            {details.daily_limit !== undefined && details.daily_limit !== null ? <p><span>محدودیت روزانه</span><b>{details.daily_limit}</b></p> : null}
-            {Array.isArray(details.alerts) && details.alerts.length ? (
-              <p><span>هشدارها</span><b>{details.alerts.slice(0, 3).map((alert) => alert.label || alert.category).join("، ")}</b></p>
-            ) : null}
+        <div className="account-drawer-backdrop" role="presentation">
+          <aside aria-modal="true" aria-label="جزئیات اکانت" className="account-details-drawer" dir="rtl" role="dialog">
+            <div className="account-drawer-header">
+              <div>
+                <span>جزئیات اکانت</span>
+                <h2>{accountLabel(details)}</h2>
+              </div>
+              <IconButton label="بستن" onClick={() => setDetails(null)}><X size={17} /></IconButton>
+            </div>
+            <div className="account-details-panel">
+              <p><span>نام ذخیره‌شده</span><b>{accountLabel(details)}</b></p>
+              <p><span>پیام‌رسان</span><b>{platformInfo(accountPlatform(details)).name}</b></p>
+              <p><span>شماره یا شناسه</span><b>{accountIdentifier(details)}</b></p>
+              {accountId(details) ? <p className="is-secondary"><span>شناسه پشتیبانی</span><b>{accountId(details)}</b></p> : null}
+              <p><span>وضعیت</span><b>{statusLabel(details)}</b></p>
+              {details.daily_limit !== undefined && details.daily_limit !== null ? <p><span>محدودیت روزانه</span><b>{details.daily_limit}</b></p> : null}
+              {Array.isArray(details.alerts) && details.alerts.length ? (
+                <p><span>هشدارها</span><b>{details.alerts.slice(0, 3).map((alert) => alert.label || alert.category).join("، ")}</b></p>
+              ) : null}
+            </div>
+            <div className="account-drawer-actions">
+              {accountPlatform(details) === "bale" ? <SecondaryButton onClick={() => openBrowser(details)}><Eye size={16} />مشاهده مرورگر</SecondaryButton> : null}
+              <SecondaryButton onClick={() => toggleActive(details)} disabled={Boolean(busyAccount)}>{isActive(details) ? "غیرفعال‌کردن" : "فعال‌کردن"}</SecondaryButton>
+              <PrimaryButton onClick={() => openEdit(details)}>ویرایش</PrimaryButton>
+            </div>
+          </aside>
+        </div>
+      ) : null}
+
+      {pendingDelete ? (
+        <Modal title="حذف اکانت" onClose={() => setPendingDelete(null)}>
+          <div className="account-delete-confirm">
+            <strong>{accountLabel(pendingDelete)}</strong>
+            <p>{platformInfo(accountPlatform(pendingDelete)).name}</p>
+            <span>این عملیات برگشت‌پذیر نیست و اکانت از رجیستری همین پیام‌رسان حذف می‌شود.</span>
           </div>
           <div className="modal-actions">
-            {accountPlatform(details) === "bale" ? <SecondaryButton onClick={() => openBrowser(details)}><Eye size={16} />مشاهده مرورگر</SecondaryButton> : null}
-            <PrimaryButton onClick={() => openEdit(details)}>ویرایش</PrimaryButton>
+            <DangerButton onClick={confirmDelete} disabled={Boolean(busyAccount)}>{busyAccount ? "در حال حذف" : "حذف اکانت"}</DangerButton>
+            <SecondaryButton onClick={() => setPendingDelete(null)} disabled={Boolean(busyAccount)}>انصراف</SecondaryButton>
           </div>
         </Modal>
       ) : null}

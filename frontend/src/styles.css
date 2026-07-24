@@ -2872,25 +2872,51 @@ textarea.campaign-message-editor {
 /* ClinicOS UI phase 9: Accounts redesign */
 .account-platform-summary-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.account-hq-section-head {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: -2px;
+}
+
+.account-hq-section-head span,
+.platform-hq-title small,
+.account-drawer-header span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.account-hq-section-head h2,
+.account-drawer-header h2 {
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1.45;
 }
 
 .account-hq-overview {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
+  gap: 10px;
 }
 
 .account-hq-overview article {
   display: grid;
-  gap: 8px;
-  min-height: 92px;
-  padding: 16px;
+  gap: 6px;
+  min-height: 84px;
+  padding: 14px 16px;
   border: 1px solid #e4ebf6;
-  border-radius: 18px;
-  background: linear-gradient(180deg, #ffffff, #f9fbff);
-  box-shadow: 0 16px 36px rgba(20, 31, 58, 0.07);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at top right, rgba(41, 71, 182, 0.08), transparent 38%),
+    linear-gradient(180deg, #ffffff, #f9fbff);
+  box-shadow: 0 14px 30px rgba(20, 31, 58, 0.065);
 }
 
 .account-hq-overview span {
@@ -2901,23 +2927,23 @@ textarea.campaign-message-editor {
 
 .account-hq-overview strong {
   color: var(--text);
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 950;
 }
 
 .account-platform-summary-card {
   display: grid;
-  gap: 16px;
+  gap: 13px;
   width: 100%;
   text-align: right;
-  padding: 18px;
+  padding: 15px;
   border: 1px solid transparent;
   border-top: 4px solid var(--platform-accent);
-  border-radius: 22px;
+  border-radius: 18px;
   background:
     linear-gradient(180deg, #ffffff, #fbfcff) padding-box,
     linear-gradient(135deg, color-mix(in srgb, var(--platform-accent) 26%, #dfe7f6), #eef3ff) border-box;
-  box-shadow: 0 18px 46px rgba(20, 31, 58, 0.08);
+  box-shadow: 0 14px 34px rgba(20, 31, 58, 0.075);
   color: inherit;
   cursor: pointer;
   transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
@@ -2926,14 +2952,14 @@ textarea.campaign-message-editor {
 .account-platform-summary-card:hover,
 .account-platform-summary-card.is-active {
   transform: translateY(-2px);
-  box-shadow: 0 24px 60px rgba(20, 31, 58, 0.12);
+  box-shadow: 0 20px 48px rgba(20, 31, 58, 0.11);
 }
 
 .account-platform-summary-card.is-active {
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--platform-accent) 8%, #ffffff), #ffffff) padding-box,
     linear-gradient(135deg, color-mix(in srgb, var(--platform-accent) 56%, #dfe7f6), #e7edff) border-box;
-  box-shadow: 0 24px 60px rgba(20, 31, 58, 0.14), 0 0 0 3px color-mix(in srgb, var(--platform-accent) 16%, transparent);
+  box-shadow: 0 20px 48px rgba(20, 31, 58, 0.13), 0 0 0 3px color-mix(in srgb, var(--platform-accent) 15%, transparent);
 }
 
 .account-platform-summary-card:focus-visible {
@@ -2965,10 +2991,10 @@ textarea.campaign-message-editor {
 
 .account-platform-stats p {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   margin: 0;
-  padding: 10px;
-  border-radius: 14px;
+  padding: 8px;
+  border-radius: 12px;
   background: #f8faff;
   box-shadow: inset 0 0 0 1px #e6edf8;
 }
@@ -2981,7 +3007,7 @@ textarea.campaign-message-editor {
 
 .account-platform-stats b {
   color: var(--text);
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 950;
 }
 
@@ -2990,8 +3016,8 @@ textarea.campaign-message-editor {
   justify-content: center;
   align-items: center;
   min-height: 38px;
-  padding: 8px 12px;
-  border-radius: 14px;
+  padding: 7px 10px;
+  border-radius: 12px;
   background: color-mix(in srgb, var(--platform-accent) 10%, #f8faff);
   color: color-mix(in srgb, var(--platform-accent) 78%, var(--text));
   font-size: 12px;
@@ -3000,7 +3026,12 @@ textarea.campaign-message-editor {
 
 .account-card-list {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
   gap: 12px;
+}
+
+.account-card-list:empty {
+  display: none;
 }
 
 .account-hq-toolbar {
@@ -3011,18 +3042,49 @@ textarea.campaign-message-editor {
   margin-bottom: 14px;
 }
 
+.platform-hq-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--platform-accent) 18%, #e4ebf6);
+  border-radius: 18px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--platform-accent) 7%, #ffffff), #ffffff);
+}
+
+.platform-hq-title > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 1px solid #dfe7f2;
+  border-radius: 12px;
+  background: #ffffff;
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.platform-hq-title strong {
+  display: block;
+  color: var(--text);
+  font-size: 17px;
+}
+
 .account-card-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(140px, auto) auto;
-  gap: 14px;
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
   padding: 14px;
   border: 1px solid transparent;
-  border-radius: 18px;
+  border-radius: 16px;
   background:
     linear-gradient(180deg, #ffffff, #fbfcff) padding-box,
     linear-gradient(135deg, rgba(223, 231, 246, 0.95), color-mix(in srgb, var(--platform-accent) 15%, #ffffff)) border-box;
-  box-shadow: 0 14px 34px rgba(20, 31, 58, 0.065);
+  box-shadow: 0 12px 28px rgba(20, 31, 58, 0.062);
   transition: transform 150ms ease, box-shadow 150ms ease, border-color 150ms ease;
 }
 
@@ -3074,10 +3136,11 @@ textarea.campaign-message-editor {
 .account-card-limit {
   display: grid;
   gap: 4px;
-  min-width: 130px;
+  min-width: 0;
   padding: 9px 12px;
   border-radius: 14px;
   background: #f8faff;
+  grid-column: 1 / -1;
 }
 
 .account-card-limit b {
@@ -3086,7 +3149,10 @@ textarea.campaign-message-editor {
 
 .account-card-actions {
   display: flex;
+  grid-column: 1 / -1;
   gap: 6px;
+  justify-content: flex-end;
+  padding-top: 2px;
 }
 
 .account-badge-stack {
@@ -3105,6 +3171,7 @@ textarea.campaign-message-editor {
   border-radius: 20px;
   background: linear-gradient(135deg, color-mix(in srgb, var(--platform-accent) 7%, #ffffff), #ffffff);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
+  margin-bottom: 12px;
 }
 
 .account-platform-empty strong,
@@ -3152,6 +3219,12 @@ textarea.campaign-message-editor {
   background: #f8faff;
 }
 
+.account-details-panel p.is-secondary b {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .account-details-panel span {
   color: var(--text-muted);
   font-size: 12px;
@@ -3164,6 +3237,76 @@ textarea.campaign-message-editor {
   text-align: left;
 }
 
+.account-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: flex-start;
+  background: rgba(12, 20, 36, 0.28);
+  backdrop-filter: blur(3px);
+}
+
+.account-details-drawer {
+  width: min(420px, 100%);
+  height: 100%;
+  padding: 18px;
+  border-right: 1px solid #e0e7f2;
+  background: #ffffff;
+  box-shadow: 24px 0 70px rgba(20, 31, 58, 0.18);
+  overflow-y: auto;
+  animation: accountDrawerIn 170ms ease-out;
+}
+
+.account-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #edf1f7;
+}
+
+.account-drawer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.account-delete-confirm {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid #f2c9c9;
+  border-radius: 16px;
+  background: #fff7f7;
+}
+
+.account-delete-confirm strong {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.account-delete-confirm p,
+.account-delete-confirm span {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.8;
+}
+
+@keyframes accountDrawerIn {
+  from {
+    opacity: 0;
+    transform: translateX(-18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 @media (max-width: 900px) {
   .account-hq-overview {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3174,12 +3317,15 @@ textarea.campaign-message-editor {
   }
 
   .account-card-row {
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 1fr;
   }
 
-  .account-card-limit,
   .account-card-actions {
     grid-column: 1 / -1;
+  }
+
+  .account-card-actions {
+    justify-content: flex-start;
   }
 }
 
@@ -3194,8 +3340,19 @@ textarea.campaign-message-editor {
     display: grid;
   }
 
+  .platform-hq-title,
+  .account-platform-empty {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
   .account-card-actions .icon-button {
     flex: 1;
+  }
+
+  .account-details-drawer {
+    width: 100%;
+    border-right: 0;
   }
 }
 
