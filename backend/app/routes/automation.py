@@ -32,7 +32,7 @@ from modules.automation_engine.platforms.platform_registry import (
     has_platform,
     list_platforms as registry_list_platforms,
 )
-from modules.automation_engine.platforms.platform_store import platform_store
+from modules.automation_engine.account_registry import account_registry_service
 from modules.automation_engine.plugins.bale import bale_plugin
 from modules.automation_engine.plugins.bale.account_store import bale_account_store, canonical_source_channel_url, normalize_source_channel_uid
 from modules.automation_engine.plugins.bale.contact_store import bale_contact_store
@@ -1802,6 +1802,12 @@ def list_automation_platforms(response: Response) -> list[dict[str, str | bool]]
     return registry_list_platforms()
 
 
+@router.get("/account-registry/summary")
+def get_account_registry_summary(response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return account_registry_service.summarize_all_platforms([str(platform["id"]) for platform in registry_list_platforms()])
+
+
 @router.get("/browser/providers")
 def list_browser_providers(response: Response) -> list[dict[str, Any]]:
     _set_dashboard_cors_headers(response)
@@ -2095,9 +2101,7 @@ def list_platform_bulk_contact_lists(platform_id: str, response: Response) -> li
 def list_platform_accounts(platform_id: str, response: Response) -> list[dict[str, Any]]:
     _set_dashboard_cors_headers(response)
     _ensure_platform(platform_id)
-    if platform_id == "bale":
-        return bale_account_store.list_accounts()
-    return platform_store.list_accounts(platform_id)
+    return account_registry_service.list_platform_accounts(platform_id)
 
 
 @router.post("/platforms/{platform_id}/accounts")
@@ -2108,17 +2112,36 @@ def create_platform_account(
 ) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     _ensure_platform(platform_id)
-    if platform_id == "bale":
-        try:
-            return bale_account_store.create_account(request.model_dump())
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return platform_store.create_account(
-        platform_id,
-        phone=request.phone,
-        status=request.status,
-        daily_limit=request.daily_limit,
-    )
+    try:
+        return account_registry_service.create_platform_account(platform_id, request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.put("/platforms/{platform_id}/accounts/{account_id}")
+def update_platform_account(
+    platform_id: str,
+    account_id: str,
+    request: BaleAccountUpdateRequest,
+    response: Response,
+) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    _ensure_platform(platform_id)
+    payload = {key: value for key, value in request.model_dump().items() if value is not None}
+    try:
+        return account_registry_service.update_platform_account(platform_id, account_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Account not found: {account_id}") from None
+
+
+@router.delete("/platforms/{platform_id}/accounts/{account_id}")
+def delete_platform_account(platform_id: str, account_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    _ensure_platform(platform_id)
+    try:
+        return account_registry_service.delete_platform_account(platform_id, account_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Account not found: {account_id}") from None
 
 
 @router.get("/platforms/{platform_id}/tasks")
