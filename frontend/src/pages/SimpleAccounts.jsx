@@ -76,6 +76,10 @@ function statusLabel(account) {
   return labels[status] || status;
 }
 
+function explicitAlerts(account) {
+  return Array.isArray(account.alerts) ? account.alerts.filter(Boolean) : [];
+}
+
 function summaryForPlatform(summary, platformId) {
   return (summary?.platforms || []).find((item) => item.platform_id === platformId) || {
     platform_id: platformId,
@@ -280,6 +284,27 @@ export default function SimpleAccounts() {
     }
   }
 
+  function renderAccountActions(account) {
+    const id = accountId(account);
+    const platformId = accountPlatform(account);
+    const busy = busyAccount.endsWith(`:${id}`);
+    const activeBusy = busyAccount === `active:${id}`;
+    const deleteBusy = busyAccount === `delete:${id}`;
+    return (
+      <div className="account-card-actions">
+        <IconButton label="جزئیات" onClick={() => setDetails(account)} disabled={busy}><Info size={16} /></IconButton>
+        {platformId === "bale" ? <IconButton label="مشاهده مرورگر" onClick={() => openBrowser(account)} disabled={busy}><Eye size={16} /></IconButton> : null}
+        <IconButton label={isActive(account) ? "غیرفعال‌کردن" : "فعال‌کردن"} onClick={() => toggleActive(account)} disabled={busy}>
+          <RefreshCw className={activeBusy ? "is-spinning" : ""} size={16} />
+        </IconButton>
+        <IconButton label="ویرایش" onClick={() => openEdit(account)} disabled={busy}><Edit3 size={16} /></IconButton>
+        <IconButton label="حذف" onClick={() => setPendingDelete(account)} disabled={busy}>
+          <Trash2 className={deleteBusy ? "is-spinning" : ""} size={16} />
+        </IconButton>
+      </div>
+    );
+  }
+
   useEffect(() => {
     load("");
   }, []);
@@ -406,31 +431,38 @@ export default function SimpleAccounts() {
                 const platformId = accountPlatform(account);
                 const meta = platformInfo(platformId);
                 const Icon = meta.icon;
-                const alerts = Array.isArray(account.alerts) ? account.alerts.slice(0, 3) : [];
+                const alerts = explicitAlerts(account);
+                const visibleAlerts = alerts.slice(0, 2);
+                const extraAlertCount = Math.max(0, alerts.length - visibleAlerts.length);
                 return (
-                  <article className="account-card-row" key={accountId(account)} style={{ "--platform-accent": meta.accent }}>
-                    <button type="button" className="account-card-main as-button" onClick={() => setDetails(account)}>
-                      <span className="platform-logo"><Icon size={20} /></span>
-                      <div>
-                        <strong>{accountLabel(account)}</strong>
-                        <small>{accountIdentifier(account)}</small>
-                      </div>
-                    </button>
-                    <div className="account-badge-stack">
+                  <article className={`account-card-row ${busyAccount.endsWith(`:${accountId(account)}`) ? "is-busy" : ""}`} key={accountId(account)} style={{ "--platform-accent": meta.accent }}>
+                    <div className="account-card-topline">
+                      <button type="button" className="account-card-main as-button" onClick={() => setDetails(account)} disabled={busyAccount.endsWith(`:${accountId(account)}`)}>
+                        <span className="account-platform-avatar"><Icon size={20} /></span>
+                        <div>
+                          <strong>{accountLabel(account)}</strong>
+                          <small>{accountIdentifier(account)}</small>
+                        </div>
+                      </button>
                       <StatusBadge tone={isActive(account) ? "success" : "warning"}>{statusLabel(account)}</StatusBadge>
-                      {alerts.map((alert) => <StatusBadge key={alert.code || alert.category} tone="warning">{alert.label || alert.category}</StatusBadge>)}
                     </div>
-                    <div className="account-card-limit">
-                      <span>محدودیت روزانه</span>
-                      <b>{account.daily_limit ?? "ثبت نشده"}</b>
+                    <div className="account-card-secondary">
+                      <span>{meta.name}</span>
+                      {accountIdentifier(account) !== "ثبت نشده" ? <b>{accountIdentifier(account)}</b> : null}
                     </div>
-                    <div className="account-card-actions">
-                      <IconButton label="جزئیات" onClick={() => setDetails(account)}><Info size={16} /></IconButton>
-                      {platformId === "bale" ? <IconButton label="مشاهده مرورگر" onClick={() => openBrowser(account)}><Eye size={16} /></IconButton> : null}
-                      <IconButton label={isActive(account) ? "غیرفعال‌کردن" : "فعال‌کردن"} onClick={() => toggleActive(account)} disabled={Boolean(busyAccount)}><RefreshCw size={16} /></IconButton>
-                      <IconButton label="ویرایش" onClick={() => openEdit(account)} disabled={Boolean(busyAccount)}><Edit3 size={16} /></IconButton>
-                      <IconButton label="حذف" onClick={() => setPendingDelete(account)} disabled={Boolean(busyAccount)}><Trash2 size={16} /></IconButton>
-                    </div>
+                    {(account.daily_limit !== undefined && account.daily_limit !== null) || alerts.length ? (
+                      <div className="account-card-meta">
+                        {account.daily_limit !== undefined && account.daily_limit !== null ? (
+                          <span className="account-card-pill">محدودیت روزانه: {account.daily_limit}</span>
+                        ) : null}
+                        {alerts.length ? <StatusBadge tone="warning">نیازمند اقدام</StatusBadge> : null}
+                        {visibleAlerts.map((alert) => (
+                          <StatusBadge key={alert.code || alert.category || alert.label} tone="warning">{alert.label || alert.category}</StatusBadge>
+                        ))}
+                        {extraAlertCount ? <span className="account-card-pill">+{extraAlertCount}</span> : null}
+                      </div>
+                    ) : null}
+                    {renderAccountActions(account)}
                   </article>
                 );
               })}
@@ -482,13 +514,20 @@ export default function SimpleAccounts() {
               {accountId(details) ? <p className="is-secondary"><span>شناسه پشتیبانی</span><b>{accountId(details)}</b></p> : null}
               <p><span>وضعیت</span><b>{statusLabel(details)}</b></p>
               {details.daily_limit !== undefined && details.daily_limit !== null ? <p><span>محدودیت روزانه</span><b>{details.daily_limit}</b></p> : null}
-              {Array.isArray(details.alerts) && details.alerts.length ? (
-                <p><span>هشدارها</span><b>{details.alerts.slice(0, 3).map((alert) => alert.label || alert.category).join("، ")}</b></p>
+              {explicitAlerts(details).length ? (
+                <div className="account-details-alerts">
+                  <span>هشدارها</span>
+                  <div>
+                    {explicitAlerts(details).map((alert) => (
+                      <StatusBadge key={alert.code || alert.category || alert.label} tone="warning">{alert.label || alert.category}</StatusBadge>
+                    ))}
+                  </div>
+                </div>
               ) : null}
             </div>
             <div className="account-drawer-actions">
               {accountPlatform(details) === "bale" ? <SecondaryButton onClick={() => openBrowser(details)}><Eye size={16} />مشاهده مرورگر</SecondaryButton> : null}
-              <SecondaryButton onClick={() => toggleActive(details)} disabled={Boolean(busyAccount)}>{isActive(details) ? "غیرفعال‌کردن" : "فعال‌کردن"}</SecondaryButton>
+              <SecondaryButton onClick={() => toggleActive(details)} disabled={busyAccount.endsWith(`:${accountId(details)}`)}>{isActive(details) ? "غیرفعال‌کردن" : "فعال‌کردن"}</SecondaryButton>
               <PrimaryButton onClick={() => openEdit(details)}>ویرایش</PrimaryButton>
             </div>
           </aside>
