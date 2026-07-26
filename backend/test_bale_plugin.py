@@ -4357,6 +4357,100 @@ def test_forward_message_to_contact_exact_recipient_confirmed_and_verified() -> 
     )
 
 
+def _forward_selected_state_from_chip_dom(name: str, avatar_text: str = "B", extra_markup: str = "") -> dict[str, object]:
+    from playwright.sync_api import sync_playwright
+
+    html = f"""
+    <style>
+      body {{ margin: 0; }}
+      .ReactModal__Overlay {{ position: relative; width: 520px; height: 620px; }}
+      .anWA5J {{ position: relative; width: 420px; height: 520px; margin: 20px; }}
+      .search {{ width: 300px; height: 36px; }}
+      .chipbar {{ position: absolute; left: 80px; bottom: 60px; width: 220px; height: 40px; }}
+      .ujDkZz {{ display: inline-flex; align-items: center; width: 180px; height: 32px; }}
+      .pLr4Vr {{ display: inline-flex; width: 24px; height: 24px; }}
+      .wIYsiZ {{ display: inline-flex; }}
+      .hidden-extra {{ display: none; }}
+      svg {{ width: 18px; height: 18px; }}
+    </style>
+    <div class="ReactModal__Overlay">
+      <div class="anWA5J">
+        <input class="search" type="search" value="" />
+      </div>
+      <div class="chipbar">
+        <div class="ujDkZz WUPitC" role="button">
+          <div aria-label="avatar" class="pLr4Vr YU_BcR">
+            <span class="N5ck6R">{avatar_text}</span>
+          </div>
+          <span class="wIYsiZ">{name}</span>
+          {extra_markup}
+          <svg role="img" aria-label="close" class="QMh5Fs"><use href="#bi-Close"></use></svg>
+        </div>
+      </div>
+    </div>
+    """
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            headless=True,
+        )
+        try:
+            page = browser.new_page(viewport={"width": 800, "height": 700})
+            page.set_content(html)
+            return BalePlugin()._forward_selected_recipients_state(page)
+        finally:
+            browser.close()
+
+
+def test_forward_selected_recipient_chip_extracts_semantic_name_without_avatar_or_controls() -> None:
+    cases = [
+        ("Bale-000003", "B"),
+        ("Bale-000003", "BB"),
+        ("Bale-000001", "B"),
+        ("Bale-000002", "B"),
+        ("نام فارسی", "ن"),
+        ("Latin Contact", "LC"),
+        ("A Leading Latin Name", "AL"),
+        ("Name With Spaces", "NW"),
+    ]
+
+    for name, avatar_text in cases:
+        state = _forward_selected_state_from_chip_dom(
+            name,
+            avatar_text=avatar_text,
+            extra_markup='<span class="hidden-extra">Hidden Noise</span>',
+        )
+
+        assert state["selected_count"] == 1
+        assert state["selected_names"] == [name]
+        assert state["selected_recipients"][0]["text"] == name
+        assert avatar_text not in state["selected_names"]
+        assert "Hidden Noise" not in state["selected_names"]
+        assert "close" not in state["selected_names"]
+
+
+def test_forward_message_to_contact_blocks_avatar_prefixed_selected_name_without_send_click() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000003"], extra_selected_after_target=["B Bale-000003"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000003")
+
+    assert result["success"] is False
+    assert result["error_code"] == "multiple_recipients_selected"
+    assert result["selected_names_after_target"] == ["Bale-000003", "B Bale-000003"]
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+    assert page.clicked.count(OpenMessageForwardPage.recipient_result_selector) == 1
+
+
+def test_forward_message_to_contact_badge_mismatch_blocks_send() -> None:
+    page = OpenMessageForwardPage(recipients=["Bale-000003"], extra_selected_after_target=["Unexpected"])
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+    result = plugin.forward_message_to_contact("bale_forward", "5613544284", "Bale-000003")
+
+    assert result["success"] is False
+    assert result["error_code"] == "multiple_recipients_selected"
+    assert OpenMessageForwardPage.confirm_selector not in page.clicked
+
+
 def test_forward_message_to_contact_preselected_unrelated_contact_is_cleared() -> None:
     page = OpenMessageForwardPage(recipients=["Bale-000001"], preselected_recipients=["Unrelated Contact"])
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))

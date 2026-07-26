@@ -3995,6 +3995,18 @@ class BalePlugin:
               || checkedChild;
           };
           const selectedName = (row) => {
+            const semanticSelectors = [
+              '.wIYsiZ',
+              '.BBzRjX',
+              '.oUKPfP'
+            ];
+            for (const selector of semanticSelectors) {
+              for (const child of Array.from(row.querySelectorAll(selector))) {
+                if (!visible(child)) continue;
+                const childText = normalize(child.innerText || child.textContent || "");
+                if (childText && childText.length <= 120) return childText;
+              }
+            }
             const text = normalize(row.innerText || row.textContent || "");
             if (text && text.length <= 160) return text;
             const labelled = Array.from(row.querySelectorAll('[title], [aria-label], span, div')).map((node) => {
@@ -4083,13 +4095,14 @@ class BalePlugin:
             for (const node of chipNodes) {
               const text = normalize(node.innerText || node.textContent || "").replace(/^Ã—\\s*/, "").replace(/\\s*Ã—$/, "");
               const chipText = normalize(text.replace(/^[Ã—xX]\\s*/, "").replace(/\\s*[Ã—xX]$/, ""));
-              if (!chipText || chipText.length > 120 || !validRecipientName(chipText)) continue;
+              const selectedChipText = selectedName(node) || chipText;
+              if (!selectedChipText || selectedChipText.length > 120 || !validRecipientName(selectedChipText)) continue;
               const childControls = Array.from(node.querySelectorAll('svg, button, [role="button"], [aria-label]')).filter((child) => child instanceof HTMLElement && visible(child));
               const click = childControls.find((child) => {
                 const rect = child.getBoundingClientRect();
                 return rect.width <= 36 && rect.height <= 36;
               }) || childControls[0] || node;
-              pushSelected(node, click, chipText, "selected_chip", node);
+              pushSelected(node, click, selectedChipText, "selected_chip", node);
               if (selected.length >= 20) break;
             }
             const removeControls = Array.from(pickerRoot.querySelectorAll('button, [role="button"], [aria-label], svg')).filter((node) => {
@@ -4105,8 +4118,9 @@ class BalePlugin:
                 const rect = chip.getBoundingClientRect();
                 if (rect.width < 40 || rect.width > 280 || rect.height < 18 || rect.height > 80) continue;
                 const chipText = normalize(chip.innerText || chip.textContent || "").replace(/^[Ãƒâ€”xX]\\s*/, "").replace(/\\s*[Ãƒâ€”xX]$/, "");
-                if (!chipText || chipText.length > 120 || !validRecipientName(chipText)) continue;
-                pushSelected(chip, control, chipText, "selected_chip", control);
+                const selectedChipText = selectedName(chip) || chipText;
+                if (!selectedChipText || selectedChipText.length > 120 || !validRecipientName(selectedChipText)) continue;
+                pushSelected(chip, control, selectedChipText, "selected_chip", control);
                 break;
               }
               if (selected.length >= 20) break;
