@@ -6,17 +6,19 @@ import CommercialJobs from "./pages/CommercialJobs.jsx";
 import CommercialCampaigns from "./pages/CommercialCampaigns.jsx";
 import CommercialLogs from "./pages/CommercialLogs.jsx";
 import CommercialSettings from "./pages/CommercialSettings.jsx";
+import SimpleAccounts from "./pages/SimpleAccounts.jsx";
 import PlatformSelector from "./pages/PlatformSelector.jsx";
 import PlatformWorkspace from "./pages/PlatformWorkspace.jsx";
 
 const pages = {
   dashboard: CommercialDashboard,
-  accounts: CommercialAccounts,
+  accounts: SimpleAccounts,
   jobs: CommercialJobs,
   campaigns: CommercialCampaigns,
   logs: CommercialLogs,
   settings: CommercialSettings,
-  messaging: PlatformSelector
+  messaging: PlatformSelector,
+  platforms: PlatformSelector
 };
 
 function pageToHash(pageId) {
