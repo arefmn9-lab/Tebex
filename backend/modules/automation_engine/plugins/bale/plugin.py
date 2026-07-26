@@ -12,6 +12,15 @@ from uuid import uuid4
 
 from modules.automation_engine.browser import actions_browser
 from modules.automation_engine.browser.browser_manager import BrowserManager, resolve_system_browser_executable
+from modules.automation_engine.browser_identity.bale_profile_contract import (
+    BaleProfileContractError,
+    acquire_profile_lease,
+    profile_compare_key,
+    profile_launch_args,
+    release_profile_lease,
+    resolve_profile_record,
+    verify_runtime_process_identity,
+)
 from modules.automation_engine.browser.providers import get_provider
 
 from .account_store import bale_account_store, normalize_source_channel_uid
@@ -34,7 +43,7 @@ class BalePlugin:
         try:
             account = bale_account_store.get_account(account_id)
             if account is None:
-                raise RuntimeError(f"Bale account not found: {account_id}")
+                raise BaleProfileContractError("UNKNOWN_ACCOUNT_PROFILE", "Bale account profile is not registered", {"account_id": account_id})
             browser_provider = str(account.get("browser_provider") or "adspower")
             if browser_provider == "adspower":
                 profile_id = str(account.get("adspower_profile_id") or "")
@@ -65,11 +74,12 @@ class BalePlugin:
                     "Playwright is not available. Install dependencies and browser binaries."
                 )
 
+            profile_metadata = _native_profile_metadata(account_id, account)
             page = self.browser_manager.get_page(
                 account_id,
                 headless=False,
                 login_required=True,
-                profile_metadata=account,
+                profile_metadata=profile_metadata,
             )
             page.goto(self.web_url, wait_until="load")
             self.browser_manager.save_session(account_id)
@@ -84,6 +94,16 @@ class BalePlugin:
             return result
         except Exception as exc:
             message = str(exc)
+            if isinstance(exc, BaleProfileContractError):
+                return {
+                    "ok": False,
+                    "platform": self.platform_id,
+                    "account_id": account_id,
+                    "browser_provider": "native_chrome",
+                    "message": message,
+                    "error_code": exc.error_code,
+                    "details": exc.details,
+                }
             account = bale_account_store.get_account(account_id) or {"account_id": account_id, "browser_provider": "unknown"}
             browser_path = getattr(self.browser_manager, "last_browser_path", None)
             self._log_open_account_attempt(
@@ -106,15 +126,14 @@ class BalePlugin:
             }
 
     def open_login(self, account_id: str) -> dict[str, Any]:
-        profile_dir = _native_profile_dir(account_id)
+        account = bale_account_store.get_account(account_id)
+        try:
+            profile_record = resolve_profile_record(account_id, account, require_registered=True)
+        except BaleProfileContractError as exc:
+            return {"ok": False, "platform": self.platform_id, "account_id": account_id, "provider_mode": "native_chrome", "error_code": exc.error_code, "message": str(exc), "details": exc.details}
+        profile_dir = Path(profile_record.user_data_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
-        account = bale_account_store.get_account(account_id) or {"account_id": account_id}
-        profile_metadata = {
-            **account,
-            "browser_provider": "native_chrome",
-            "adspower_profile_id": "",
-            "user_data_dir": str(profile_dir),
-        }
+        profile_metadata = _native_profile_metadata(account_id, account)
         try:
             page = self.browser_manager.get_page(
                 account_id,
@@ -146,7 +165,12 @@ class BalePlugin:
 
     def check_login(self, account_id: str) -> dict[str, Any]:
         started = time.perf_counter()
-        profile_dir = _native_profile_dir(account_id)
+        account = bale_account_store.get_account(account_id)
+        try:
+            profile_record = resolve_profile_record(account_id, account, require_registered=True)
+        except BaleProfileContractError as exc:
+            return {"ok": False, "logged_in": False, "platform": self.platform_id, "account_id": account_id, "provider_mode": "native_chrome", "error_code": exc.error_code, "message": str(exc), "details": exc.details, "duration_ms": int((time.perf_counter() - started) * 1000)}
+        profile_dir = Path(profile_record.user_data_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
         try:
             page = self.browser_manager.get_page(
@@ -157,23 +181,27 @@ class BalePlugin:
                     "account_id": account_id,
                     "browser_provider": "native_chrome",
                     "adspower_profile_id": "",
-                    "user_data_dir": str(profile_dir),
+                    "user_data_dir": profile_record.user_data_dir,
+                    "profile_directory": profile_record.profile_directory,
                 },
             )
             page.goto(self.web_url, wait_until="load")
-            login_check = self._detect_login_state(page, timeout_ms=3000)
+            auth = self.classify_authentication_state(page, timeout_ms=3000)
+            login_check = auth.get("login_check") or {}
             error_code = None
-            message = "Bale login detected" if login_check["logged_in"] else "Manual Bale login is required"
-            if login_check["install_prompt_detected"]:
+            message = "Bale login detected" if auth["authenticated"] else "Manual Bale login is required"
+            if auth.get("auth_state") == "auth_unverified":
+                error_code = "auth_unverified"
+                message = "Bale authentication state could not be verified"
+            elif login_check.get("install_prompt_detected"):
                 error_code = "bale_install_prompt"
                 message = "Bale install/help prompt is visible. Dismiss it, then log in."
-            elif not login_check["logged_in"]:
-                error_code = str(login_check.get("error_code") or "not_logged_in")
-                if error_code == "login_state_unknown":
-                    message = "Bale login state could not be determined"
+            elif not auth["authenticated"]:
+                error_code = str(auth.get("error_code") or "authentication_required")
             return {
-                "ok": bool(login_check["logged_in"]),
-                "logged_in": bool(login_check["logged_in"]),
+                "ok": bool(auth["authenticated"]),
+                "logged_in": bool(auth["authenticated"]),
+                "auth_state": auth.get("auth_state"),
                 "platform": self.platform_id,
                 "account_id": account_id,
                 "provider_mode": "native_chrome",
@@ -182,6 +210,7 @@ class BalePlugin:
                 "error_code": error_code,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
                 "login_check": login_check,
+                "auth": auth,
             }
         except Exception as exc:
             return {
@@ -2601,7 +2630,7 @@ class BalePlugin:
                 )
         profile_metadata = {**account, "browser_provider": effective_provider}
         if effective_provider == "native_chrome":
-            profile_metadata["adspower_profile_id"] = ""
+            profile_metadata = _native_profile_metadata(account_id, account)
         return self.browser_manager.get_page(
             account_id,
             headless=False,
@@ -2643,41 +2672,67 @@ class BalePlugin:
         if not browser_path:
             raise BalePluginError("browser_start_timeout", "No system Chrome/Edge found")
 
-        profile_dir = Path(profile_path) if profile_path else _native_profile_dir(account_id)
+        account = bale_account_store.get_account(account_id)
+        profile_record = resolve_profile_record(account_id, account, require_registered=True)
+        if profile_compare_key(browser_path) != profile_compare_key(profile_record.chrome_executable):
+            raise BaleProfileContractError("PROFILE_IDENTITY_MISMATCH", "Resolved browser executable does not match the Bale profile registry", {"expected": profile_record.chrome_executable, "actual": browser_path})
+        if profile_path and str(Path(profile_path).resolve(strict=False)) != profile_record.user_data_dir:
+            raise BaleProfileContractError("PROFILE_IDENTITY_MISMATCH", "Requested Bale profile path does not match account registry", {"requested": str(profile_path), "expected": profile_record.user_data_dir})
+        profile_dir = Path(profile_record.user_data_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
+        lease_payload = acquire_profile_lease(profile_record, run_id=f"bale_runtime_{account_id}")
+        lease = lease_payload["lease"]
         playwright = sync_playwright().start()
         context = None
         try:
             context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
+                user_data_dir=profile_record.user_data_dir,
                 executable_path=browser_path,
                 headless=False,
-                args=[],
+                args=profile_launch_args(profile_record),
             )
+            runtime_identity = verify_runtime_process_identity(profile_record)
             page = context.pages[0] if context.pages else context.new_page()
             return {
                 "playwright": playwright,
                 "context": context,
                 "page": page,
-                "profile_path": str(profile_dir),
+                "profile_path": profile_record.user_data_dir,
+                "account_id": account_id,
                 "provider_mode": provider_mode or "native_chrome",
                 "browser_path": browser_path,
+                "profile_directory": profile_record.profile_directory,
+                "profile_lease": lease,
+                "runtime_process_identity": runtime_identity,
             }
         except Exception:
             if context is not None:
                 context.close()
+            release_profile_lease(profile_record, lease, abnormal=True, reason="runtime_session_launch_failed")
             playwright.stop()
             raise
 
     def close_reusable_runtime_session(self, runtime_session: Any) -> dict[str, Any]:
         metadata = getattr(runtime_session, "metadata", {}) or {}
-        context = getattr(runtime_session, "context", None)
+        if isinstance(runtime_session, dict):
+            metadata = runtime_session
+            context = runtime_session.get("context")
+        else:
+            context = getattr(runtime_session, "context", None)
         playwright = metadata.get("playwright") if isinstance(metadata, dict) else None
+        profile_path = str(metadata.get("profile_path") or getattr(runtime_session, "profile_path", "") or "")
+        account_id = str(metadata.get("account_id") or getattr(runtime_session, "account_id", "") or "")
+        lease = metadata.get("profile_lease") if isinstance(metadata, dict) else None
         try:
             if context is not None:
                 context.close()
             if playwright is not None:
                 playwright.stop()
+            if profile_path and account_id:
+                release_profile_lease(resolve_profile_record(account_id), lease)
+            elif profile_path:
+                profile_account = Path(profile_path).name
+                release_profile_lease(resolve_profile_record(profile_account), lease)
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error_code": "session_close_failed", "message": str(exc)}
@@ -2712,26 +2767,35 @@ class BalePlugin:
         if not browser_path:
             raise BalePluginError("browser_start_timeout", "No system Chrome/Edge found")
 
-        profile_dir = _native_profile_dir(account_id)
+        account = bale_account_store.get_account(account_id)
+        profile_record = resolve_profile_record(account_id, account, require_registered=True)
+        if profile_compare_key(browser_path) != profile_compare_key(profile_record.chrome_executable):
+            raise BaleProfileContractError("PROFILE_IDENTITY_MISMATCH", "Resolved browser executable does not match the Bale profile registry", {"expected": profile_record.chrome_executable, "actual": browser_path})
+        profile_dir = Path(profile_record.user_data_dir)
         profile_dir.mkdir(parents=True, exist_ok=True)
         playwright = None
         context = None
+        lease: dict[str, Any] | None = None
         try:
             playwright = sync_playwright().start()
+            lease = acquire_profile_lease(profile_record, run_id=f"bale_isolated_{account_id}")["lease"]
             context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
+                user_data_dir=profile_record.user_data_dir,
                 executable_path=browser_path,
                 headless=False,
-                args=[],
+                args=profile_launch_args(profile_record),
             )
+            runtime_identity = verify_runtime_process_identity(profile_record)
             page = context.pages[0] if context.pages else context.new_page()
             yield (
                 page,
                 {
                     "provider_mode": "native_chrome",
                     "browser_reused": False,
-                    "profile_dir": str(profile_dir),
+                    "profile_dir": profile_record.user_data_dir,
                     "browser_path": browser_path,
+                    "profile_directory": profile_record.profile_directory,
+                    "runtime_process_identity": runtime_identity,
                 },
             )
         finally:
@@ -2739,10 +2803,12 @@ class BalePlugin:
                 context.close()
             if playwright is not None:
                 playwright.stop()
+            if lease is not None:
+                release_profile_lease(profile_record, lease)
 
     def _browser_failure_meta(self, account_id: str, provider_mode: str) -> dict[str, Any]:
         if provider_mode == "native_chrome":
-            profile_dir = _native_profile_dir(account_id)
+            profile_dir = Path(resolve_profile_record(account_id).user_data_dir)
             profile_dir.mkdir(parents=True, exist_ok=True)
             return {
                 "provider_mode": "native_chrome",
@@ -2841,7 +2907,7 @@ class BalePlugin:
         install_prompt = bool(login.get("install_prompt_detected"))
         contacts_ui_available = bool(self._contacts_ui_visible(page))
         loading_visible = bool(self._first_visible_selector(page, ['[aria-label="Loading-icon"]', '[role="progressbar"]', '[class*="loading" i]', '[class*="spinner" i]'], timeout_ms=500))
-        reconnect_visible = any(token in text_lower for token in ["offline", "reconnect", "connecting", "connection", "disconnected"]) or "Ã˜Â¯Ã˜Â±Ã˜Â­Ã˜Â§Ã™â€ž Ã˜Â§Ã˜ÂªÃ˜ÂµÃ˜Â§Ã™â€ž" in visible_text
+        reconnect_visible = any(token in text_lower for token in ["offline", "reconnect", "connecting", "connection", "disconnected"]) or "Ø¯Ø±Ø­Ø§Ù„ Ø§ØªØµØ§Ù„" in visible_text
         strong_chat_evidence = bool(
             login.get("chat_list_visible")
             or login.get("message_input_detected")
@@ -2866,15 +2932,15 @@ class BalePlugin:
         if reconnect_visible:
             evidence.append("offline_or_reconnecting_visible")
 
-        if "qr" in text_lower or "Ã˜Â¨Ã˜Â§Ã˜Â±ÃšÂ©Ã˜Â¯" in visible_text or "ÃšÂ©Ã›Å’Ã™Ë†Ã˜Â¢Ã˜Â±" in visible_text:
+        if "qr" in text_lower or "Ø¨Ø§Ø±Ú©Ø¯" in visible_text or "Ú©ÛŒÙˆØ¢Ø±" in visible_text:
             auth_state = "unauthenticated"
             legacy_auth_state = "qr_login_required"
             error_code = "authentication_required"
-        elif "ÃšÂ©Ã˜Â¯" in visible_text and ("Ã˜ÂªÃ˜Â§Ã›Å’Ã›Å’Ã˜Â¯" in visible_text or "Ã˜ÂªÃ˜Â£Ã›Å’Ã›Å’Ã˜Â¯" in visible_text or "verification" in text_lower):
+        elif "Ú©Ø¯" in visible_text and ("ØªØ§ÛŒÛŒØ¯" in visible_text or "ØªØ£ÛŒÛŒØ¯" in visible_text or "verification" in text_lower):
             auth_state = "unauthenticated"
             legacy_auth_state = "verification_code_required"
             error_code = "authentication_required"
-        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["Ã™â€¦Ã˜Â³Ã˜Â¯Ã™Ë†Ã˜Â¯", "Ã™â€¦Ã˜Â­Ã˜Â¯Ã™Ë†Ã˜Â¯"]):
+        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["Ù…Ø³Ø¯ÙˆØ¯", "Ù…Ø­Ø¯ÙˆØ¯"]):
             auth_state = "auth_unverified"
             legacy_auth_state = "account_restricted"
             error_code = "account_restricted"
@@ -8270,8 +8336,21 @@ class BalePluginError(RuntimeError):
 
 
 def _native_profile_dir(account_id: str) -> Path:
-    backend_dir = Path(__file__).resolve().parents[4]
-    return backend_dir / "runtime" / "browser_profiles" / account_id
+    return Path(resolve_profile_record(account_id).user_data_dir)
+
+
+def _native_profile_metadata(account_id: str, account: dict[str, Any] | None = None) -> dict[str, Any]:
+    record = resolve_profile_record(account_id, account)
+    profile_dir = Path(record.user_data_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        **(account or {"account_id": account_id}),
+        "account_id": account_id,
+        "browser_provider": "native_chrome",
+        "adspower_profile_id": "",
+        "user_data_dir": record.user_data_dir,
+        "profile_directory": record.profile_directory,
+    }
 
 
 _CHAT_UI_SELECTORS = [

@@ -1483,10 +1483,9 @@ def test_open_login_returns_profile_dir_without_real_browser() -> None:
     page = MockPage(set())
     plugin = BalePlugin(browser_manager=MockBrowserManager(page))
     result = plugin.open_login("bale_login_1")
-    assert result["ok"] is True
-    assert result["profile_dir"]
-    assert "bale_login_1" in result["profile_dir"]
-    assert page.urls[-1] == plugin.web_url
+    assert result["ok"] is False
+    assert result["error_code"] == "UNKNOWN_ACCOUNT_PROFILE"
+    assert page.urls == []
 
 
 def test_send_text_message_uses_captured_message_input_and_enter_without_fake_success() -> None:
