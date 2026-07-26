@@ -25,6 +25,11 @@ from modules.automation_engine.bulk_messaging import (
     message_source_store,
 )
 from modules.automation_engine.commercial_queue import commercial_queue_service
+from modules.automation_engine.bale_bulk_orchestrator import (
+    BaleBulkCampaignConfig,
+    BaleBulkOrchestratorError,
+    bale_bulk_orchestrator,
+)
 from modules.automation_engine.db.database import DATABASE_PATH
 from modules.automation_engine.dispatcher import create_default_dispatcher
 from modules.automation_engine.browser.profile_groups import profile_group_store
@@ -180,6 +185,43 @@ class CreateTaskRequest(BaseModel):
     run_at: datetime | None = None
 
 
+class BaleBulkSourceRequest(BaseModel):
+    uid: str = ""
+    url: str = ""
+
+
+class BaleBulkRecipientRequest(BaseModel):
+    recipient_id: str = ""
+    display_name: str = ""
+    enabled: bool = True
+
+
+class BaleBulkCampaignRequest(BaseModel):
+    campaign_id: str
+    platform: str = "bale"
+    account_id: str
+    source: BaleBulkSourceRequest
+    recipients: list[BaleBulkRecipientRequest] = Field(default_factory=list, max_length=10)
+    mode: str = "dry_run"
+    concurrency: int = 1
+    max_recipients: int = 10
+    max_final_clicks: int = 0
+    continue_on_not_found: bool = True
+    stop_on_ambiguous: bool = True
+    stop_on_selection_mismatch: bool = True
+    stop_on_structural_failure: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    explicit_live_authorized: bool = False
+
+
+class BaleBulkRunRequest(BaseModel):
+    run_id: str | None = None
+
+
+def _bale_bulk_error(exc: Exception) -> HTTPException:
+    code = getattr(exc, "error_code", None) or "bale_bulk_orchestrator_error"
+    status = 404 if code == "campaign_not_found" else 409
+    return HTTPException(status_code=status, detail={"error_code": code, "message": str(exc), "details": getattr(exc, "details", {})})
 
 
 class RunTaskRequest(BaseModel):
@@ -269,6 +311,114 @@ def download_diagnostic_file(path: str) -> FileResponse:
         raise HTTPException(status_code=415, detail="Diagnostics file type is not downloadable")
     return FileResponse(file_path, filename=file_path.name)
 
+
+@router.get("/platforms/bale/bulk-campaigns")
+def list_bale_bulk_campaigns(response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return {"items": bale_bulk_orchestrator.store.list()}
+
+
+@router.post("/platforms/bale/bulk-campaigns")
+def save_bale_bulk_campaign(payload: BaleBulkCampaignRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_bulk_orchestrator.save_draft(payload.model_dump())
+    except BaleBulkOrchestratorError as exc:
+        raise _bale_bulk_error(exc) from exc
+
+
+@router.get("/platforms/bale/bulk-campaigns/{campaign_id}")
+def get_bale_bulk_campaign(campaign_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_bulk_orchestrator.get_state(campaign_id)
+    except BaleBulkOrchestratorError as exc:
+        raise _bale_bulk_error(exc) from exc
+
+
+@router.post("/platforms/bale/bulk-campaigns/{campaign_id}/validate")
+def validate_bale_bulk_campaign(campaign_id: str, payload: BaleBulkCampaignRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        config = BaleBulkCampaignConfig.from_payload({**payload.model_dump(), "campaign_id": campaign_id})
+        return bale_bulk_orchestrator.validate_config(
+            config,
+            explicit_live_authorized=payload.explicit_live_authorized,
+        )
+    except BaleBulkOrchestratorError as exc:
+        raise _bale_bulk_error(exc) from exc
+
+
+@router.post("/platforms/bale/bulk-campaigns/{campaign_id}/dry-preflight")
+def run_bale_bulk_dry_preflight(campaign_id: str, payload: BaleBulkRunRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_bulk_orchestrator.run_dry_preflight(campaign_id, run_id=payload.run_id)
+    except BaleBulkOrchestratorError as exc:
+        raise _bale_bulk_error(exc) from exc
+
+
+@router.get("/platforms/bale/bulk-campaigns/{campaign_id}/results")
+def get_bale_bulk_results(campaign_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        state = bale_bulk_orchestrator.get_state(campaign_id)
+        return {
+            "campaign_id": campaign_id,
+            "recipient_results": state.get("resume_state", {}).get("items", []),
+            "stored_campaign": state,
+        }
+    except BaleBulkOrchestratorError as exc:
+        raise _bale_bulk_error(exc) from exc
+
+
+@router.get("/platforms/bale/bulk-campaigns/{campaign_id}/resume-state")
+def get_bale_bulk_resume_state(campaign_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        stored = bale_bulk_orchestrator.store.get(campaign_id)
+        if stored is None:
+            raise BaleBulkOrchestratorError("campaign_not_found", "Bale bulk campaign was not found")
+        config = BaleBulkCampaignConfig.from_payload(stored["config"])
+        return bale_bulk_orchestrator.resume_state(config)
+    except BaleBulkOrchestratorError as exc:
+        raise _bale_bulk_error(exc) from exc
+
+
+@router.post("/platforms/bale/bulk-campaigns/{campaign_id}/live-run")
+def prepare_bale_bulk_live_run(campaign_id: str, payload: BaleBulkCampaignRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    config_payload = {**payload.model_dump(), "campaign_id": campaign_id, "mode": "live"}
+    config = BaleBulkCampaignConfig.from_payload(config_payload)
+    validation = bale_bulk_orchestrator.validate_config(config, explicit_live_authorized=payload.explicit_live_authorized)
+    enabled_nonterminal = bale_bulk_orchestrator.resume_state(config)["items"]
+    enabled_nonterminal_count = sum(1 for item in enabled_nonterminal if item["enabled"] and item["state"] == "pending")
+    if config.max_final_clicks > enabled_nonterminal_count:
+        validation = {
+            **validation,
+            "ok": False,
+            "errors": [
+                *validation.get("errors", []),
+                {"field": "max_final_clicks", "error_code": "click_budget_exceeds_enabled_nonterminal_recipients"},
+            ],
+        }
+    if not payload.explicit_live_authorized or not validation["ok"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "live_run_not_authorized",
+                "message": "Controlled live Bale bulk execution requires explicit authorization and valid campaign readiness.",
+                "validation": validation,
+            },
+        )
+    return {
+        "campaign_id": campaign_id,
+        "live_run_ready": True,
+        "execution_started": False,
+        "controlled_live_endpoint": True,
+        "enabled_nonterminal_recipient_count": enabled_nonterminal_count,
+        "maximum_possible_final_clicks": config.max_final_clicks,
+    }
 
 
 class CreatePlatformAccountRequest(BaseModel):
