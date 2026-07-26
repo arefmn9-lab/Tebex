@@ -149,7 +149,7 @@ class AccountHealthService:
             "last_error_message": error.get("message") or error.get("error_message"),
             "manual_review_required": manual,
         }
-        if code in {"not_logged_in", "bale_install_prompt", "login_state_unknown", "authentication_required"}:
+        if code in {"not_logged_in", "bale_install_prompt", "login_state_unknown", "authentication_required", "auth_unverified"}:
             status = "auth_required"; updates["auth_failure_count"] = int(current["auth_failure_count"]) + 1
         elif code in {"profile_path_conflict", "profile_owned_by_another_account", "profile_path_outside_allowed_root", "browser_identity_mismatch", "profile_path_invalid"}:
             status = "profile_conflict"; updates["profile_conflict_count"] = int(current["profile_conflict_count"]) + 1

@@ -105,7 +105,7 @@ class BaleAuthenticationMaintenanceService:
                 page.goto(self.plugin.web_url, wait_until="load")
             self._dismiss_install_help_prompt(page)
             auth = self._classify(page)
-            if auth.get("auth_state") in {"login_required", "verification_code_required", "qr_login_required"}:
+            if auth.get("auth_state") in {"unauthenticated", "login_required", "verification_code_required", "qr_login_required"}:
                 self.account_health.record_failure(account_id, {"error_code": "authentication_required", "error_domain": "authentication", "error_message": "Manual Bale authentication is required"})
             payload = {
                 "maintenance_session_id": maintenance_session_id,
@@ -158,7 +158,7 @@ class BaleAuthenticationMaintenanceService:
         contacts = self._verify_contacts_available(page)
         if contacts.get("ok") and page is not None and hasattr(page, "goto"):
             page.goto(self.plugin.web_url, wait_until="load")
-        verified = bool(auth.get("authenticated") and auth.get("chat_shell_visible") and contacts.get("contacts_ui_available"))
+        verified = bool(auth.get("auth_state") == "authenticated" and auth.get("authenticated") and auth.get("chat_shell_visible") and contacts.get("contacts_ui_available"))
         if verified:
             self.account_health.record_success(str(session_payload["account_id"]))
         else:

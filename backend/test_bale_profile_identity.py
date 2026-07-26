@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modules.automation_engine.browser_identity import bale_profile_contract as contract
+from modules.automation_engine.plugins.bale.plugin import BalePlugin
 
 
 ACCOUNT_ID = "bale_09211690533"
@@ -133,3 +134,58 @@ def test_process_identity_mismatch_and_multiple_roots_block(monkeypatch) -> None
         raise AssertionError("multiple roots should fail")
     except contract.BaleProfileContractError as exc:
         assert exc.error_code == "MULTIPLE_BROWSER_ROOTS"
+
+class AuthLocator:
+    def __init__(self, selector: str, page: "AuthPage") -> None:
+        self.selector = selector
+        self.page = page
+        self.first = self
+
+    def wait_for(self, state: str, timeout: int) -> None:
+        if self.selector not in self.page.visible:
+            raise TimeoutError(self.selector)
+
+    def inner_text(self, timeout: int) -> str:
+        if self.selector == "body":
+            return self.page.body_text
+        return self.page.text.get(self.selector, "")
+
+
+class AuthPage:
+    def __init__(self, visible: set[str], body_text: str = "", url: str = "https://web.bale.ai/") -> None:
+        self.visible = visible
+        self.body_text = body_text
+        self.url = url
+        self.text: dict[str, str] = {}
+
+    def locator(self, selector: str) -> AuthLocator:
+        return AuthLocator(selector, self)
+
+
+def test_explicit_login_screen_is_unauthenticated() -> None:
+    page = AuthPage({"body", "input[type='tel']"}, "login phone", "https://web.bale.ai/login")
+    auth = BalePlugin().classify_authentication_state(page)
+    assert auth["auth_state"] == "unauthenticated"
+    assert auth["legacy_auth_state"] == "login_required"
+    assert auth["authenticated"] is False
+
+
+def test_positive_authenticated_ui_is_authenticated() -> None:
+    page = AuthPage({"body", "[data-testid='chat-list']"}, "chat list", "https://web.bale.ai/")
+    auth = BalePlugin().classify_authentication_state(page)
+    assert auth["auth_state"] == "authenticated"
+    assert auth["authenticated"] is True
+
+
+def test_loading_without_login_ui_is_auth_unverified() -> None:
+    page = AuthPage({"body", "[data-testid='chat-list']", '[aria-label="Loading-icon"]'}, "chat list connecting", "https://web.bale.ai/chat?uid=6407382527")
+    auth = BalePlugin().classify_authentication_state(page)
+    assert auth["auth_state"] == "auth_unverified"
+    assert auth["authenticated"] is False
+
+
+def test_absence_of_login_form_alone_never_authenticated() -> None:
+    page = AuthPage({"body"}, "", "https://web.bale.ai/")
+    auth = BalePlugin().classify_authentication_state(page)
+    assert auth["auth_state"] == "auth_unverified"
+    assert auth["authenticated"] is False

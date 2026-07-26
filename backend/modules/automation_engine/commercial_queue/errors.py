@@ -42,6 +42,13 @@ ACCOUNT_BLOCKING_CODES = {
     "login_state_unknown",
     "browser_start_timeout",
     "browser_profile_corruption",
+    "auth_unverified",
+    "PROFILE_ALREADY_IN_USE",
+    "PROFILE_IDENTITY_MISMATCH",
+    "PROFILE_IDENTITY_UNVERIFIED",
+    "MULTIPLE_BROWSER_ROOTS",
+    "UNKNOWN_ACCOUNT_PROFILE",
+    "CANONICAL_PROFILE_FORBIDDEN_IN_TEST",
 }
 
 CAMPAIGN_BLOCKING_CODES = {
@@ -99,6 +106,12 @@ SESSION_CODES = {
     "profile_path_invalid",
     "profile_directory_missing",
     "identity_validation_failed",
+    "PROFILE_ALREADY_IN_USE",
+    "PROFILE_IDENTITY_MISMATCH",
+    "PROFILE_IDENTITY_UNVERIFIED",
+    "MULTIPLE_BROWSER_ROOTS",
+    "UNKNOWN_ACCOUNT_PROFILE",
+    "CANONICAL_PROFILE_FORBIDDEN_IN_TEST",
 }
 
 
@@ -154,6 +167,12 @@ def classify_error(result: dict[str, Any] | None = None, *, component: str = "wo
         "profile_path_invalid",
         "profile_directory_missing",
         "identity_validation_failed",
+        "PROFILE_ALREADY_IN_USE",
+        "PROFILE_IDENTITY_MISMATCH",
+        "PROFILE_IDENTITY_UNVERIFIED",
+        "MULTIPLE_BROWSER_ROOTS",
+        "UNKNOWN_ACCOUNT_PROFILE",
+        "CANONICAL_PROFILE_FORBIDDEN_IN_TEST",
     }
     safe_to_continue = not account_blocking and not campaign_blocking and not manual_review
     return StructuredExecutionError(

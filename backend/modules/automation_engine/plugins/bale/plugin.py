@@ -2840,6 +2840,8 @@ class BalePlugin:
         normalized_url = page_url.lower()
         install_prompt = bool(login.get("install_prompt_detected"))
         contacts_ui_available = bool(self._contacts_ui_visible(page))
+        loading_visible = bool(self._first_visible_selector(page, ['[aria-label="Loading-icon"]', '[role="progressbar"]', '[class*="loading" i]', '[class*="spinner" i]'], timeout_ms=500))
+        reconnect_visible = any(token in text_lower for token in ["offline", "reconnect", "connecting", "connection", "disconnected"]) or "Ã˜Â¯Ã˜Â±Ã˜Â­Ã˜Â§Ã™â€ž Ã˜Â§Ã˜ÂªÃ˜ÂµÃ˜Â§Ã™â€ž" in visible_text
         strong_chat_evidence = bool(
             login.get("chat_list_visible")
             or login.get("message_input_detected")
@@ -2859,39 +2861,58 @@ class BalePlugin:
             evidence.append("chat_shell_visible")
         if contacts_ui_available:
             evidence.append("contacts_ui_available")
+        if loading_visible:
+            evidence.append("loading_visible")
+        if reconnect_visible:
+            evidence.append("offline_or_reconnecting_visible")
 
-        if "qr" in text_lower or "Ø¨Ø§Ø±Ú©Ø¯" in visible_text or "Ú©ÛŒÙˆØ¢Ø±" in visible_text:
-            auth_state = "qr_login_required"
+        if "qr" in text_lower or "Ã˜Â¨Ã˜Â§Ã˜Â±ÃšÂ©Ã˜Â¯" in visible_text or "ÃšÂ©Ã›Å’Ã™Ë†Ã˜Â¢Ã˜Â±" in visible_text:
+            auth_state = "unauthenticated"
+            legacy_auth_state = "qr_login_required"
             error_code = "authentication_required"
-        elif "Ú©Ø¯" in visible_text and ("ØªØ§ÛŒÛŒØ¯" in visible_text or "ØªØ£ÛŒÛŒØ¯" in visible_text or "verification" in text_lower):
-            auth_state = "verification_code_required"
+        elif "ÃšÂ©Ã˜Â¯" in visible_text and ("Ã˜ÂªÃ˜Â§Ã›Å’Ã›Å’Ã˜Â¯" in visible_text or "Ã˜ÂªÃ˜Â£Ã›Å’Ã›Å’Ã˜Â¯" in visible_text or "verification" in text_lower):
+            auth_state = "unauthenticated"
+            legacy_auth_state = "verification_code_required"
             error_code = "authentication_required"
-        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["Ù…Ø³Ø¯ÙˆØ¯", "Ù…Ø­Ø¯ÙˆØ¯"]):
-            auth_state = "account_restricted"
+        elif any(token in text_lower for token in ["restricted", "blocked", "suspended"]) or any(token in visible_text for token in ["Ã™â€¦Ã˜Â³Ã˜Â¯Ã™Ë†Ã˜Â¯", "Ã™â€¦Ã˜Â­Ã˜Â¯Ã™Ë†Ã˜Â¯"]):
+            auth_state = "auth_unverified"
+            legacy_auth_state = "account_restricted"
             error_code = "account_restricted"
         elif install_prompt:
-            auth_state = "install_help_prompt"
-            error_code = None
+            auth_state = "auth_unverified"
+            legacy_auth_state = "install_help_prompt"
+            error_code = "auth_unverified"
+        elif loading_visible or reconnect_visible:
+            auth_state = "auth_unverified"
+            legacy_auth_state = "loading"
+            error_code = "auth_unverified"
         elif chat_shell_visible:
             auth_state = "authenticated"
+            legacy_auth_state = "authenticated"
             error_code = None
         elif login_ui_visible:
-            auth_state = "login_required"
+            auth_state = "unauthenticated"
+            legacy_auth_state = "login_required"
             error_code = "authentication_required"
         elif not page_url or "loading" in text_lower:
-            auth_state = "loading"
-            error_code = None
+            auth_state = "auth_unverified"
+            legacy_auth_state = "loading"
+            error_code = "auth_unverified"
         else:
-            auth_state = "unknown_auth_state"
-            error_code = "unknown_auth_state"
+            auth_state = "auth_unverified"
+            legacy_auth_state = "unknown_auth_state"
+            error_code = "auth_unverified"
 
         authenticated = auth_state == "authenticated"
         return {
             "auth_state": auth_state,
+            "legacy_auth_state": legacy_auth_state,
             "authenticated": authenticated,
             "login_ui_visible": login_ui_visible,
             "chat_shell_visible": chat_shell_visible,
             "contacts_ui_available": contacts_ui_available,
+            "loading_visible": loading_visible,
+            "offline_or_reconnecting_visible": reconnect_visible,
             "page_url": page_url,
             "error_code": error_code,
             "detection_evidence": evidence,
