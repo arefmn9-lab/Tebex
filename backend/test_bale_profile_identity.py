@@ -65,6 +65,42 @@ def test_canonical_profile_rejected_in_ordinary_tests(monkeypatch) -> None:
         assert exc.error_code == "CANONICAL_PROFILE_FORBIDDEN_IN_TEST"
 
 
+
+def test_active_profile_owner_blocks_second_launch(monkeypatch, tmp_path) -> None:
+    record = contract.BaleProfileRecord("bale", "bale_lock", contract.CANONICAL_CHROME_EXECUTABLE, str(contract.PROFILE_ROOT / "bale_lock"), "Default")
+    monkeypatch.setattr(contract, "chrome_processes_for_profile", lambda _record: [])
+    first = contract.acquire_profile_lease(record, run_id="first", controlled_live_authorized=True)["lease"]
+    monkeypatch.setattr(contract, "_pid_alive", lambda pid: True)
+    try:
+        try:
+            contract.acquire_profile_lease(record, run_id="second", controlled_live_authorized=True)
+            raise AssertionError("second owner should fail")
+        except contract.BaleProfileContractError as exc:
+            assert exc.error_code == "PROFILE_ALREADY_IN_USE"
+    finally:
+        monkeypatch.setattr(contract, "_pid_alive", lambda pid: False)
+        contract.release_profile_lease(record, first)
+
+
+def test_stale_dead_owner_lock_recovers(monkeypatch) -> None:
+    record = contract.BaleProfileRecord("bale", "bale_stale", contract.CANONICAL_CHROME_EXECUTABLE, str(contract.PROFILE_ROOT / "bale_stale"), "Default")
+    monkeypatch.setattr(contract, "chrome_processes_for_profile", lambda _record: [])
+    monkeypatch.setattr(contract, "_pid_alive", lambda pid: False)
+    first = contract.acquire_profile_lease(record, run_id="stale", controlled_live_authorized=True)["lease"]
+    second = contract.acquire_profile_lease(record, run_id="second", controlled_live_authorized=True)["lease"]
+    assert second["run_id"] == "second"
+    contract.release_profile_lease(record, second)
+    assert first["run_id"] == "stale"
+
+
+def test_live_competing_chrome_process_blocks_launch(monkeypatch) -> None:
+    record = contract.resolve_profile_record(ACCOUNT_ID)
+    monkeypatch.setattr(contract, "chrome_processes_for_profile", lambda _record: [{"ProcessId": 123, "CommandLine": "--user-data-dir=" + record.user_data_dir}])
+    try:
+        contract.acquire_profile_lease(record, run_id="blocked", controlled_live_authorized=True)
+        raise AssertionError("live Chrome owner should fail")
+    except contract.BaleProfileContractError as exc:
+        assert exc.error_code == "PROFILE_ALREADY_IN_USE"
 def test_actual_process_command_line_verified(monkeypatch) -> None:
     record = contract.resolve_profile_record(ACCOUNT_ID)
     monkeypatch.setattr(

@@ -7,6 +7,14 @@ from typing import Any
 from .profile_groups import account_user_data_dir
 from .profile_provider import get_profile_provider
 from .session_manager import SessionManager
+from modules.automation_engine.browser_identity.bale_profile_contract import (
+    BaleProfileContractError,
+    acquire_profile_lease,
+    profile_launch_args,
+    release_profile_lease,
+    resolve_profile_record,
+    verify_runtime_process_identity,
+)
 
 
 SYSTEM_BROWSER_CANDIDATES = [
@@ -40,6 +48,7 @@ class BrowserManager:
         self._contexts: dict[str, Any] = {}
         self._pages: dict[str, Any] = {}
         self._profile_metadata: dict[str, dict[str, Any]] = {}
+        self._profile_leases: dict[str, dict[str, Any]] = {}
         self._headless: bool | None = None
         self.last_browser_path: str | None = None
 
@@ -116,6 +125,7 @@ class BrowserManager:
             account_id=account_id,
             user_data_dir=str(profile["user_data_dir"]),
             headless=headless and not login_required,
+            profile_metadata=profile,
         )
         self._contexts[account_id] = context
         self.session_manager.assign_session(account_id, profile)
@@ -153,10 +163,14 @@ class BrowserManager:
 
         context = self._contexts.pop(account_id, None)
         if context is not None:
+            profile = self._profile_metadata.pop(account_id, {})
             if self.session_manager.can_save_storage_state(account_id):
                 self.session_manager.save_storage_state(account_id, context)
             context.close()
-            profile = self._profile_metadata.pop(account_id, {})
+            lease = self._profile_leases.pop(account_id, None)
+            record = profile.get("_bale_profile_record")
+            if isinstance(record, dict):
+                release_profile_lease(resolve_profile_record(account_id), lease)
             get_profile_provider(str(profile.get("browser_provider") or "native_chrome")).close_profile(
                 account_id,
                 str(profile.get("adspower_profile_id") or profile.get("profile_id") or account_id),
@@ -179,6 +193,7 @@ class BrowserManager:
         account_id: str,
         profile_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        record = resolve_profile_record(account_id)
         profile = {
             "account_id": account_id,
             "platform_id": "bale",
@@ -188,10 +203,15 @@ class BrowserManager:
             "device_group_id": "device_group_001",
             "profile_group_id": "group_001",
             "worker_id": "local_windows_1",
-            "user_data_dir": str(account_user_data_dir("bale", account_id)),
+            "user_data_dir": record.user_data_dir,
+            "profile_directory": record.profile_directory,
+            "_bale_profile_record": record.to_dict(),
         }
         profile.update(profile_metadata or {})
-        profile["user_data_dir"] = str(profile.get("user_data_dir") or account_user_data_dir("bale", account_id))
+        record = resolve_profile_record(account_id, profile)
+        profile["user_data_dir"] = record.user_data_dir
+        profile["profile_directory"] = record.profile_directory
+        profile["_bale_profile_record"] = record.to_dict()
         self._profile_metadata[account_id] = profile
         return profile
 
@@ -200,6 +220,7 @@ class BrowserManager:
         account_id: str,
         user_data_dir: str,
         headless: bool = True,
+        profile_metadata: dict[str, Any] | None = None,
     ) -> Any:
         if self._playwright is None:
             try:
@@ -208,6 +229,12 @@ class BrowserManager:
                 raise RuntimeError("Playwright is not installed or not importable") from exc
             self._playwright = sync_playwright().start()
 
+        record = resolve_profile_record(account_id, profile_metadata or {})
+        if str(user_data_dir) and str(user_data_dir) != record.user_data_dir:
+            raise RuntimeError("PROFILE_IDENTITY_MISMATCH")
+        lease_payload = acquire_profile_lease(record, run_id=f"browser_manager_{account_id}")
+        lease = lease_payload["lease"]
+        self._profile_leases[account_id] = lease
         browser_path = resolve_system_browser_executable()
         self.last_browser_path = browser_path
         print("[BrowserManager] os.name =", os.name)
@@ -218,13 +245,29 @@ class BrowserManager:
 
         if not browser_path:
             print("No system Chrome/Edge found")
+            release_profile_lease(record, lease, abnormal=True, reason="browser_executable_missing")
             raise RuntimeError("No system Chrome/Edge found")
+        if str(browser_path).casefold() != record.chrome_executable.casefold():
+            release_profile_lease(record, lease, abnormal=True, reason="browser_executable_mismatch")
+            raise RuntimeError("PROFILE_IDENTITY_MISMATCH")
 
         print("[BrowserManager] FORCED system browser:", browser_path)
         launch_headless = False if platform.system() == "Windows" or os.name == "nt" else headless
-        return self._playwright.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            executable_path=browser_path,
-            headless=launch_headless,
-            args=[],
-        )
+        try:
+            context = self._playwright.chromium.launch_persistent_context(
+                user_data_dir=record.user_data_dir,
+                executable_path=browser_path,
+                headless=launch_headless,
+                args=profile_launch_args(record),
+            )
+            identity = verify_runtime_process_identity(record)
+            self._profile_metadata.setdefault(account_id, {})["runtime_process_identity"] = identity
+            return context
+        except BaleProfileContractError:
+            release_profile_lease(record, lease, abnormal=True, reason="profile_identity_failed")
+            self._profile_leases.pop(account_id, None)
+            raise
+        except Exception:
+            release_profile_lease(record, lease, abnormal=True, reason="launch_failed")
+            self._profile_leases.pop(account_id, None)
+            raise
