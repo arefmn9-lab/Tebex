@@ -196,6 +196,10 @@ class CampaignLifecycleError(ValueError):
         self.summary = summary or {}
 
 
+def _stable_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 class CommercialQueueService:
     def __init__(
         self,
@@ -1676,6 +1680,9 @@ class CommercialQueueService:
             "ok": not blocking,
         }
 
+    def validation_hash(self, validation: dict[str, Any]) -> str:
+        return _stable_hash(validation)
+
     def validate_campaign_recipient_authorization(self, campaign_id: str, dry_run: bool = False) -> dict[str, Any]:
         jobs = self.repository.list_jobs(status=None, account_id=None, campaign_id=campaign_id, limit=10000, offset=0)
         queued = [job for job in jobs if job.get("status") == "queued"]
@@ -1737,16 +1744,120 @@ class CommercialQueueService:
         if status not in allowed_from:
             raise CampaignLifecycleError("invalid_campaign_transition", f"Cannot transition campaign from {status} to {target}")
 
-    def queue_campaign(self, campaign_id: str) -> dict[str, Any]:
+    def _get_dry_run_audit_record(self, campaign_id: str, dry_run_id: str) -> dict[str, Any] | None:
+        with self.repository.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM commercial_dry_run_audit_records
+                WHERE campaign_id = ? AND dry_run_id = ?
+                """,
+                (campaign_id, dry_run_id),
+            ).fetchone()
+        return _bool_fields(dict(row)) if row else None
+
+    def _queue_block(self, error_code: str, message: str, details: dict[str, Any]) -> None:
+        raise CampaignLifecycleError(error_code, message, details)
+
+    def _validate_queue_request(self, campaign_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
-        self._require_transition(campaign, {"draft"}, "queued")
+        expected_status = str(payload.get("expected_campaign_status") or "")
+        if expected_status != "draft":
+            self._queue_block("campaign_status_mismatch", "Campaign queueing requires expected_campaign_status=draft", {"campaign": campaign, "expected_campaign_status": expected_status})
+        if campaign["status"] != expected_status:
+            code = "duplicate_queue_request" if campaign["status"] == "queued" else "campaign_status_mismatch"
+            self._queue_block(code, "Campaign status does not match the queue request", {"campaign": campaign, "expected_campaign_status": expected_status})
+        if not bool(payload.get("explicit_operator_confirmation")):
+            self._queue_block("operator_confirmation_required", "Explicit operator confirmation is required before queueing", {"campaign": campaign})
+        idempotency_key = str(payload.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            self._queue_block("idempotency_key_required", "Queue request idempotency_key is required", {"campaign": campaign})
+
         summary = self.validate_campaign_start(campaign_id)
+        validation_hash = self.validation_hash(summary)
+        if payload.get("validation_hash") and payload.get("validation_hash") != validation_hash:
+            self._queue_block("validation_not_ok", "Submitted validation hash does not match current validation state", {"validation": summary, "validation_hash": validation_hash})
+        if summary["eligible_account_count"] <= 0 or not summary["source_channel_resolved"]:
+            self._queue_block("account_context_missing", "Eligible account and source context are required before queueing", {"validation": summary})
+
+        manifest = self.repository.get_confirmed_manifest_for_campaign(campaign_id)
+        if manifest is None:
+            self._queue_block("manifest_missing", "Confirmed recipient manifest is required before queueing", {"validation": summary})
+        submitted_manifest_hash = str(payload.get("manifest_hash") or "")
+        if not submitted_manifest_hash or submitted_manifest_hash != manifest.get("manifest_hash"):
+            self._queue_block("manifest_stale", "Submitted recipient manifest hash does not match the current confirmed manifest", {"confirmed_manifest": manifest})
         if summary["deliverable_job_count"] <= 0:
             raise CampaignLifecycleError("campaign_has_no_deliverable_jobs", "Campaign has no deliverable jobs", summary)
+
+        authorization = self.validate_campaign_recipient_authorization(campaign_id, dry_run=False)
+        if authorization["unauthorized_job_count"] > 0 or authorization["synthetic_test_job_count"] > 0 or authorization["revoked_authorization_job_count"] > 0:
+            self._queue_block("authorization_incomplete", "All queueable recipients require live authorization before queueing", {"recipient_authorization": authorization})
+        if not summary["ok"]:
+            self._queue_block("validation_not_ok", "Campaign validation is not ok", {"validation": summary, "validation_hash": validation_hash})
+
+        dry_run_id = str(payload.get("dry_run_id") or payload.get("check_id") or "").strip()
+        if not dry_run_id:
+            self._queue_block("dry_run_evidence_missing", "Dry-run/check-without-sending evidence is required before queueing", {"campaign": campaign})
+        dry_run = self._get_dry_run_audit_record(campaign_id, dry_run_id)
+        if dry_run is None or dry_run.get("status") != "completed" or bool(dry_run.get("forbidden_mutation_detected")):
+            self._queue_block("dry_run_evidence_missing", "Completed dry-run/check-without-sending evidence was not found", {"dry_run_id": dry_run_id})
+        dry_diagnostics = self._json_field(dry_run.get("diagnostics_json"), {})
+        dry_validation = dry_diagnostics.get("validation") if isinstance(dry_diagnostics.get("validation"), dict) else {}
+        if self.validation_hash(dry_validation) != validation_hash or dry_diagnostics.get("confirmed_manifest_id") != manifest.get("manifest_id"):
+            self._queue_block("dry_run_evidence_stale", "Dry-run/check evidence no longer matches current campaign state", {"dry_run_id": dry_run_id, "validation_hash": validation_hash})
+
+        final_review_hash = str(payload.get("final_review_hash") or "").strip()
+        if not final_review_hash:
+            self._queue_block("final_review_missing", "Final-review hash is required before queueing", {"campaign": campaign})
+        final_review = self.final_review(campaign_id)
+        if final_review.get("final_review_hash") != final_review_hash:
+            self._queue_block("final_review_stale", "Final-review hash no longer matches current campaign state", {"expected": final_review.get("final_review_hash"), "provided": final_review_hash})
+        if not final_review.get("validation", {}).get("ok"):
+            self._queue_block("final_review_missing", "Final review has blocking validation errors", {"final_review": final_review})
+        if (final_review.get("confirmed_recipients_summary") or {}).get("manifest_hash") != manifest.get("manifest_hash"):
+            self._queue_block("manifest_stale", "Final-review manifest hash does not match the current confirmed manifest", {"final_review": final_review, "confirmed_manifest": manifest})
+
+        effective_limit = int((final_review.get("limits") or {}).get("max_jobs_per_execution") or (final_review.get("limits") or {}).get("deliveries_per_round") or summary["deliverable_job_count"])
+        if summary["deliverable_job_count"] > effective_limit:
+            self._queue_block("limit_exceeded", "Deliverable recipient count exceeds the effective queue limit", {"deliverable_job_count": summary["deliverable_job_count"], "effective_limit": effective_limit})
+        approval_id = str(payload.get("approval_id") or "").strip()
+        approval = self.get_live_execution_approval(approval_id) if approval_id else None
+        if approval is not None and approval.get("final_review_hash") != final_review_hash:
+            self._queue_block("final_review_stale", "Approval does not match the submitted final-review hash", {"approval": approval, "final_review_hash": final_review_hash})
+        blocked_count = int(authorization.get("unauthorized_job_count") or 0) + int(authorization.get("synthetic_test_job_count") or 0) + int(authorization.get("revoked_authorization_job_count") or 0)
+        return {
+            "campaign": campaign,
+            "validation": {**summary, "validation_hash": validation_hash},
+            "confirmed_manifest": manifest,
+            "dry_run": dry_run,
+            "final_review": final_review,
+            "approval": approval,
+            "authorized_recipient_count": int(authorization.get("live_authorized_job_count") or 0),
+            "blocked_recipient_count": blocked_count,
+            "skipped_recipient_count": int(summary["deliverable_job_count"]) - int(authorization.get("live_eligible_job_count") or 0),
+            "effective_limit": effective_limit,
+            "idempotency_key": idempotency_key,
+        }
+
+    def queue_campaign(self, campaign_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = payload or {}
+        evidence = self._validate_queue_request(campaign_id, request)
         self.repository.requeue_campaign_assigned_jobs(campaign_id)
-        return {"campaign": self.repository.update_campaign(campaign_id, {"status": "queued"}), "validation": summary}
+        campaign = self.repository.update_campaign(campaign_id, {"status": "queued"})
+        return {
+            "queued": True,
+            "execution_started": False,
+            "campaign": campaign,
+            "validation": evidence["validation"],
+            "confirmed_manifest": evidence["confirmed_manifest"],
+            "authorized_recipient_count": evidence["authorized_recipient_count"],
+            "blocked_recipient_count": evidence["blocked_recipient_count"],
+            "skipped_recipient_count": evidence["skipped_recipient_count"],
+            "effective_limit": evidence["effective_limit"],
+            "scheduler_warning": "Queueing does not send immediately, but a started campaign can later be executed by scheduler or worker paths.",
+            "idempotency": {"key": evidence["idempotency_key"], "status": "created"},
+        }
 
     def start_campaign(self, campaign_id: str) -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id)

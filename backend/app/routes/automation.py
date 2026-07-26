@@ -821,6 +821,19 @@ class CampaignSendApprovalRequest(BaseModel):
     explicit_confirmation: bool = False
 
 
+class CampaignQueueRequest(BaseModel):
+    validation_hash: str | None = None
+    validation_id: str | None = None
+    dry_run_id: str | None = None
+    check_id: str | None = None
+    final_review_hash: str | None = None
+    manifest_hash: str | None = None
+    approval_id: str | None = None
+    idempotency_key: str | None = None
+    explicit_operator_confirmation: bool = False
+    expected_campaign_status: str = "draft"
+
+
 class CampaignLivePreflightRequest(BaseModel):
     approval_id: str | None = None
 
@@ -1462,10 +1475,10 @@ def validate_commercial_campaign_start(campaign_id: str, response: Response) -> 
 
 
 @router.post("/campaigns/{campaign_id}/queue")
-def queue_commercial_campaign(campaign_id: str, response: Response) -> dict[str, Any]:
+def queue_commercial_campaign(campaign_id: str, request: CampaignQueueRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        return commercial_queue_service.queue_campaign(campaign_id)
+        return commercial_queue_service.queue_campaign(campaign_id, request.model_dump())
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 
