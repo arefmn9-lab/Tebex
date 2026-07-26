@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from modules.automation_engine.browser.profile_groups import account_user_data_dir
+from modules.automation_engine.browser_identity.bale_profile_contract import resolve_profile_record
 from modules.automation_engine.browser.profile_provider import BROWSER_PROVIDERS
 
 
@@ -115,7 +116,7 @@ class BaleAccountStore:
                 "browser_provider": browser_provider,
                 "profile_id": profile_id or f"profile_{account_id}",
                 "adspower_profile_id": adspower_profile_id,
-                "user_data_dir": str(account_user_data_dir("bale", account_id)),
+                "user_data_dir": resolve_profile_record(account_id).user_data_dir,
             },
         )
 
@@ -229,7 +230,7 @@ class BaleAccountStore:
         device_group_id = str(account.get("device_group_id") or "device_group_001")
         account_group_id = str(account.get("account_group_id") or "bale_test_group")
         worker_id = str(account.get("worker_id") or "local_windows_1")
-        user_data_dir = str(account.get("user_data_dir") or account_user_data_dir("bale", account_id))
+        user_data_dir = resolve_profile_record(account_id, account).user_data_dir
         return {
             "account_id": account_id,
             "platform_id": "bale",

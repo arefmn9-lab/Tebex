@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from modules.automation_engine.plugins.bale.account_store import bale_account_store
+from modules.automation_engine.browser_identity.bale_profile_contract import resolve_profile_record
 
 from .repository import BrowserIdentityRepository
 from .validation import default_profile_path, normalize_profile_path, profile_compare_key, validate_identity_payload
@@ -21,20 +22,22 @@ class BrowserIdentityResolver:
         self.repository = repository or BrowserIdentityRepository()
 
     def get_or_create(self, account_id: str, platform: str = "bale") -> dict[str, Any]:
+        profile_record = resolve_profile_record(account_id)
+        profile_path = normalize_profile_path(profile_record.user_data_dir, account_id)
+        canonical_payload = {
+            "account_id": account_id,
+            "platform": platform,
+            "profile_path": profile_path,
+            "normalized_profile_path": profile_compare_key(profile_path),
+            "validation_status": "adopted_existing_profile" if Path(profile_path).exists() else "pending",
+        }
         existing = self.repository.get_by_account(account_id)
         if existing:
-            return existing
-        profile_path = normalize_profile_path(default_profile_path(account_id), account_id)
+            if profile_compare_key(existing.get("profile_path") or "") == canonical_payload["normalized_profile_path"]:
+                return existing
+            return self.repository.upsert_identity({**existing, **canonical_payload}, increment_version=True)
         Path(profile_path).mkdir(parents=True, exist_ok=True)
-        return self.repository.upsert_identity(
-            {
-                "account_id": account_id,
-                "platform": platform,
-                "profile_path": profile_path,
-                "normalized_profile_path": profile_compare_key(profile_path),
-                "validation_status": "adopted_existing_profile" if Path(profile_path).exists() else "pending",
-            }
-        )
+        return self.repository.upsert_identity(canonical_payload)
 
     def validate_identity(self, account_id: str, require_directory: bool = True) -> dict[str, Any]:
         identity = self.get_or_create(account_id)
