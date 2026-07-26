@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
+    "test:phase1": "node scripts/phase1-smoke.mjs",
     "test:phase2": "node scripts/phase2-smoke.mjs",
+    "test:campaign-entry": "node scripts/campaign-execution-entry-smoke.mjs",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
@@ -18,4 +20,3 @@
   },
   "devDependencies": {}
 }
-
