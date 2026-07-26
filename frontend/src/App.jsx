@@ -6,7 +6,9 @@ import CommercialJobs from "./pages/CommercialJobs.jsx";
 import CommercialCampaigns from "./pages/CommercialCampaigns.jsx";
 import CommercialLogs from "./pages/CommercialLogs.jsx";
 import CommercialSettings from "./pages/CommercialSettings.jsx";
+import BaleBulkCampaigns from "./pages/BaleBulkCampaigns.jsx";
 import Diagnostics from "./pages/Diagnostics.jsx";
+import BaleWorkspace from "./pages/BaleWorkspace.jsx";
 import SimpleAccounts from "./pages/SimpleAccounts.jsx";
 import PlatformSelector from "./pages/PlatformSelector.jsx";
 import PlatformWorkspace from "./pages/PlatformWorkspace.jsx";
@@ -16,6 +18,7 @@ const pages = {
   accounts: SimpleAccounts,
   jobs: CommercialJobs,
   campaigns: CommercialCampaigns,
+  baleBulk: BaleBulkCampaigns,
   logs: CommercialLogs,
   settings: CommercialSettings,
   diagnostics: Diagnostics,
@@ -74,7 +77,9 @@ export default function App() {
 
   return (
     <MainLayout activePage={activePage} onNavigate={handleNavigate}>
-      {activePage.startsWith("platform:") ? (
+      {activePage === "platform:bale" ? (
+        <BaleWorkspace />
+      ) : activePage.startsWith("platform:") ? (
         <PlatformWorkspace platformId={activePage.split(":")[1]} />
       ) : (
         <Page onNavigate={handleNavigate} />

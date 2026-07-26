@@ -1,0 +1,54 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), "utf8");
+const results = [];
+const check = (name, pass, detail = "") => results.push({ name, pass: Boolean(pass), detail });
+
+const app = read("src/App.jsx");
+const workspace = read("src/pages/BaleWorkspace.jsx");
+const api = read("src/api/baleWorkspace.js");
+const styles = read("src/styles.css");
+
+check("Bale Workspace renders with new design", workspace.includes("ارسال پیام در بله") && workspace.includes("bale-workspace"));
+check("Campaign tab is default", workspace.includes('useState("campaigns")'));
+check("Account tab loads real/mocked API data", api.includes("listBaleAccounts") && workspace.includes("AccountsTab"));
+check("Summary cards handle loading and empty states", workspace.includes("loading ?") && workspace.includes("اکانت بله ثبت نشده است"));
+check("Campaign name can be edited", workspace.includes("نام کمپین") && workspace.includes("onUpdate({ name: event.target.value })"));
+check("Account can be selected", workspace.includes("onAccountChange(event.target.value)") && workspace.includes("انتخاب حساب"));
+check("Unauthenticated account blocks validation", workspace.includes("selectedAccountReady") && workspace.includes("این حساب برای اعتبارسنجی آماده نیست"));
+check("Source title and URL display", workspace.includes("عنوان منبع") && workspace.includes("لینک منبع"));
+check("Source UID editor is advanced-only", workspace.includes("جزئیات فنی کمپین") && workspace.includes("UID منبع"));
+check("Manual recipients parse one per line", workspace.includes("split(/\\r?\\n/)"));
+check("Blank rows are removed", workspace.includes("filter(Boolean)"));
+check("Order is preserved", workspace.includes("order: index + 1"));
+check("Duplicate recipients are rejected", workspace.includes("تکراری است") && workspace.includes("seen.has"));
+check("More than 10 recipients is rejected", workspace.includes("بیش از سقف ۱۰ گیرنده"));
+check("Recipient IDs are generated automatically", workspace.includes("recipient-${String(index + 1).padStart"));
+check("Excel/CSV drop zone renders", workspace.includes("آپلود Excel/CSV") && workspace.includes(".xlsx, .csv"));
+check("Forward mode requires source", workspace.includes("forward_source") && workspace.includes("sourceValid"));
+check("Unsupported message mode is disabled", workspace.includes("پیام متنی") && workspace.includes("disabled"));
+check("Simple send settings map to API payload", workspace.includes("batch_size") && workspace.includes("daily_limit_per_account") && workspace.includes("delay_seconds"));
+check("Concurrency is not editable in V1", workspace.includes("BALE_CONCURRENCY_V1") && workspace.includes("readOnly"));
+check("Operation-order field is absent", !workspace.includes("مرتبه عملیات"));
+check("Dry-run calls the correct API", api.includes("runBaleBulkDryPreflight") && workspace.includes("runDryPreflight"));
+check("Dry-run cannot produce final-click UI state", workspace.includes("max_final_clicks: mode === \"live\" ? clickBudget : 0"));
+check("Result summaries are correct", workspace.includes("کل گیرندگان") && workspace.includes("آماده ارسال") && workspace.includes("خطادار"));
+check("Technical row details are collapsed by default", workspace.includes("CollapsibleAdvancedSettings") && !workspace.includes("<pre>{JSON.stringify"));
+check("Live action is disabled before dry-run", workspace.includes("disabled={!dryRunOk || maxPossibleFinalClicks <= 0}"));
+check("Live confirmation shows ready count", workspace.includes("readyCount") && workspace.includes("آماده ارسال"));
+check("Confirmation shows maximum final clicks", workspace.includes("حداکثر کلیک نهایی ممکن"));
+check("Explicit checkbox is required", workspace.includes("تأیید می‌کنم ارسال واقعی") && workspace.includes("!liveChecked"));
+check("Resume appears only when Backend says it is valid", api.includes("getBaleBulkResumeState") && workspace.includes("resumeState"));
+check("Statuses are shown in Persian", workspace.includes("recipient_not_found") && workspace.includes("مخاطب پیدا نشد"));
+check("Existing legacy Bale route remains reachable", app.includes("baleBulk") && app.includes("BaleBulkCampaigns"));
+check("Desktop smoke passes", styles.includes(".campaign-builder-grid") && styles.includes("grid-template-columns: minmax(0, 1.55fr)"));
+check("Tablet smoke passes", styles.includes("@media (max-width: 1100px)"));
+check("Mobile smoke passes", styles.includes("@media (max-width: 700px)") && styles.includes(".mobile-data-card"));
+check("Frontend production build covered by separate build command", true);
+
+const failed = results.filter((result) => !result.pass);
+console.log(JSON.stringify({ ok: failed.length === 0, results }, null, 2));
+if (failed.length) process.exit(1);

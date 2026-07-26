@@ -196,3 +196,47 @@ export function revokeRecipientLive(recipientId, payload) {
     body: JSON.stringify(payload),
   });
 }
+
+export function listBaleBulkCampaigns() {
+  return request("/automation/platforms/bale/bulk-campaigns");
+}
+
+export function saveBaleBulkCampaign(payload) {
+  return request("/automation/platforms/bale/bulk-campaigns", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getBaleBulkCampaign(campaignId) {
+  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}`);
+}
+
+export function validateBaleBulkCampaign(campaignId, payload) {
+  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/validate`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function runBaleBulkDryPreflight(campaignId, payload = {}) {
+  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/dry-preflight`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getBaleBulkResults(campaignId) {
+  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/results`);
+}
+
+export function getBaleBulkResumeState(campaignId) {
+  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/resume-state`);
+}
+
+export function prepareBaleBulkLiveRun(campaignId, payload) {
+  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/live-run`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
