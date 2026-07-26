@@ -34,8 +34,11 @@ export function validateCampaignStart(campaignId) {
   return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/validate-start`, { method: "POST" });
 }
 
-export function queueCampaign(campaignId) {
-  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/queue`, { method: "POST" });
+export function queueCampaign(campaignId, payload) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/queue`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 export function startCampaign(campaignId) {
