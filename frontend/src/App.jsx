@@ -6,6 +6,7 @@ import CommercialJobs from "./pages/CommercialJobs.jsx";
 import CommercialCampaigns from "./pages/CommercialCampaigns.jsx";
 import CommercialLogs from "./pages/CommercialLogs.jsx";
 import CommercialSettings from "./pages/CommercialSettings.jsx";
+import Diagnostics from "./pages/Diagnostics.jsx";
 import SimpleAccounts from "./pages/SimpleAccounts.jsx";
 import PlatformSelector from "./pages/PlatformSelector.jsx";
 import PlatformWorkspace from "./pages/PlatformWorkspace.jsx";
@@ -17,6 +18,7 @@ const pages = {
   campaigns: CommercialCampaigns,
   logs: CommercialLogs,
   settings: CommercialSettings,
+  diagnostics: Diagnostics,
   messaging: PlatformSelector,
   platforms: PlatformSelector
 };

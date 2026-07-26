@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import threading
 import sqlite3
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from modules.automation_engine.bulk_messaging import (
@@ -59,6 +62,29 @@ def _set_dashboard_cors_headers(response: Response) -> None:
 
 router = APIRouter(prefix="/automation", tags=["automation"])
 
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+DIAGNOSTICS_ROOT = _BACKEND_ROOT / "runtime" / "diagnostics"
+_DIAGNOSTIC_TEXT_EXTENSIONS = {".json", ".jsonl", ".txt", ".log"}
+_DIAGNOSTIC_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+_DIAGNOSTIC_PREVIEW_EXTENSIONS = _DIAGNOSTIC_TEXT_EXTENSIONS | _DIAGNOSTIC_IMAGE_EXTENSIONS
+_DIAGNOSTIC_BLOCKED_NAME_PARTS = {
+    ".env",
+    "cookie",
+    "cookies",
+    "token",
+    "tokens",
+    "localstorage",
+    "sessionstorage",
+    "credential",
+    "credentials",
+    "browser_profiles",
+    "browser_profile",
+}
+_DIAGNOSTIC_BLOCKED_EXTENSIONS = {".db", ".sqlite", ".sqlite3", ".pem", ".key", ".pfx"}
+_DIAGNOSTIC_MAX_PREVIEW_BYTES = 512_000
+_DIAGNOSTIC_MAX_RUNS = 250
+_DIAGNOSTIC_MAX_FILES = 600
+
 queue = TaskQueue()
 scheduler = Scheduler(queue)
 dispatcher = create_default_dispatcher()
@@ -74,13 +100,175 @@ _worker_thread: threading.Thread | None = None
 _worker_lock = threading.Lock()
 
 
+def _diagnostics_root() -> Path:
+    DIAGNOSTICS_ROOT.mkdir(parents=True, exist_ok=True)
+    return DIAGNOSTICS_ROOT.resolve()
+
+
+def _is_blocked_diagnostic_path(path: Path) -> bool:
+    lowered_parts = [part.lower() for part in path.parts]
+    if any(part in _DIAGNOSTIC_BLOCKED_NAME_PARTS for part in lowered_parts):
+        return True
+    name = path.name.lower()
+    if any(part in name for part in _DIAGNOSTIC_BLOCKED_NAME_PARTS):
+        return True
+    return path.suffix.lower() in _DIAGNOSTIC_BLOCKED_EXTENSIONS
+
+
+def _safe_diagnostics_path(relative_path: str | None = None, *, require_exists: bool = True) -> Path:
+    raw = (relative_path or "").strip().replace("\\", "/")
+    candidate = Path(raw)
+    if raw.startswith("/") or candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise HTTPException(status_code=403, detail="Diagnostics path is not allowed")
+    root = _diagnostics_root()
+    resolved = (root / candidate).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Diagnostics path is not allowed") from exc
+    if require_exists and not resolved.exists():
+        raise HTTPException(status_code=404, detail="Diagnostics path was not found")
+    if _is_blocked_diagnostic_path(resolved.relative_to(root)):
+        raise HTTPException(status_code=403, detail="Diagnostics file is not allowed")
+    return resolved
+
+
+def _diagnostic_file_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return "json"
+    if suffix == ".jsonl":
+        return "jsonl"
+    if suffix in {".txt", ".log"}:
+        return "text"
+    if suffix in _DIAGNOSTIC_IMAGE_EXTENSIONS:
+        return "image"
+    return "unsupported"
+
+
+def _diagnostic_file_info(path: Path, root: Path) -> dict[str, Any]:
+    stat = path.stat()
+    relative = path.relative_to(root).as_posix()
+    kind = _diagnostic_file_kind(path)
+    return {
+        "name": path.name,
+        "relative_path": relative,
+        "kind": kind,
+        "extension": path.suffix.lower(),
+        "size_bytes": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        "preview_supported": kind in {"json", "jsonl", "text", "image"},
+        "download_supported": kind in {"json", "jsonl", "text", "image"},
+    }
+
+
+def _diagnostic_run_summary(run_dir: Path, root: Path) -> dict[str, Any]:
+    files = [path for path in run_dir.rglob("*") if path.is_file() and not _is_blocked_diagnostic_path(path.relative_to(root))]
+    latest_mtime = max([run_dir.stat().st_mtime, *[path.stat().st_mtime for path in files]], default=run_dir.stat().st_mtime)
+    status_file = next((name for name in ("result.json", "batch_summary.json", "readiness_summary.json") if (run_dir / name).is_file()), "")
+    return {
+        "name": run_dir.name,
+        "modified_at": datetime.fromtimestamp(latest_mtime, timezone.utc).isoformat(),
+        "file_count": len(files),
+        "screenshot_count": sum(1 for path in files if path.suffix.lower() in _DIAGNOSTIC_IMAGE_EXTENSIONS),
+        "status_file": status_file,
+    }
+
+
 class CreateTaskRequest(BaseModel):
     scenario_path: str
     run_at: datetime | None = None
 
 
+
+
 class RunTaskRequest(BaseModel):
     task_id: str
+
+
+@router.get("/diagnostics/runs")
+def list_diagnostic_runs(response: Response, limit: int = Query(100, ge=1, le=_DIAGNOSTIC_MAX_RUNS)) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    root = _diagnostics_root()
+    runs = [
+        _diagnostic_run_summary(path, root)
+        for path in root.iterdir()
+        if path.is_dir() and not _is_blocked_diagnostic_path(path.relative_to(root))
+    ]
+    runs.sort(key=lambda item: item["modified_at"], reverse=True)
+    return {
+        "diagnostics_root": "backend/runtime/diagnostics",
+        "runs": runs[:limit],
+        "total": len(runs),
+        "read_only": True,
+    }
+
+
+@router.get("/diagnostics/runs/{run_name}/files")
+def list_diagnostic_run_files(run_name: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    run_dir = _safe_diagnostics_path(run_name)
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Diagnostics run was not found")
+    root = _diagnostics_root()
+    files = [
+        _diagnostic_file_info(path, root)
+        for path in run_dir.rglob("*")
+        if path.is_file() and not _is_blocked_diagnostic_path(path.relative_to(root))
+    ]
+    files.sort(key=lambda item: (item["relative_path"].count("/"), item["relative_path"]))
+    return {
+        "run_name": run_dir.name,
+        "files": files[:_DIAGNOSTIC_MAX_FILES],
+        "total": len(files),
+        "read_only": True,
+    }
+
+
+@router.get("/diagnostics/preview")
+def preview_diagnostic_file(path: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    file_path = _safe_diagnostics_path(path)
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Diagnostics file was not found")
+    kind = _diagnostic_file_kind(file_path)
+    info = _diagnostic_file_info(file_path, _diagnostics_root())
+    if kind == "unsupported":
+        return {"file": info, "preview": None, "truncated": False, "parse_error": "", "read_only": True}
+    if kind == "image":
+        return {"file": info, "preview": None, "image_url": f"/automation/diagnostics/download?path={path}", "truncated": False, "parse_error": "", "read_only": True}
+    size = file_path.stat().st_size
+    with file_path.open("rb") as handle:
+        raw = handle.read(_DIAGNOSTIC_MAX_PREVIEW_BYTES + 1)
+    truncated = len(raw) > _DIAGNOSTIC_MAX_PREVIEW_BYTES
+    text = raw[:_DIAGNOSTIC_MAX_PREVIEW_BYTES].decode("utf-8", errors="replace")
+    parse_error = ""
+    parsed: Any = None
+    if kind == "json":
+        try:
+            parsed = json.loads(text) if not truncated else None
+        except json.JSONDecodeError as exc:
+            parse_error = f"Invalid JSON at line {exc.lineno}, column {exc.colno}"
+    return {
+        "file": info,
+        "preview": text,
+        "parsed_json": parsed,
+        "truncated": truncated or size > _DIAGNOSTIC_MAX_PREVIEW_BYTES,
+        "parse_error": parse_error,
+        "max_preview_bytes": _DIAGNOSTIC_MAX_PREVIEW_BYTES,
+        "read_only": True,
+    }
+
+
+@router.get("/diagnostics/download")
+def download_diagnostic_file(path: str) -> FileResponse:
+    file_path = _safe_diagnostics_path(path)
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Diagnostics file was not found")
+    if file_path.suffix.lower() not in _DIAGNOSTIC_PREVIEW_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Diagnostics file type is not downloadable")
+    return FileResponse(file_path, filename=file_path.name)
+
 
 
 class CreatePlatformAccountRequest(BaseModel):

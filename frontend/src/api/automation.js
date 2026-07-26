@@ -29,3 +29,19 @@ export function getTaskStatus(taskId) {
   return request(`/automation/task/status/${encodeURIComponent(taskId)}`);
 }
 
+export function listDiagnosticRuns() {
+  return request("/automation/diagnostics/runs");
+}
+
+export function listDiagnosticRunFiles(runName) {
+  return request(`/automation/diagnostics/runs/${encodeURIComponent(runName)}/files`);
+}
+
+export function previewDiagnosticFile(relativePath) {
+  return request(`/automation/diagnostics/preview?path=${encodeURIComponent(relativePath)}`);
+}
+
+export function diagnosticDownloadUrl(relativePath) {
+  const base = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+  return `${base}/automation/diagnostics/download?path=${encodeURIComponent(relativePath)}`;
+}
