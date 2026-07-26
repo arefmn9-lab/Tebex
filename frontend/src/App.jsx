@@ -9,6 +9,7 @@ import CommercialSettings from "./pages/CommercialSettings.jsx";
 import BaleBulkCampaigns from "./pages/BaleBulkCampaigns.jsx";
 import Diagnostics from "./pages/Diagnostics.jsx";
 import BaleWorkspace from "./pages/BaleWorkspace.jsx";
+import CampaignExecutionEntry from "./pages/CampaignExecutionEntry.jsx";
 import OperationsAndLogs from "./pages/OperationsAndLogs.jsx";
 import SimpleAccounts from "./pages/SimpleAccounts.jsx";
 import PlatformSelector from "./pages/PlatformSelector.jsx";
@@ -25,7 +26,7 @@ const pages = {
   reports: CommercialLogs,
   settings: CommercialSettings,
   diagnostics: Diagnostics,
-  messaging: PlatformSelector,
+  messaging: CampaignExecutionEntry,
   platforms: PlatformSelector
 };
 
