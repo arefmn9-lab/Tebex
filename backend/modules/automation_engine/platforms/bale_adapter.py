@@ -10,6 +10,95 @@ from modules.automation_engine.plugins.bale.plugin import _native_profile_dir
 from modules.automation_engine.scenario_runner import ScenarioActionExecutor, ScenarioRunner
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _forward_submission_classification(
+    records: dict[str, Any],
+    click_result: dict[str, Any],
+    verify_state: dict[str, Any],
+    expected_recipient_name: str,
+) -> dict[str, Any]:
+    selected_state = records.get("recipient_selected_state") if isinstance(records.get("recipient_selected_state"), dict) else {}
+    selected_names = selected_state.get("selected_names") if isinstance(selected_state.get("selected_names"), list) else []
+    click_count = _safe_int(records.get("send_confirmation_click_count"))
+    explicit_error = any(verify_state.get(key) for key in ("visible_send_error", "send_error_visible", "send_error_text", "platform_rejection", "send_rejected"))
+    predicates = {
+        "recipient_boundary_verified": bool(records.get("recipient_selection_verified")),
+        "selected_names_match": selected_names == [expected_recipient_name],
+        "recipient_badge_count_is_one": _safe_int(selected_state.get("selected_count")) == 1,
+        "final_send_selector_count_is_one": _safe_int(records.get("final_forward_dom_count")) == 1,
+        "final_send_visible": _safe_int(records.get("final_forward_visible_count")) == 1,
+        "final_send_enabled": _safe_int(records.get("final_forward_enabled_count")) == 1,
+        "final_send_click_count_was_zero": _safe_int(records.get("final_send_click_count_before_click")) == 0,
+        "final_send_pointer_click_invoked_once": click_count == 1,
+        "final_send_click_completed": click_result.get("status") == "success",
+        "no_retry_or_second_send": click_count == 1,
+        "immediate_ui_transition_modal_closed": verify_state.get("recipient_picker_visible") is False,
+        "no_explicit_send_error": not explicit_error,
+    }
+    if all(predicates.values()):
+        delivery_verified = bool(verify_state.get("send_success_verified"))
+        return {
+            "ok": True,
+            "send_action_verified": True,
+            "delivery_status": "delivered" if delivery_verified else "submitted",
+            "delivery_verified": delivery_verified,
+            "submitted_success_predicates": predicates,
+            "error_code": None,
+            "failed_step": None,
+        }
+    if explicit_error and click_count == 1 and click_result.get("status") == "success":
+        return {
+            "ok": False,
+            "send_action_verified": False,
+            "delivery_status": "failed",
+            "delivery_verified": False,
+            "submitted_success_predicates": predicates,
+            "error_code": "explicit_platform_error",
+            "failed_step": "verify_send_result",
+        }
+    if click_count == 1 and click_result.get("status") == "success" and verify_state.get("recipient_picker_visible") is not False:
+        return {
+            "ok": False,
+            "send_action_verified": False,
+            "delivery_status": "post_click_ambiguous",
+            "delivery_verified": False,
+            "submitted_success_predicates": predicates,
+            "error_code": "post_click_ambiguous_state",
+            "failed_step": "verify_send_result",
+        }
+    return {
+        "ok": False,
+        "send_action_verified": False,
+        "delivery_status": "send_unverified",
+        "delivery_verified": False,
+        "submitted_success_predicates": predicates,
+        "error_code": "send_result_unverified",
+        "failed_step": "verify_send_result",
+    }
+
+
+def _is_post_click_diagnostic_probe_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        fragment in message
+        for fragment in (
+            "syntaxerror: invalid regular expression",
+            "locator.wait_for",
+            "timeout",
+            "detached",
+            "execution context was destroyed",
+            "target closed",
+            "context closed",
+        )
+    )
+
+
 class BaleScenarioActionExecutor(ScenarioActionExecutor):
     def __init__(self, plugin: Any, plan: Any, runtime_session: Any | None = None) -> None:
         super().__init__()
@@ -24,6 +113,16 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
         self.latest_message_selector = ""
         self.search_selector = ""
         self.first_recipient_result: dict[str, Any] | None = None
+
+    def _forward_modal_closed_after_click(self, page: Any) -> bool:
+        try:
+            overlay = page.locator(".ReactModal__Overlay")
+            count = int(overlay.count())
+            if count == 0:
+                return True
+            return not any(overlay.nth(index).is_visible(timeout=100) for index in range(count))
+        except Exception:
+            return False
 
     def element_exists(self, name: str, element: dict[str, Any] | None = None) -> bool:
         selector = str((element or {}).get("selector") or "")
@@ -323,24 +422,56 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
             if not confirm_selector:
                 return {"ok": False, "error_code": "forward_confirm_button_not_found"}
             page = self._ensure_page()
+            self.records["final_send_click_count_before_click"] = int(self.records.get("send_confirmation_click_count") or 0)
             click_result = self.plugin._click_selector_short(page, confirm_selector, timeout_ms=timeout_ms or 4000)
             self.records.update({
                 "send_confirmation_click_count": 1 if click_result.get("status") == "success" else 0,
                 "confirm_click_count": 1 if click_result.get("status") == "success" else 0,
             })
             if click_result.get("status") != "success":
+                self.records.update({
+                    "send_action_verified": False,
+                    "delivery_status": "send_unverified",
+                    "delivery_verified": False,
+                })
                 return {"ok": False, "error_code": "forward_confirm_failed", "click_result": click_result}
-            verify_state = self.plugin._wait_forward_success_state(page, expected_recipient_name=str(self.plan.display_name), timeout_ms=2000)
+            diagnostic_warning: dict[str, Any] = {}
+            try:
+                verify_state = self.plugin._wait_forward_success_state(page, expected_recipient_name=str(self.plan.display_name), timeout_ms=2000)
+            except Exception as exc:
+                if not _is_post_click_diagnostic_probe_error(exc):
+                    raise
+                modal_closed = self._forward_modal_closed_after_click(page)
+                verify_state = {
+                    "recipient_picker_visible": not modal_closed,
+                    "send_success_verified": False,
+                    "forward_verified": False,
+                    "verification_method": "",
+                    "verification_evidence": "",
+                    "remote_message_id": None,
+                    "verified_forward_recipient_count": 0,
+                }
+                diagnostic_warning = {
+                    "post_click_diagnostic_status": "failed",
+                    "post_click_diagnostic_error": str(exc),
+                    "post_click_modal_closed_verified": modal_closed,
+                }
+            classification = _forward_submission_classification(self.records, click_result, verify_state, str(self.plan.display_name))
             self.records.update({
+                "send_action_verified": bool(classification.get("send_action_verified")),
+                "delivery_status": str(classification.get("delivery_status") or "send_unverified"),
+                "delivery_verified": bool(classification.get("delivery_verified")),
+                "submitted_success_predicates": classification.get("submitted_success_predicates") or {},
                 "send_success_verified": bool(verify_state.get("send_success_verified")),
                 "verification_method": str(verify_state.get("verification_method") or ""),
                 "verification_evidence": str(verify_state.get("verification_evidence") or ""),
                 "remote_message_id": verify_state.get("remote_message_id") or None,
                 "post_send_verification": verify_state,
+                **diagnostic_warning,
             })
-            if not verify_state.get("send_success_verified"):
-                return {"ok": False, "error_code": "send_result_unverified", "failed_step": "verify_send_result", "click_result": click_result, **verify_state}
-            return {"ok": True, "click_result": click_result, **verify_state}
+            if not classification.get("ok"):
+                return {"ok": False, "error_code": str(classification.get("error_code") or "send_result_unverified"), "failed_step": str(classification.get("failed_step") or "verify_send_result"), "click_result": click_result, **verify_state}
+            return {"ok": True, "click_result": click_result, **verify_state, **classification}
         return super().click(element_name, element, timeout_ms)
 
 
@@ -420,9 +551,15 @@ class BaleDeliveryAdapter:
         failed_step = scenario_result.get("failed_step")
         if scenario_result.get("error_code") == "send_result_unverified":
             failed_step = "verify_send_result"
+        confirm_click_count = _safe_int(records["confirm_click_count"]) if "confirm_click_count" in records else (1 if final_send_invoked else 0)
+        send_confirmation_click_count = _safe_int(records["send_confirmation_click_count"]) if "send_confirmation_click_count" in records else (1 if final_send_invoked else 0)
+        send_action_verified = bool(records.get("send_action_verified"))
+        delivery_status = str(records.get("delivery_status") or ("delivered" if records.get("send_success_verified") else "submitted" if send_action_verified else "send_unverified" if final_send_invoked else "not_sent"))
+        delivery_verified = bool(records.get("delivery_verified") or records.get("send_success_verified"))
+        success = bool(scenario_result.get("ok"))
         return {
-            "success": bool(scenario_result.get("ok")),
-            "ok": bool(scenario_result.get("ok")),
+            "success": success,
+            "ok": success,
             "action": "bale_standalone_scenario",
             "scenario_id": scenario_result.get("scenario_id"),
             "job_id": plan.job_id,
@@ -438,13 +575,17 @@ class BaleDeliveryAdapter:
             "composer_visible": bool(records.get("confirmation_visible")),
             "final_send_control_visible": bool(records.get("confirmation_visible")),
             "stopped_before_send": bool(scenario_result.get("stopped_before_send") or records.get("stopped_before_send")),
-            "confirm_click_count": int(records.get("confirm_click_count") or (1 if final_send_invoked else 0)),
-            "send_confirmation_click_count": int(records.get("send_confirmation_click_count") or (1 if final_send_invoked else 0)),
+            "confirm_click_count": confirm_click_count,
+            "send_confirmation_click_count": send_confirmation_click_count,
+            "send_action_verified": send_action_verified,
+            "delivery_status": delivery_status,
+            "delivery_verified": delivery_verified,
             "send_success_verified": bool(records.get("send_success_verified")),
+            "retry_allowed": False if final_send_invoked else None,
             "verification_method": str(records.get("verification_method") or ""),
             "verification_evidence": str(records.get("verification_evidence") or ""),
             "remote_message_id": records.get("remote_message_id") or None,
-            "outcome": "sent" if final_send_invoked and scenario_result.get("ok") and records.get("send_success_verified") else "cancelled",
+            "outcome": "sent" if final_send_invoked and success and delivery_status in {"submitted", "delivered"} else "cancelled",
             "failed_step": failed_step,
             "error_code": scenario_result.get("error_code"),
             "error_message": scenario_result.get("error_message"),

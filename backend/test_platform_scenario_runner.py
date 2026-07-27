@@ -470,6 +470,9 @@ def test_live_send_requires_explicit_authorization_before_mocked_confirmation() 
     assert blocked["confirm_click_count"] == 0
     assert allowed["success"] is True
     assert allowed["confirm_click_count"] == 1
+    assert allowed["send_action_verified"] is True
+    assert allowed["delivery_status"] == "delivered"
+    assert allowed["delivery_verified"] is True
     assert allowed["send_success_verified"] is True
     assert allowed["verification_method"] == "explicit_success_toast"
     assert allowed_plugin.forward_message_called == 0
@@ -477,7 +480,7 @@ def test_live_send_requires_explicit_authorization_before_mocked_confirmation() 
     assert allowed_plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
 
 
-def test_live_send_requires_explicit_post_send_evidence() -> None:
+def test_completed_live_send_without_delivery_evidence_is_submitted() -> None:
     plugin = FakeBalePlugin()
     plugin.send_success_state = {
         "recipient_picker_visible": False,
@@ -491,12 +494,249 @@ def test_live_send_requires_explicit_post_send_evidence() -> None:
 
     result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
 
-    assert result["success"] is False
+    assert result["success"] is True
     assert result["confirm_click_count"] == 1
-    assert result["failed_step"] == "verify_send_result"
-    assert result["error_code"] == "send_result_unverified"
+    assert result["send_confirmation_click_count"] == 1
+    assert result["send_action_verified"] is True
+    assert result["delivery_status"] == "submitted"
+    assert result["delivery_verified"] is False
+    assert result["send_success_verified"] is False
+    assert result["verification_method"] == ""
+    assert result["outcome"] == "sent"
+    assert result["failed_step"] is None
+    assert result["error_code"] is None
+    assert result["diagnostics"]["submitted_success_predicates"]["immediate_ui_transition_modal_closed"] is True
+    assert result["diagnostics"]["submitted_success_predicates"]["final_send_pointer_click_invoked_once"] is True
     assert plugin.forward_latest_called == 0
     assert plugin.forward_message_called == 0
+    assert plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
+
+
+def test_post_click_diagnostic_timeout_after_modal_close_is_submitted_with_warning() -> None:
+    class ModalLocator:
+        def count(self) -> int:
+            return 0
+
+    class DiagnosticTimeoutPlugin(FakeBalePlugin):
+        def __init__(self) -> None:
+            super().__init__()
+            base_locator = self.page.locator
+            self.page.locator = lambda selector: ModalLocator() if selector == ".ReactModal__Overlay" else base_locator(selector)
+
+        def _wait_forward_success_state(self, page: object, expected_recipient_name: str = "", timeout_ms: int = 1500) -> dict[str, object]:
+            raise TimeoutError("Locator.wait_for: Timeout 2000ms exceeded")
+
+    plugin = DiagnosticTimeoutPlugin()
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(display_name="Bale-000003"), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is True
+    assert result["delivery_status"] == "submitted"
+    assert result["send_action_verified"] is True
+    assert result["delivery_verified"] is False
+    assert result["retry_allowed"] is False
+    assert result["diagnostics"]["post_click_diagnostic_status"] == "failed"
+    assert "Timeout" in result["diagnostics"]["post_click_diagnostic_error"]
+    assert result["diagnostics"]["post_click_modal_closed_verified"] is True
+    assert plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
+
+
+def test_post_click_detached_modal_probe_after_modal_close_is_submitted_with_warning() -> None:
+    class ModalLocator:
+        def count(self) -> int:
+            return 0
+
+    class DetachedProbePlugin(FakeBalePlugin):
+        def __init__(self) -> None:
+            super().__init__()
+            base_locator = self.page.locator
+            self.page.locator = lambda selector: ModalLocator() if selector == ".ReactModal__Overlay" else base_locator(selector)
+
+        def _wait_forward_success_state(self, page: object, expected_recipient_name: str = "", timeout_ms: int = 1500) -> dict[str, object]:
+            raise RuntimeError("Element is detached from DOM")
+
+    plugin = DetachedProbePlugin()
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(display_name="Bale-000003"), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is True
+    assert result["delivery_status"] == "submitted"
+    assert result["diagnostics"]["post_click_diagnostic_status"] == "failed"
+    assert result["diagnostics"]["post_click_modal_closed_verified"] is True
+
+
+def test_post_click_invalid_regex_probe_after_modal_close_is_submitted_with_warning() -> None:
+    class ModalLocator:
+        def count(self) -> int:
+            return 0
+
+    class InvalidRegexProbePlugin(FakeBalePlugin):
+        def __init__(self) -> None:
+            super().__init__()
+            base_locator = self.page.locator
+            self.page.locator = lambda selector: ModalLocator() if selector == ".ReactModal__Overlay" else base_locator(selector)
+
+        def _wait_forward_success_state(self, page: object, expected_recipient_name: str = "", timeout_ms: int = 1500) -> dict[str, object]:
+            raise RuntimeError("Page.evaluate: SyntaxError: Invalid regular expression: /error|failed|???/: Nothing to repeat")
+
+    plugin = InvalidRegexProbePlugin()
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(display_name="Bale-000003"), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is True
+    assert result["delivery_status"] == "submitted"
+    assert result["send_action_verified"] is True
+    assert result["diagnostics"]["post_click_diagnostic_status"] == "failed"
+    assert result["diagnostics"]["submitted_success_predicates"]["selected_names_match"] is True
+
+
+def test_structured_acknowledgment_marks_delivery_verified() -> None:
+    plugin = FakeBalePlugin()
+    plugin.send_success_state = {
+        "recipient_picker_visible": False,
+        "send_success_verified": True,
+        "forward_verified": True,
+        "verification_method": "structured_application_ack",
+        "verification_evidence": "ack:forward-submitted",
+        "remote_message_id": "remote-1",
+        "verified_forward_recipient_count": 1,
+    }
+
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is True
+    assert result["send_action_verified"] is True
+    assert result["delivery_status"] == "delivered"
+    assert result["delivery_verified"] is True
+    assert result["send_success_verified"] is True
+    assert result["verification_method"] == "structured_application_ack"
+    assert result["remote_message_id"] == "remote-1"
+
+
+def test_destination_confirmation_marks_delivery_verified() -> None:
+    plugin = FakeBalePlugin()
+    plugin.send_success_state = {
+        "recipient_picker_visible": False,
+        "send_success_verified": True,
+        "forward_verified": True,
+        "verification_method": "destination_chat_confirmation",
+        "verification_evidence": "visible forwarded message",
+        "remote_message_id": None,
+        "verified_forward_recipient_count": 1,
+    }
+
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is True
+    assert result["delivery_status"] == "delivered"
+    assert result["delivery_verified"] is True
+    assert result["verification_method"] == "destination_chat_confirmation"
+
+
+def test_final_click_interaction_error_is_not_submitted() -> None:
+    class FinalClickFailsPlugin(FakeBalePlugin):
+        def _click_selector_short(
+            self,
+            page: object,
+            selector: str,
+            timeout_ms: int = 1000,
+            postcondition_selector: str | None = None,
+            postcondition_timeout_ms: int = 0,
+        ) -> dict[str, object]:
+            if selector == FINAL_SEND_SELECTOR:
+                self.clicked.append(selector)
+                return {"status": "failed", "selector": selector, "error": "not hit testable"}
+            return super()._click_selector_short(page, selector, timeout_ms, postcondition_selector, postcondition_timeout_ms)
+
+    plugin = FinalClickFailsPlugin()
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "forward_confirm_failed"
+    assert result["send_action_verified"] is False
+    assert result["delivery_status"] == "send_unverified"
+    assert result["confirm_click_count"] == 0
+    assert plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
+
+
+def test_modal_open_with_visible_send_error_is_not_submitted() -> None:
+    plugin = FakeBalePlugin()
+    plugin.send_success_state = {
+        "recipient_picker_visible": True,
+        "send_success_verified": False,
+        "forward_verified": False,
+        "verification_method": "",
+        "verification_evidence": "",
+        "remote_message_id": None,
+        "verified_forward_recipient_count": 0,
+        "send_error_text": "Unable to forward",
+    }
+
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "explicit_platform_error"
+    assert result["send_action_verified"] is False
+    assert result["delivery_status"] == "failed"
+    assert result["outcome"] == "cancelled"
+    assert result["diagnostics"]["submitted_success_predicates"]["no_explicit_send_error"] is False
+
+
+def test_modal_open_after_completed_click_is_post_click_ambiguous() -> None:
+    plugin = FakeBalePlugin()
+    plugin.send_success_state = {
+        "recipient_picker_visible": True,
+        "send_success_verified": False,
+        "forward_verified": False,
+        "verification_method": "",
+        "verification_evidence": "",
+        "remote_message_id": None,
+        "verified_forward_recipient_count": 0,
+    }
+
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is False
+    assert result["error_code"] == "post_click_ambiguous_state"
+    assert result["delivery_status"] == "post_click_ambiguous"
+    assert result["retry_allowed"] is False
+    assert plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
+
+
+def test_unexpected_post_click_exception_is_not_swallowed() -> None:
+    class UnexpectedProbePlugin(FakeBalePlugin):
+        def _wait_forward_success_state(self, page: object, expected_recipient_name: str = "", timeout_ms: int = 1500) -> dict[str, object]:
+            raise RuntimeError("database disappeared")
+
+    plugin = UnexpectedProbePlugin()
+    try:
+        BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+    except RuntimeError as exc:
+        assert "database disappeared" in str(exc)
+    else:
+        raise AssertionError("unexpected post-click exception was swallowed")
+    assert plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
+
+
+def test_submitted_send_is_not_retried_or_labeled_delivered() -> None:
+    plugin = FakeBalePlugin()
+    plugin.send_success_state = {
+        "recipient_picker_visible": False,
+        "send_success_verified": False,
+        "forward_verified": False,
+        "verification_method": "",
+        "verification_evidence": "",
+        "remote_message_id": None,
+        "verified_forward_recipient_count": 0,
+    }
+
+    result = BaleDeliveryAdapter(plugin=plugin).execute_standalone_scenario(_plan(), operation_mode="live_send", allow_final_send=True)
+
+    assert result["success"] is True
+    assert result["outcome"] == "sent"
+    assert result["delivery_status"] == "submitted"
+    assert result["delivery_status"] != "delivered"
+    assert result["delivery_verified"] is False
+    assert result["retry_allowed"] is False
+    assert result["error_code"] is None
+    assert plugin.clicked.count(FINAL_SEND_SELECTOR) == 1
 
 
 if __name__ == "__main__":
@@ -513,5 +753,15 @@ if __name__ == "__main__":
     test_selection_unverified_is_not_no_account_and_never_sends()
     test_missing_hover_forward_control_fails_at_open_forward_picker()
     test_live_send_requires_explicit_authorization_before_mocked_confirmation()
-    test_live_send_requires_explicit_post_send_evidence()
+    test_completed_live_send_without_delivery_evidence_is_submitted()
+    test_post_click_diagnostic_timeout_after_modal_close_is_submitted_with_warning()
+    test_post_click_detached_modal_probe_after_modal_close_is_submitted_with_warning()
+    test_post_click_invalid_regex_probe_after_modal_close_is_submitted_with_warning()
+    test_structured_acknowledgment_marks_delivery_verified()
+    test_destination_confirmation_marks_delivery_verified()
+    test_final_click_interaction_error_is_not_submitted()
+    test_modal_open_with_visible_send_error_is_not_submitted()
+    test_modal_open_after_completed_click_is_post_click_ambiguous()
+    test_unexpected_post_click_exception_is_not_swallowed()
+    test_submitted_send_is_not_retried_or_labeled_delivered()
     print("Platform scenario runner tests passed")
