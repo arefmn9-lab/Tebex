@@ -37,7 +37,7 @@ from .import_pipeline import (
 )
 from .operations import operation_registry
 from .policy import EffectivePolicyResolver
-from .repository import CommercialQueueRepository, parse_time, utc_now
+from .repository import CommercialQueueRepository, commercial_send_completed, parse_time, utc_now
 from .resources import ResourceCapacityProvider
 
 
@@ -4281,7 +4281,9 @@ class CommercialQueueService:
                             "error_message": reset_result.get("message") or "Session reset failed",
                             "failed_step": "reset_reused_session",
                         }
-                structured_error = classify_error(result, component="worker", step=result.get("failed_step")).to_dict() if not (result.get("success") and result.get("forward_verified") and result.get("diagnostics_consistent")) else {}
+                send_completed = commercial_send_completed(result)
+                delivery_verified = bool(result.get("delivery_verified") or result.get("forward_verified"))
+                structured_error = classify_error(result, component="worker", step=result.get("failed_step")).to_dict() if not send_completed else {}
                 if dry_run:
                     completed = self.repository.complete_job(
                         job["id"],
@@ -4299,15 +4301,18 @@ class CommercialQueueService:
                     )
                     event_type = "job_paused"
                     event_status = "skipped"
-                elif result.get("success") and result.get("forward_verified") and result.get("diagnostics_consistent"):
+                elif send_completed:
                     completed = self.repository.complete_job(
                         job["id"],
                         "succeeded",
                         {
                             "result_success": True,
                             "verified_forwarded_recipient_count": int(result.get("verified_forwarded_recipient_count") or 0),
-                            "forward_verified": True,
+                            "forward_verified": delivery_verified,
                             "diagnostics_consistent": True,
+                            "delivery_status": result.get("delivery_status"),
+                            "delivery_verified": delivery_verified,
+                            "send_action_verified": bool(result.get("send_action_verified")) if "send_action_verified" in result else None,
                         },
                     )
                     self.repository.increment_account_sent_counts(account_id)

@@ -66,6 +66,24 @@ TERMINAL_PLATFORM_OUTCOMES = {
 ACTIVE_PLATFORM_OUTCOMES = {"queued", "assigned", "in_progress"}
 
 
+def commercial_send_completed(result: dict[str, Any] | None) -> bool:
+    payload = result or {}
+    has_modern_fields = any(key in payload for key in ("delivery_status", "send_action_verified", "delivery_verified"))
+    if has_modern_fields:
+        return (
+            bool(payload.get("success"))
+            and str(payload.get("delivery_status") or "") in {"submitted", "delivered"}
+            and payload.get("send_action_verified") is True
+            and not payload.get("error_code")
+        )
+    return (
+        bool(payload.get("success"))
+        and bool(payload.get("forward_verified"))
+        and bool(payload.get("diagnostics_consistent"))
+        and not payload.get("error_code")
+    )
+
+
 def aggregate_scenario_status(outcomes: list[str]) -> str:
     if not outcomes:
         return "pending"
@@ -3001,13 +3019,8 @@ class CommercialQueueRepository:
                     (job_row["platform_run_id"],),
                 ).fetchone()
                 previous_outcome = str(platform_row["outcome"]) if platform_row is not None else None
-                verified_success = (
-                    status == "succeeded"
-                    and bool(payload.get("result_success"))
-                    and bool(payload.get("forward_verified"))
-                    and bool(payload.get("diagnostics_consistent"))
-                )
-                if verified_success:
+                send_completed = commercial_send_completed({"success": status == "succeeded" and bool(payload.get("result_success")), **payload})
+                if send_completed:
                     outcome = "sent"
                 elif status == "cancelled":
                     outcome = "cancelled"
@@ -3056,6 +3069,9 @@ class CommercialQueueRepository:
                         metadata={
                             "job_status": status,
                             "result_success": payload.get("result_success"),
+                            "delivery_status": payload.get("delivery_status"),
+                            "delivery_verified": payload.get("delivery_verified"),
+                            "send_action_verified": payload.get("send_action_verified"),
                             "forward_verified": payload.get("forward_verified"),
                             "diagnostics_consistent": payload.get("diagnostics_consistent"),
                         },

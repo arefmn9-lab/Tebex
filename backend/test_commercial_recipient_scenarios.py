@@ -118,6 +118,39 @@ def test_linked_delivery_job_completion_updates_platform_run_and_retry_recreates
     assert retried["whatsapp"]["outcome"] == "sent"
 
 
+def test_linked_submitted_delivery_job_is_terminal_sent_without_delivery_verification() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        service = _service(Path(tmp_dir) / "commercial.db")
+        campaign = service.create_campaign({"name": "Linked Submitted", "platform": "multi"})
+        imported = service.import_recipients(campaign["id"], ["09304073331"])
+        recipient = imported["created_recipients"][0]
+        service.authorize_recipient_live(recipient["id"], "temp test authorization", authorized_by="test")
+        scenario = service.start_recipient_scenario(campaign["id"], recipient["id"], ["bale"], create_delivery_jobs=True)
+        bale = _platforms(scenario)["bale"]
+
+        service.repository.complete_job(
+            bale["delivery_job_id"],
+            "succeeded",
+            {
+                "result_success": True,
+                "delivery_status": "submitted",
+                "send_action_verified": True,
+                "delivery_verified": False,
+                "verified_forwarded_recipient_count": 0,
+                "forward_verified": False,
+                "diagnostics_consistent": True,
+            },
+        )
+        updated = service.get_recipient_scenario(scenario["id"])
+        retry = service.retry_recipient_scenario(scenario["id"])
+
+    assert _platforms(updated)["bale"]["outcome"] == "sent"
+    assert updated["scenario_status"] == "completed"
+    assert updated["sent_platform_count"] == 1
+    assert updated["failed_platform_count"] == 0
+    assert retry["requeued_platform_run_count"] == 0
+
+
 def test_repeated_scenario_creation_is_idempotent_for_campaign_phone() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         service = _service(Path(tmp_dir) / "commercial.db")
@@ -278,6 +311,7 @@ if __name__ == "__main__":
     test_account_not_found_is_checked_terminal_not_sent_and_not_retried_by_default()
     test_failed_retryable_produces_retry_pending_and_only_that_platform_requeues()
     test_linked_delivery_job_completion_updates_platform_run_and_retry_recreates_only_failed_job()
+    test_linked_submitted_delivery_job_is_terminal_sent_without_delivery_verification()
     test_repeated_scenario_creation_is_idempotent_for_campaign_phone()
     test_concurrent_scenario_creation_creates_one_recipient_run()
     test_terminal_sent_outcome_cannot_be_silently_downgraded()

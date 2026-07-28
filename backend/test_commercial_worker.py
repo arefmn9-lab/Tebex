@@ -6,7 +6,7 @@ from pathlib import Path
 from app.main import app
 from app.routes import automation as automation_routes
 from fastapi.testclient import TestClient
-from modules.automation_engine.commercial_queue.repository import CommercialQueueRepository, utc_now
+from modules.automation_engine.commercial_queue.repository import CommercialQueueRepository, commercial_send_completed, utc_now
 from modules.automation_engine.commercial_queue.service import CommercialQueueService
 
 
@@ -172,6 +172,87 @@ def test_worker_runs_assigned_jobs_sequentially_and_updates_success_counters() -
     assert settings["current_round_sent_count"] == 2
 
 
+def test_commercial_send_completed_prefers_modern_submitted_contract() -> None:
+    cases = [
+        (
+            {
+                "success": True,
+                "delivery_status": "submitted",
+                "send_action_verified": True,
+                "delivery_verified": False,
+                "forward_verified": False,
+                "diagnostics_consistent": False,
+                "error_code": None,
+            },
+            True,
+        ),
+        (
+            {
+                "success": True,
+                "delivery_status": "delivered",
+                "send_action_verified": True,
+                "delivery_verified": True,
+                "error_code": None,
+            },
+            True,
+        ),
+        (
+            {
+                "success": False,
+                "delivery_status": "send_unverified",
+                "send_action_verified": False,
+                "forward_verified": True,
+                "diagnostics_consistent": True,
+                "error_code": "send_result_unverified",
+            },
+            False,
+        ),
+        (
+            {"success": True, "forward_verified": True, "diagnostics_consistent": True, "error_code": None},
+            True,
+        ),
+        (
+            {"success": True, "forward_verified": False, "diagnostics_consistent": True, "error_code": None},
+            False,
+        ),
+    ]
+
+    for payload, expected in cases:
+        assert commercial_send_completed(payload) is expected
+
+
+def test_submitted_worker_result_is_terminal_success_without_delivery_verification_or_retry() -> None:
+    submitted = {
+        "success": True,
+        "delivery_status": "submitted",
+        "send_action_verified": True,
+        "delivery_verified": False,
+        "send_success_verified": False,
+        "forward_verified": False,
+        "diagnostics_consistent": False,
+        "verified_forwarded_recipient_count": 0,
+        "error_code": None,
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        orchestrator = OrchestratorStub([submitted])
+        service = _service(Path(tmp_dir) / "worker.db", orchestrator)
+        campaign = _campaign_with_jobs(service, count=1)
+        result = service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=False)
+        resumed = service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=False)
+        jobs = service.list_jobs(campaign_id=campaign["id"], limit=10)["items"]
+        campaign_after = service.get_campaign(campaign["id"])
+
+    assert result["processed_count"] == 1
+    assert result["requeued_unstarted_count"] == 0
+    assert resumed["assigned_count"] == 0
+    assert jobs[0]["status"] == "succeeded"
+    assert jobs[0]["result_success"] == 1
+    assert jobs[0]["forward_verified"] == 0
+    assert jobs[0]["retryable"] is None
+    assert campaign_after["succeeded_count"] == 1
+    assert campaign_after["failed_count"] == 0
+
+
 def test_failed_job_does_not_increment_and_ordinary_failure_continues() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         orchestrator = OrchestratorStub(
@@ -286,6 +367,8 @@ if __name__ == "__main__":
     test_one_worker_lock_per_account_and_stale_release()
     test_stale_job_recovery_requeues_assigned_and_pauses_uncertain_running()
     test_worker_runs_assigned_jobs_sequentially_and_updates_success_counters()
+    test_commercial_send_completed_prefers_modern_submitted_contract()
+    test_submitted_worker_result_is_terminal_success_without_delivery_verification_or_retry()
     test_failed_job_does_not_increment_and_ordinary_failure_continues()
     test_unsafe_account_level_failure_stops_round_and_requeues_unstarted()
     test_dry_run_sends_nothing_and_does_not_increment_daily_count()
