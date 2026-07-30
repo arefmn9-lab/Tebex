@@ -41,6 +41,7 @@ from modules.automation_engine.platforms.platform_registry import (
     list_platforms as registry_list_platforms,
 )
 from modules.automation_engine.account_registry import account_registry_service
+from modules.automation_engine.account_registry.bale_onboarding import BaleOnboardingError, bale_onboarding_service
 from modules.automation_engine.plugins.bale import bale_plugin
 from modules.automation_engine.plugins.bale.account_store import bale_account_store, canonical_source_channel_url, normalize_source_channel_uid
 from modules.automation_engine.plugins.bale.contact_store import bale_contact_store
@@ -725,6 +726,37 @@ class BalePrepareAuthorizedContactsRequest(BaseModel):
 
 class BaleAuthenticationOpenRequest(BaseModel):
     account_id: str
+    purpose: str = "login"
+
+
+class BaleOnboardingPreflightRequest(BaseModel):
+    identifier: str
+    account_id: str | None = None
+
+
+class BaleOnboardingProvisionRequest(BaleOnboardingPreflightRequest):
+    idempotency_key: str
+    onboarding_batch_id: str | None = None
+    created_by: str = "operator"
+
+
+class BaleOnboardingBatchRequest(BaseModel):
+    name: str
+    target_count: int = Field(ge=1)
+    account_ids: list[str] = Field(default_factory=list)
+    created_by: str = "operator"
+
+
+class BaleSchedulingRequest(BaseModel):
+    enabled: bool
+
+
+class BaleRetireRequest(BaseModel):
+    reason: str = "retired_by_operator"
+
+class BaleOperationalConfigurationRequest(BaseModel):
+    configuration: dict[str, Any]
+    actor: str = "operator-ui"
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -2569,9 +2601,15 @@ def audit_bale_authentication_profile(account_id: str, response: Response) -> di
 @router.post("/platforms/bale/authentication/open")
 def open_bale_authentication(request: BaleAuthenticationOpenRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
+    launch_lock = None
     try:
-        return commercial_queue_service.open_bale_authentication(request.account_id)
+        launch_lock = bale_onboarding_service.acquire_profile_launch_lock(request.account_id)
+        result = commercial_queue_service.open_bale_authentication(request.account_id)
+        bale_onboarding_service.record_authentication_open(request.account_id, result, purpose=request.purpose)
+        return result
     except Exception as exc:
+        if launch_lock:
+            bale_onboarding_service.release_profile_launch_lock(request.account_id, launch_lock["owner_id"])
         raise _campaign_lifecycle_error(exc) from exc
 
 
@@ -2579,7 +2617,9 @@ def open_bale_authentication(request: BaleAuthenticationOpenRequest, response: R
 def get_bale_authentication_status(maintenance_session_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        return commercial_queue_service.get_bale_authentication_status(maintenance_session_id)
+        result = commercial_queue_service.get_bale_authentication_status(maintenance_session_id)
+        bale_onboarding_service.record_authentication_status(maintenance_session_id, result)
+        return result
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 
@@ -2588,7 +2628,9 @@ def get_bale_authentication_status(maintenance_session_id: str, response: Respon
 def verify_bale_authentication(maintenance_session_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        return commercial_queue_service.verify_bale_authentication(maintenance_session_id)
+        result = commercial_queue_service.verify_bale_authentication(maintenance_session_id)
+        result["account"] = bale_onboarding_service.record_authentication_verified(maintenance_session_id, result)
+        return result
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 
@@ -2597,9 +2639,145 @@ def verify_bale_authentication(maintenance_session_id: str, response: Response) 
 def close_bale_authentication(maintenance_session_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        return commercial_queue_service.close_bale_authentication(maintenance_session_id)
+        result = commercial_queue_service.close_bale_authentication(maintenance_session_id)
+        result["account"] = bale_onboarding_service.record_authentication_closed(maintenance_session_id, result)
+        return result
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
+
+
+def _onboarding_error(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_code": getattr(exc, "error_code", "bale_onboarding_error"),
+            "message": str(exc),
+            "details": getattr(exc, "details", {}),
+        },
+    )
+
+
+@router.get("/platforms/bale/onboarding/accounts")
+def list_bale_onboarding_accounts(response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.list_accounts()
+
+
+@router.get("/platforms/bale/onboarding/accounts/{account_id}")
+def get_bale_onboarding_account(account_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    account = bale_onboarding_service.get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return account
+
+
+@router.get("/platforms/bale/onboarding/accounts/{account_id}/reconcile")
+def reconcile_bale_onboarding_account(account_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.reconcile(account_id)
+
+
+@router.post("/platforms/bale/onboarding/preflight")
+def preflight_bale_onboarding(request: BaleOnboardingPreflightRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.preflight(request.identifier, request.account_id)
+
+
+@router.post("/platforms/bale/onboarding/provision")
+def provision_bale_onboarding_account(request: BaleOnboardingProvisionRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.provision(request.model_dump())
+    except BaleOnboardingError as exc:
+        raise _onboarding_error(exc) from exc
+
+
+@router.put("/platforms/bale/onboarding/accounts/{account_id}/scheduling")
+def set_bale_onboarding_scheduling(account_id: str, request: BaleSchedulingRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.set_scheduling(account_id, request.enabled)
+    except BaleOnboardingError as exc:
+        raise _onboarding_error(exc) from exc
+
+
+@router.post("/platforms/bale/onboarding/accounts/{account_id}/disable")
+def disable_bale_onboarding_account(account_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.disable_account(account_id)
+    except Exception as exc:
+        raise _onboarding_error(exc) from exc
+
+
+@router.post("/platforms/bale/onboarding/accounts/{account_id}/retire")
+def retire_bale_onboarding_account(account_id: str, request: BaleRetireRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.transition(account_id, "retired", reason=request.reason)
+    except BaleOnboardingError as exc:
+        raise _onboarding_error(exc) from exc
+
+
+@router.get("/platforms/bale/onboarding/batches")
+def list_bale_onboarding_batches(response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.list_batches()
+
+
+@router.post("/platforms/bale/onboarding/batches")
+def create_bale_onboarding_batch(request: BaleOnboardingBatchRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.create_batch(request.model_dump())
+    except BaleOnboardingError as exc:
+        raise _onboarding_error(exc) from exc
+
+
+@router.get("/platforms/bale/onboarding/batches/{batch_id}")
+def get_bale_onboarding_batch(batch_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.get_batch(batch_id)
+    except BaleOnboardingError as exc:
+        raise _onboarding_error(exc) from exc
+
+
+@router.get("/platforms/bale/onboarding/operations/{operation_id}")
+def get_bale_onboarding_operation(operation_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    operation = bale_onboarding_service.get_operation(operation_id)
+    if not operation:
+        raise HTTPException(status_code=404, detail="Operation not found")
+    return operation
+
+
+@router.get("/platforms/bale/onboarding/audit-events")
+def list_bale_onboarding_audit_events(response: Response, account_id: str | None = None, batch_id: str | None = None) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.audit_events(account_id, batch_id)
+
+
+@router.post("/platforms/bale/onboarding/recover-stale-sessions")
+def recover_bale_onboarding_sessions(response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.recover_stale_sessions()
+
+
+@router.get("/platforms/bale/onboarding/configuration")
+def get_bale_onboarding_configuration(response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    return bale_onboarding_service.configuration()
+
+
+@router.put("/platforms/bale/onboarding/configuration")
+def update_bale_onboarding_configuration(request: BaleOperationalConfigurationRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return bale_onboarding_service.update_configuration(request.configuration, request.actor)
+    except Exception as exc:
+        raise _onboarding_error(exc) from exc
 
 
 @router.get("/platforms/bale/source-channel")
@@ -3168,13 +3346,19 @@ def open_bale_account(
 @router.post("/platforms/bale/accounts/{account_id}/open-login")
 def open_bale_login(account_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return bale_plugin.open_login(account_id)
+    raise HTTPException(
+        status_code=410,
+        detail={"error_code": "legacy_login_route_deprecated", "message": "Use the controlled Bale authentication workflow."},
+    )
 
 
 @router.post("/platforms/bale/accounts/{account_id}/check-login")
 def check_bale_login(account_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return bale_plugin.check_login(account_id)
+    raise HTTPException(
+        status_code=410,
+        detail={"error_code": "legacy_login_route_deprecated", "message": "Use the controlled Bale authentication workflow."},
+    )
 
 
 @router.post("/platforms/bale/send-test")
@@ -3221,10 +3405,7 @@ def open_account_browser(account_id: str, response: Response) -> dict[str, Any]:
 @router.get("/accounts")
 def list_accounts(response: Response) -> list[dict[str, Any]]:
     _set_dashboard_cors_headers(response)
-    try:
-        return [_serialize_account(account) for account in worker.account_manager.list_accounts()]
-    except Exception:
-        return []
+    return account_registry_service.list_platform_accounts("bale")
 
 
 @router.get("/health")
