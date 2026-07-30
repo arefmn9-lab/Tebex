@@ -571,8 +571,8 @@ export default function BaleWorkspace() {
           account={accountModal.mode === "new" ? null : accountModal}
           onClose={() => setAccountModal(null)}
           onSave={async (payload) => {
-            if (accountModal.mode === "new" && payload.account_id) await openBaleLogin(payload.account_id);
-            else if (payload.account_id) await updateBaleAccount(payload.account_id, payload);
+            // Login is intentionally never started as a side effect of account creation.
+            if (accountModal.mode !== "new" && payload.account_id) await updateBaleAccount(payload.account_id, payload);
             setAccountModal(null);
             await refreshWorkspace();
           }}

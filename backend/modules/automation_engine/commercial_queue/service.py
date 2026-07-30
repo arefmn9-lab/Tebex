@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from modules.automation_engine.plugins.bale import bale_plugin
 from modules.automation_engine.plugins.bale.account_store import bale_account_store
+from modules.automation_engine.account_registry.bale_onboarding import bale_onboarding_service
 from modules.automation_engine.plugins.bale.contact_store import BaleContactError, bale_contact_store, normalize_bale_phone
 from modules.automation_engine.platforms.bale_adapter import BaleDeliveryAdapter
 from modules.automation_engine.runtime_sessions.manager import AccountRuntimeSessionManager, RuntimeSessionError
@@ -20,7 +21,7 @@ from modules.automation_engine.browser_identity.repository import BrowserIdentit
 from modules.automation_engine.browser_identity.resolver import BrowserIdentityResolver
 
 from .account_health import AccountHealthRepository, AccountHealthService, BLOCKING_STATES
-from .bale_authentication import BaleAuthenticationMaintenanceService
+from .bale_authentication import BaleAuthenticationMaintenanceService, FakeBaleAuthenticationMaintenanceService
 from .context import OperationContext
 from .errors import ERROR_DOMAINS, classify_error
 from .execution_plan import build_execution_plan
@@ -218,14 +219,14 @@ class CommercialQueueService:
         self.browser_identity_resolver = BrowserIdentityResolver(identity_repository)
         self.runtime_session_manager.identity_resolver = self.browser_identity_resolver
         self.account_health = AccountHealthService(AccountHealthRepository(self.repository.database_path))
-        self.bale_authentication = BaleAuthenticationMaintenanceService(
+        self.bale_authentication = FakeBaleAuthenticationMaintenanceService() if os.environ.get("CLINICOS_FAKE_BALE_AUTHENTICATION") == "1" else BaleAuthenticationMaintenanceService(
             runtime_session_manager=self.runtime_session_manager,
             browser_identity_resolver=self.browser_identity_resolver,
             account_health=self.account_health,
             plugin=bale_plugin,
         )
         self.orchestrator = orchestrator
-        self.account_auth_checker = account_auth_checker or (lambda account_id: bale_account_store.get_account(account_id) is not None)
+        self.account_auth_checker = account_auth_checker or bale_onboarding_service.scheduler_authentication_available
         self.sleeper = sleeper or time.sleep
         self.contact_store = bale_contact_store
         self.recover_stale_jobs()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,11 @@ DEFAULT_PREPARATION = {
 
 
 def _runtime_dir() -> Path:
+    configured = os.environ.get("CLINICOS_BALE_RUNTIME_DIR")
+    if configured:
+        path = Path(configured)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     backend_dir = Path(__file__).resolve().parents[4]
     path = backend_dir / "runtime" / "platforms" / "bale"
     path.mkdir(parents=True, exist_ok=True)
@@ -82,6 +88,9 @@ class BaleAccountStore:
         account_id = str(payload.get("account_id") or f"bale_{phone or len(accounts) + 1}").strip()
         if any(account["account_id"] == account_id for account in accounts):
             raise ValueError(f"Account already exists: {account_id}")
+        normalized_phone = normalize_bale_identifier(phone)
+        if any(normalize_bale_identifier(str(account.get("phone") or account.get("username_or_number") or "")) == normalized_phone for account in accounts):
+            raise ValueError("duplicate_bale_identifier")
         self._validate_provider_payload(payload)
         account = self._normalize_account({"account_id": account_id, **payload})
         accounts.append(account)
@@ -293,11 +302,26 @@ class BaleAccountStore:
 
     def _write_json(self, path: Path, data: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as json_file:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as json_file:
             json.dump(data, json_file, ensure_ascii=False, indent=2)
+            json_file.flush()
+            os.fsync(json_file.fileno())
+        os.replace(temporary, path)
 
 
 bale_account_store = BaleAccountStore()
+
+
+def normalize_bale_identifier(value: str) -> str:
+    raw = str(value or "").strip().replace(" ", "").replace("-", "")
+    if raw.startswith("+98"):
+        raw = "0" + raw[3:]
+    elif raw.startswith("0098"):
+        raw = "0" + raw[4:]
+    elif raw.startswith("98") and len(raw) == 12:
+        raw = "0" + raw[2:]
+    return raw
 
 
 def normalize_source_channel_uid(value: str) -> str:

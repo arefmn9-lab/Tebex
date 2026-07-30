@@ -299,16 +299,24 @@ export function openBaleAccount(accountId) {
   });
 }
 
-export function openBaleLogin(accountId) {
-  return request(`/automation/platforms/bale/accounts/${encodeURIComponent(accountId)}/open-login`, {
+const controlledBaleSessions = new Map();
+
+export async function openBaleLogin(accountId) {
+  await request(`/automation/platforms/bale/authentication/audit/${encodeURIComponent(accountId)}`);
+  const result = await request("/automation/platforms/bale/authentication/open", {
     method: "POST",
+    body: JSON.stringify({ account_id: accountId, purpose: "login" }),
   });
+  controlledBaleSessions.set(accountId, result.maintenance_session_id);
+  return result;
 }
 
 export function checkBaleLogin(accountId) {
-  return request(`/automation/platforms/bale/accounts/${encodeURIComponent(accountId)}/check-login`, {
-    method: "POST",
-  });
+  const sessionId = controlledBaleSessions.get(accountId);
+  if (!sessionId) {
+    return Promise.reject(Object.assign(new Error("Controlled login session not found; resume from Bale Accounts."), { code: "controlled_login_session_required" }));
+  }
+  return request(`/automation/platforms/bale/authentication/status/${encodeURIComponent(sessionId)}`);
 }
 
 export function sendBaleTestMessage(payload) {

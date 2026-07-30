@@ -5,8 +5,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import modules.automation_engine.commercial_queue.service as commercial_service
 from modules.automation_engine.commercial_queue.repository import CommercialQueueRepository
 from modules.automation_engine.commercial_queue.service import CampaignLifecycleError, CommercialQueueService
+from modules.automation_engine.plugins.bale.contact_store import BaleContactStore
 
 
 AUTHORIZED_PHONES = {"989304073331", "989050454491", "989377686492"}
@@ -69,48 +71,97 @@ def _authorize(service: CommercialQueueService, recipient_id: str) -> None:
     )
 
 
-def test_bale_000010_and_000011_creation_trace_is_found() -> None:
-    service = CommercialQueueService()
-    trace = service.audit_bale_contact_provenance(["Bale-000010", "Bale-000011"])
-    by_name = {item["display_name"]: item for item in trace["items"]}
-    assert by_name["Bale-000010"]["normalized_phone"] == "989304073112"
-    assert by_name["Bale-000011"]["normalized_phone"] == "989304073113"
-    assert by_name["Bale-000010"]["api_endpoint"] == "/automation/campaigns/{campaign_id}/run-dry-round"
-    assert by_name["Bale-000011"]["api_endpoint"] == "/automation/campaigns/{campaign_id}/run-dry-round"
-    assert by_name["Bale-000010"]["bale_contact_created"] is True
-    assert by_name["Bale-000011"]["bale_contact_created"] is True
-    assert by_name["Bale-000010"]["confirm_click_count"] == 0
-    assert by_name["Bale-000011"]["send_or_forward_action_occurred"] is False
+def _provenance_service(tmp: Path, monkeypatch: Any) -> CommercialQueueService:
+    contact_store = BaleContactStore(tmp / "contacts.json")
+    monkeypatch.setattr(commercial_service, "bale_contact_store", contact_store)
+    service = _service(tmp / "provenance.db")
+    service.contact_store = contact_store
+    account_id = "bale_09211690533"
+    contact_store.bulk_add_bale_contacts(account_id, [f"093040731{value:02d}" for value in range(3, 14)])
+    campaign = _campaign(service)
+    for phone in ["989304073112", "989304073113"]:
+        contact_store.update_contact_metadata(account_id, phone, {
+            "recipient_origin": "unauthorized_generated",
+            "authorization_status": "blocked",
+            "synthetic_test_data": True,
+            "live_execution_authorized": False,
+            "should_not_retry": True,
+            "contact_preparation_allowed": False,
+            "live_execution_blocked": True,
+            "block_reason": "missing_explicit_user_input",
+        })
+        recipient, job = service.repository.create_recipient_and_job(campaign, phone, phone, f"Trace-{phone[-3:]}", "run-dry-round")
+        service.repository.create_job_event({
+            "job_id": job["id"],
+            "campaign_id": campaign["id"],
+            "recipient_id": recipient["id"],
+            "event_type": "dry_run_probe",
+            "status": "completed",
+            "diagnostics": {
+                "contact_save_status": "saved",
+                "contact_created": True,
+                "confirm_click_count": 0,
+                "verified_forwarded_recipient_count": 0,
+            },
+        })
+    return service
 
 
-def test_no_user_manifest_means_incident_contacts_are_blocked() -> None:
-    service = CommercialQueueService()
-    trace = service.audit_bale_contact_provenance(["Bale-000010", "Bale-000011"])
-    for item in trace["items"]:
-        record = item["contact_store_record"]
-        assert record["recipient_origin"] == "unauthorized_generated"
-        assert record["authorization_status"] == "blocked"
-        assert record["synthetic_test_data"] is True
-        assert record["live_execution_authorized"] is False
-        assert record["should_not_retry"] is True
-        assert record["contact_preparation_allowed"] is False
-        assert record["live_execution_blocked"] is True
-        assert record["block_reason"] == "missing_explicit_user_input"
+def test_bale_000010_and_000011_creation_trace_is_found(monkeypatch: Any) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        service = _provenance_service(Path(tmp), monkeypatch)
+        trace = service.audit_bale_contact_provenance(["Bale-000010", "Bale-000011"])
+        by_name = {item["display_name"]: item for item in trace["items"]}
+        assert by_name["Bale-000010"]["normalized_phone"] == "989304073112"
+        assert by_name["Bale-000011"]["normalized_phone"] == "989304073113"
+        assert by_name["Bale-000010"]["api_endpoint"] == "/automation/campaigns/{campaign_id}/run-dry-round"
+        assert by_name["Bale-000011"]["api_endpoint"] == "/automation/campaigns/{campaign_id}/run-dry-round"
+        assert by_name["Bale-000010"]["bale_contact_created"] is True
+        assert by_name["Bale-000011"]["bale_contact_created"] is True
+        assert by_name["Bale-000010"]["confirm_click_count"] == 0
+        assert by_name["Bale-000011"]["send_or_forward_action_occurred"] is False
+
+
+def test_no_user_manifest_means_incident_contacts_are_blocked(monkeypatch: Any) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        service = _provenance_service(Path(tmp), monkeypatch)
+        trace = service.audit_bale_contact_provenance(["Bale-000010", "Bale-000011"])
+        for item in trace["items"]:
+            record = item["contact_store_record"]
+            assert record["recipient_origin"] == "unauthorized_generated"
+            assert record["authorization_status"] == "blocked"
+            assert record["synthetic_test_data"] is True
+            assert record["live_execution_authorized"] is False
+            assert record["should_not_retry"] is True
+            assert record["contact_preparation_allowed"] is False
+            assert record["live_execution_blocked"] is True
+            assert record["block_reason"] == "missing_explicit_user_input"
 
 
 def test_only_three_user_authorized_numbers_remain_authorized_in_workspace_db() -> None:
-    repository = CommercialQueueRepository()
-    with repository.connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT DISTINCT phone_normalized
-            FROM commercial_recipients
-            WHERE live_execution_authorized = 1
-              AND authorization_status = 'authorized'
-              AND COALESCE(synthetic_test_data, 0) = 0
-            """
-        ).fetchall()
-    assert {str(row["phone_normalized"]) for row in rows}.issubset(AUTHORIZED_PHONES)
+    with tempfile.TemporaryDirectory() as tmp:
+        service = _service(Path(tmp) / "authorized_scope.db")
+        campaign = _campaign(service)
+        for index, phone in enumerate(sorted(AUTHORIZED_PHONES), start=1):
+            recipient, _ = service.repository.create_recipient_and_job(
+                campaign,
+                phone,
+                phone,
+                f"Authorized-{index:03d}",
+                "test",
+            )
+            _authorize(service, recipient["id"])
+        with service.repository.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT phone_normalized
+                FROM commercial_recipients
+                WHERE live_execution_authorized = 1
+                  AND authorization_status = 'authorized'
+                  AND COALESCE(synthetic_test_data, 0) = 0
+                """
+            ).fetchall()
+    assert {str(row["phone_normalized"]) for row in rows} == AUTHORIZED_PHONES
 
 
 def test_dry_run_is_read_only_and_creates_only_audit_record() -> None:

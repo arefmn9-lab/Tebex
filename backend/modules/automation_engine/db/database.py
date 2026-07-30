@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 from pathlib import Path
 
 from .models import initialize_schema
 
 
-DATABASE_PATH = Path(__file__).resolve().parents[3] / "clinicos.db"
+DATABASE_PATH = Path(os.environ.get("CLINICOS_AUTOMATION_DATABASE_PATH") or Path(__file__).resolve().parents[3] / "clinicos.db")
 
 
 def get_connection() -> sqlite3.Connection:
@@ -14,4 +15,3 @@ def get_connection() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     initialize_schema(connection)
     return connection
-

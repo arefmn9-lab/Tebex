@@ -10,6 +10,8 @@ from modules.automation_engine.plugins.bale.plugin import _native_profile_dir
 
 from .account_health import AccountHealthService
 from .repository import utc_now
+from .bale_identity import BaleOwnIdentityClassifier
+from modules.automation_engine.plugins.bale.account_store import bale_account_store
 
 
 class BaleAuthenticationMaintenanceError(RuntimeError):
@@ -17,6 +19,43 @@ class BaleAuthenticationMaintenanceError(RuntimeError):
         super().__init__(message)
         self.error_code = error_code
         self.details = details or {}
+
+class FakeBaleAuthenticationMaintenanceService:
+    """Explicit no-browser implementation for isolated tests and UI smoke runs."""
+    def __init__(self) -> None:
+        self.sessions: dict[str, dict[str, Any]] = {}
+
+    def audit_profile_paths(self, account_id: str) -> dict[str, Any]:
+        return {"account_id": account_id, "all_paths_match_expected": True, "mock_mode": True, "secrets_exposed": False}
+
+    def open(self, account_id: str) -> dict[str, Any]:
+        session_id = f"fake_bale_auth_{uuid4().hex[:12]}"
+        payload = {"maintenance_session_id": session_id, "account_id": account_id, "runtime_session_id": "fake-runtime", "closed": False, "auth": {"auth_state": "verification_code_required", "authenticated": False}, "mock_mode": True}
+        self.sessions[session_id] = payload
+        return payload
+
+    def status(self, maintenance_session_id: str) -> dict[str, Any]:
+        return dict(self._require(maintenance_session_id))
+
+    def verify(self, maintenance_session_id: str) -> dict[str, Any]:
+        payload = self._require(maintenance_session_id)
+        payload["auth"] = {"auth_state": "authenticated", "authenticated": True, "chat_shell_visible": True, "contacts_ui_available": True}
+        return {**payload, "verified": True, "identity_check": {"status": "match", "verified_match": True, "mock_mode": True}}
+
+    def close(self, maintenance_session_id: str) -> dict[str, Any]:
+        payload = self.sessions.get(maintenance_session_id)
+        if not payload or payload.get("closed"):
+            return {"ok": True, "maintenance_session_id": maintenance_session_id, "already_closed": True, "closed": False, "mock_mode": True}
+        payload["closed"] = True
+        return {"ok": True, "maintenance_session_id": maintenance_session_id, "closed": True, "mock_mode": True}
+
+    def list_sessions(self) -> dict[str, Any]:
+        return {"items": [dict(item) for item in self.sessions.values() if not item.get("closed")], "mock_mode": True}
+
+    def _require(self, session_id: str) -> dict[str, Any]:
+        if session_id not in self.sessions:
+            raise BaleAuthenticationMaintenanceError("maintenance_session_not_found", "Fake maintenance session was not found")
+        return self.sessions[session_id]
 
 
 class BaleAuthenticationMaintenanceService:
@@ -27,11 +66,15 @@ class BaleAuthenticationMaintenanceService:
         browser_identity_resolver: Any,
         account_health: AccountHealthService,
         plugin: Any,
+        identity_classifier: Any | None = None,
+        account_store: Any | None = None,
     ) -> None:
         self.runtime_session_manager = runtime_session_manager
         self.browser_identity_resolver = browser_identity_resolver
         self.account_health = account_health
         self.plugin = plugin
+        self.identity_classifier = identity_classifier or BaleOwnIdentityClassifier()
+        self.account_store = account_store or bale_account_store
         self._sessions: dict[str, dict[str, Any]] = {}
         self._session_by_account: dict[str, str] = {}
 
@@ -156,16 +199,19 @@ class BaleAuthenticationMaintenanceService:
         self._dismiss_install_help_prompt(page)
         auth = self._classify(page)
         contacts = self._verify_contacts_available(page)
+        account = self.account_store.get_account(str(session_payload["account_id"])) or {}
+        registered = str(account.get("phone") or account.get("username_or_number") or "")
+        identity = self.identity_classifier.classify(page, registered)
         if contacts.get("ok") and page is not None and hasattr(page, "goto"):
             page.goto(self.plugin.web_url, wait_until="load")
-        verified = bool(auth.get("auth_state") == "authenticated" and auth.get("authenticated") and auth.get("chat_shell_visible") and contacts.get("contacts_ui_available"))
+        verified = bool(auth.get("auth_state") == "authenticated" and auth.get("authenticated") and auth.get("chat_shell_visible") and contacts.get("contacts_ui_available") and identity.get("verified_match"))
         if verified:
             self.account_health.record_success(str(session_payload["account_id"]))
         else:
-            self.account_health.record_failure(str(session_payload["account_id"]), {"error_code": auth.get("error_code") or "authentication_required", "error_domain": "authentication", "error_message": "Bale authentication verification failed"})
+            self.account_health.record_failure(str(session_payload["account_id"]), {"error_code": identity.get("error_code") or auth.get("error_code") or "authentication_required", "error_domain": "authentication", "error_message": "Bale authentication or account identity verification failed"})
         session_payload["auth"] = {**auth, "contacts_ui_available": bool(contacts.get("contacts_ui_available"))}
         session_payload["last_checked_at"] = utc_now()
-        return {**self._safe_session_payload(session_payload), "verified": verified, "contacts_check": contacts}
+        return {**self._safe_session_payload(session_payload), "verified": verified, "contacts_check": contacts, "identity_check": identity}
 
     def close(self, maintenance_session_id: str) -> dict[str, Any]:
         session_payload = self._sessions.get(maintenance_session_id)

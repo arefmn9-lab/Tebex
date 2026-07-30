@@ -2572,7 +2572,6 @@ class CommercialQueueRepository:
                 f"""
                 UPDATE commercial_delivery_jobs AS job SET
                     status = 'queued',
-                    account_id = NULL,
                     claimed_at = NULL,
                     updated_at = ?
                 WHERE job.campaign_id = ? AND job.status = 'assigned' AND job.started_at IS NULL
@@ -2714,8 +2713,8 @@ class CommercialQueueRepository:
             if active is not None:
                 connection.rollback()
                 return []
-            filters = ["job.status = 'queued'", queue_claim_eligibility_where()]
-            params: list[Any] = []
+            filters = ["job.status = 'queued'", "(job.account_id IS NULL OR job.account_id = ?)", queue_claim_eligibility_where()]
+            params: list[Any] = [account_id]
             if campaign_id:
                 filters.append("job.campaign_id = ?")
                 params.append(campaign_id)
@@ -3384,7 +3383,6 @@ class CommercialQueueRepository:
                     """
                     UPDATE commercial_delivery_jobs SET
                         status = 'queued',
-                        account_id = NULL,
                         claimed_at = NULL,
                         updated_at = ?
                     WHERE id = ?
@@ -3545,7 +3543,6 @@ class CommercialQueueRepository:
                             """
                             UPDATE commercial_delivery_jobs SET
                                 status = 'queued',
-                                account_id = NULL,
                                 claimed_at = NULL,
                                 updated_at = ?
                             WHERE id = ?

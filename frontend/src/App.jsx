@@ -4,28 +4,27 @@ import CommercialDashboard from "./pages/CommercialDashboard.jsx";
 import CommercialAccounts from "./pages/CommercialAccounts.jsx";
 import CommercialJobs from "./pages/CommercialJobs.jsx";
 import CommercialCampaigns from "./pages/CommercialCampaigns.jsx";
-import CommercialLogs from "./pages/CommercialLogs.jsx";
 import CommercialSettings from "./pages/CommercialSettings.jsx";
 import BaleBulkCampaigns from "./pages/BaleBulkCampaigns.jsx";
-import Diagnostics from "./pages/Diagnostics.jsx";
 import BaleWorkspace from "./pages/BaleWorkspace.jsx";
 import CampaignExecutionEntry from "./pages/CampaignExecutionEntry.jsx";
 import OperationsAndLogs from "./pages/OperationsAndLogs.jsx";
-import SimpleAccounts from "./pages/SimpleAccounts.jsx";
+import BaleAccounts from "./pages/BaleAccounts.jsx";
 import PlatformSelector from "./pages/PlatformSelector.jsx";
 import PlatformWorkspace from "./pages/PlatformWorkspace.jsx";
+import ActionErrorNotice from "./components/ActionErrorNotice.jsx";
 
 const pages = {
   dashboard: CommercialDashboard,
-  accounts: SimpleAccounts,
+  accounts: BaleAccounts,
   jobs: CommercialJobs,
   operations: OperationsAndLogs,
   campaigns: CommercialCampaigns,
   baleBulk: BaleBulkCampaigns,
-  logs: CommercialLogs,
-  reports: CommercialLogs,
+  logs: OperationsAndLogs,
+  reports: OperationsAndLogs,
+  diagnostics: OperationsAndLogs,
   settings: CommercialSettings,
-  diagnostics: Diagnostics,
   messaging: CampaignExecutionEntry,
   platforms: PlatformSelector
 };
@@ -88,6 +87,7 @@ export default function App() {
       ) : (
         <Page onNavigate={handleNavigate} />
       )}
+      <ActionErrorNotice />
     </MainLayout>
   );
 }

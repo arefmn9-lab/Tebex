@@ -6084,6 +6084,10 @@ class BalePlugin:
 
     def _click_enabled_add_contact_button(self, page: Any) -> dict[str, Any]:
         button_selectors = [
+            '.ReactModal__Overlay button[aria-label="افزودن"]',
+            '.ReactModal__Overlay button:has-text("افزودن")',
+            '.ReactModal__Overlay [role="button"][aria-label="افزودن"]',
+            '.ReactModal__Overlay [role="button"]:has-text("افزودن")',
             '.ReactModal__Overlay button:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',
             '.ReactModal__Overlay button:has-text("Add")',
             '.ReactModal__Overlay [role="button"]:has-text("Ø§ÙØ²ÙˆØ¯Ù†")',

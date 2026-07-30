@@ -4499,3 +4499,182 @@ textarea::placeholder {
     flex: 1 1 auto;
   }
 }
+.bale-accounts-page {
+  display: grid;
+  gap: 18px;
+  color: #172033;
+}
+
+.bale-accounts-header,
+.batch-panel,
+.account-list-panel {
+  background: #fff;
+  border: 1px solid #dfe5ef;
+  border-radius: 18px;
+  padding: 20px;
+}
+
+.bale-accounts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.bale-accounts-header h1 { margin: 3px 0 8px; }
+.bale-accounts-header p { margin: 0; color: #667085; }
+.eyebrow { color: #2657d6 !important; font-weight: 800; font-size: 12px; }
+.header-actions, .batch-actions, .row-actions, .wizard-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+.operational-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 14px;
+  background: #fff7df;
+  border: 1px solid #f0cf67;
+}
+
+.operational-settings .settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.operational-settings label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.82rem;
+}
+
+.operational-banner > * {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.account-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(100px, 1fr));
+  gap: 10px;
+}
+
+.account-summary-grid article {
+  background: #fff;
+  border: 1px solid #e3e8f0;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.account-summary-grid span { display: block; color: #667085; font-size: 12px; }
+.account-summary-grid strong { display: block; margin-top: 6px; font-size: 24px; }
+.onboarding-notice { display: flex; gap: 8px; align-items: center; padding: 11px 14px; background: #ecfdf3; border: 1px solid #a6e7bf; border-radius: 12px; }
+.batch-panel { display: grid; gap: 14px; }
+.batch-panel h2, .batch-panel p { margin: 0 0 5px; }
+.batch-actions select, .account-list-toolbar select, .account-list-toolbar input, .wizard-body input, .wizard-body select {
+  min-height: 40px;
+  border: 1px solid #cfd7e6;
+  border-radius: 10px;
+  padding: 0 11px;
+  background: #fff;
+}
+
+.batch-progress { display: flex; flex-wrap: wrap; gap: 9px; padding: 12px; background: #f6f8fc; border-radius: 12px; }
+.batch-progress span, .batch-progress b { padding: 5px 9px; background: white; border-radius: 8px; }
+.account-list-toolbar { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.account-list-toolbar label { display: flex; align-items: center; gap: 7px; flex: 1; }
+.account-list-toolbar input { width: 100%; }
+.dynamic-account-list { display: grid; gap: 8px; }
+.dynamic-account-row { border: 1px solid #e1e6ef; border-radius: 13px; overflow: hidden; }
+.account-centric-row .account-row-main { grid-template-columns: auto minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(150px, .9fr) auto; }
+.account-actions button { display: inline-flex; align-items: center; gap: 6px; }
+.otp-safety-note { color: #475467; background: #f8fafc; border: 1px solid #e4e7ec; border-radius: 9px; padding: 10px 12px; }
+.created-account-success dl, .account-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.created-account-success dl div, .account-facts div { background: #f8fafc; border-radius: 9px; padding: 10px; }
+.created-account-success dt, .account-facts dt { color: #667085; font-size: 12px; }
+.created-account-success dd, .account-facts dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.diagnostic-result { border-top: 1px solid #e4e7ec; padding-top: 12px; margin-top: 12px; }
+.diagnostic-result h3 small { display: block; color: #667085; font-weight: 500; }
+.account-row-main {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 14px minmax(170px, 1.4fr) minmax(150px, 1fr) minmax(160px, 1fr) 24px;
+  gap: 12px;
+  align-items: center;
+  text-align: right;
+  padding: 14px;
+  border: 0;
+  background: #fff;
+  cursor: pointer;
+}
+.account-row-main:hover { background: #f8faff; }
+.account-row-main span b, .account-row-main span small { display: block; }
+.account-row-main span small { color: #778195; margin-top: 3px; }
+.health-dot { width: 9px; height: 9px; border-radius: 50%; background: #98a2b3; }
+.health-healthy { background: #12a05c; }
+.health-blocked, .health-auth_required { background: #d92d20; }
+.account-row-details { padding: 15px; background: #f8faff; border-top: 1px solid #e1e6ef; }
+.account-row-details dl { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.account-row-details dl div { background: #fff; padding: 10px; border-radius: 9px; }
+.account-row-details dt { color: #667085; font-size: 12px; }
+.account-row-details dd { margin: 5px 0 0; font-weight: 700; overflow-wrap: anywhere; }
+.blocking-reasons { color: #9b3b10; display: flex; gap: 6px; align-items: center; }
+.technical-toggle { border: 0; background: transparent; color: #526079; display: flex; gap: 5px; align-items: center; cursor: pointer; margin: 7px 0; }
+.technical-toggle code { margin-inline-start: 8px; padding: 3px 6px; background: #e9edf5; border-radius: 5px; }
+.danger-link { color: #b42318; }
+.pagination { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 15px; }
+.pagination button, .row-actions button, .wizard-actions button, .wizard-body > button { min-height: 36px; border: 1px solid #ccd5e3; background: #fff; border-radius: 9px; padding: 0 12px; cursor: pointer; }
+.pagination button:disabled, button:disabled { opacity: .5; cursor: not-allowed; }
+.onboarding-modal-backdrop { position: fixed; inset: 0; z-index: 2000; background: rgb(15 23 42 / 58%); display: grid; place-items: center; padding: 20px; }
+.onboarding-modal { position: relative; width: min(760px, 100%); max-height: 90vh; overflow: auto; background: #fff; border-radius: 20px; padding: 24px; box-shadow: 0 24px 80px rgb(0 0 0 / 25%); }
+.onboarding-wizard { width: min(900px, 100%); }
+.modal-close { position: absolute; left: 16px; top: 16px; border: 0; background: #f0f3f8; border-radius: 9px; padding: 6px; cursor: pointer; }
+.wizard-stepper { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; margin: 20px 0; }
+.wizard-stepper span { display: grid; place-items: center; min-height: 54px; background: #f0f3f8; border-radius: 9px; color: #667085; font-weight: 800; }
+.wizard-stepper span.active { background: #2947b6; color: #fff; }
+.wizard-stepper span.done { background: #dff7e9; color: #137548; }
+.wizard-stepper small { font-size: 9px; font-weight: 600; }
+.wizard-body { display: grid; gap: 14px; }
+.wizard-body label { display: grid; gap: 6px; font-weight: 700; }
+.wizard-body code { overflow-wrap: anywhere; }
+.preflight-checks { display: grid; gap: 7px; }
+.preflight-checks article { padding: 10px; border-radius: 9px; }
+.preflight-pass { background: #ecfdf3; }
+.preflight-warning { background: #fffaeb; }
+.preflight-fail { background: #fef3f2; }
+.check-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 14px 0; }
+.check-grid span { padding: 9px; border-radius: 8px; }
+.check-pass { background: #ecfdf3; }
+.check-warn { background: #fffaeb; }
+
+@media (max-width: 1100px) {
+  .account-summary-grid { grid-template-columns: repeat(4, 1fr); }
+}
+
+@media (max-width: 720px) {
+  .bale-accounts-header, .account-list-toolbar { align-items: stretch; flex-direction: column; }
+  .account-summary-grid { grid-template-columns: repeat(2, 1fr); }
+  .account-row-main { grid-template-columns: 12px 1fr 24px; }
+  .account-row-main > span:nth-of-type(n+3) { display: none; }
+  .account-row-details dl { grid-template-columns: 1fr 1fr; }
+  .wizard-stepper { grid-template-columns: repeat(4, 1fr); }
+}
+.action-error-notice {
+  position: fixed;
+  inset: auto auto 24px 24px;
+  z-index: 1000;
+  width: min(480px, calc(100vw - 48px));
+  padding: 18px;
+  border: 1px solid #ef4444;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 16px 40px rgb(15 23 42 / 20%);
+  display: grid;
+  gap: 10px;
+}
+.action-error-notice .diagnostics-file-preview { max-height: 240px; overflow: auto; }
+.operations-export-actions { display: flex; gap: 8px; flex-wrap: wrap; }

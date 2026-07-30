@@ -14,7 +14,7 @@ from uuid import uuid4
 CANONICAL_CHROME_EXECUTABLE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 PROFILE_DIRECTORY = "Default"
 BACKEND_DIR = Path(__file__).resolve().parents[3]
-PROFILE_ROOT = BACKEND_DIR / "runtime" / "browser_profiles"
+PROFILE_ROOT = Path(os.environ.get("CLINICOS_BALE_PROFILE_ROOT") or BACKEND_DIR / "runtime" / "browser_profiles")
 LOCK_FILENAME = ".clinicos_profile_lease.json"
 LAST_CLOSE_FILENAME = ".clinicos_profile_last_close.json"
 ALLOW_CANONICAL_PROFILE_IN_TESTS_ENV = "CLINICOS_ALLOW_CANONICAL_PROFILE_IN_TESTS"

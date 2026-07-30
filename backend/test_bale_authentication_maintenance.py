@@ -125,6 +125,16 @@ class FakePlugin:
         return {"success": False}
 
 
+class FakeMatchingIdentityClassifier:
+    def classify(self, page: Any, registered_identifier: str) -> dict[str, Any]:
+        return {"status": "match", "verified_match": True, "blocking": False, "secrets_accessed": False}
+
+
+class FakeAccountStore:
+    def get_account(self, account_id: str) -> dict[str, Any]:
+        return {"account_id": account_id, "phone": "09211690533"}
+
+
 def _service(page: FakePage | None = None) -> tuple[CommercialQueueService, FakeAdapter, FakePlugin]:
     db_path = Path("runtime/test_bale_authentication_maintenance.db")
     if db_path.exists():
@@ -141,6 +151,8 @@ def _service(page: FakePage | None = None) -> tuple[CommercialQueueService, Fake
         browser_identity_resolver=service.browser_identity_resolver,
         account_health=service.account_health,
         plugin=plugin,
+        identity_classifier=FakeMatchingIdentityClassifier(),
+        account_store=FakeAccountStore(),
     )
     profile_path = Path(__file__).resolve().parent / PROFILE_PATH
     profile_path.mkdir(parents=True, exist_ok=True)
@@ -244,11 +256,18 @@ def test_maintenance_open_launches_no_worker_job_contact_source_or_forwarding() 
 def test_manual_credentials_are_never_accepted_and_status_exposes_no_secrets() -> None:
     service, _, _ = _service(FakePage("login_required"))
     previous = automation_routes.commercial_queue_service
+    previous_onboarding = automation_routes.bale_onboarding_service
+    class FakeOnboarding:
+        def acquire_profile_launch_lock(self, account_id): return {"owner_id": "fake"}
+        def record_authentication_open(self, account_id, result, purpose="login"): return {}
+        def release_profile_launch_lock(self, account_id, owner_id): return True
+    automation_routes.bale_onboarding_service = FakeOnboarding()
     automation_routes.commercial_queue_service = service
     try:
         response = TestClient(app).post("/automation/platforms/bale/authentication/open", json={"account_id": ACCOUNT_ID, "password": "secret", "otp": "123456"})
     finally:
         automation_routes.commercial_queue_service = previous
+        automation_routes.bale_onboarding_service = previous_onboarding
     body = response.json()
     assert response.status_code == 200
     assert "password" not in str(body)

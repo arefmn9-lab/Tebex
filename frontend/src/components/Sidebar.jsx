@@ -2,10 +2,8 @@ import {
   Activity,
   BookUser,
   BriefcaseBusiness,
-  FileSearch,
   LayoutDashboard,
   LogOut,
-  ScrollText,
   Users,
 } from "lucide-react";
 
@@ -14,15 +12,13 @@ const navItems = [
   { id: "campaigns", label: "کمپین‌ها", icon: BriefcaseBusiness },
   { id: "accounts", label: "اکانت‌ها", icon: Users },
   { id: "numberBank", label: "بانک شماره", icon: BookUser, disabled: true },
-  { id: "operations", label: "عملیات و لاگ‌ها", icon: Activity },
-  { id: "reports", label: "گزارش‌ها", icon: ScrollText },
-  { id: "diagnostics", label: "تشخیص فنی", icon: FileSearch },
+  { id: "operations", label: "مرکز عملیات", icon: Activity },
 ];
 
 export { navItems };
 
 export default function Sidebar({ activePage, onNavigate }) {
-  const normalizedActive = activePage === "jobs" || activePage === "logs" ? "operations" : activePage;
+  const normalizedActive = ["jobs", "logs", "reports", "diagnostics"].includes(activePage) ? "operations" : activePage;
 
   return (
     <aside className="sidebar" dir="rtl">

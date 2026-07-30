@@ -1,164 +1,119 @@
-import { RefreshCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Copy, Download, RefreshCw } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { listEvents } from "../api/events";
 import { listJobs } from "../api/jobs";
+import { listLogs } from "../api/logs";
 import { getSchedulerStatus } from "../api/scheduler";
+import { listDiagnosticRuns } from "../api/automation";
+import { listBrowserProviders } from "../api/platforms";
+import { request } from "../api/client";
 import {
-  ContentCard,
-  EmptyState,
-  FormField,
-  InlineError,
-  LoadingState,
-  PageHeader,
-  SecondaryButton,
-  StatusBadge,
-  TextInput,
-} from "../components/ui/DesignSystem.jsx";
+  createDiagnosticEvent, downloadDiagnostics, getClientDiagnosticEvents,
+  readableReport, subscribeDiagnostics,
+} from "../diagnostics";
+import { ContentCard, EmptyState, InlineError, LoadingState, PageHeader, SecondaryButton, StatusBadge } from "../components/ui/DesignSystem.jsx";
 
-function fmt(value) {
-  if (value === null || value === undefined || value === "") return "-";
-  return String(value);
-}
+const fmt = (value) => value === null || value === undefined || value === "" ? "-" : String(value);
+const tone = (value) => /fail|error|cancel/i.test(value || "") ? "danger" : /success|complete|running|queue/i.test(value || "") ? "success" : "neutral";
 
-function short(value, length = 16) {
-  const text = fmt(value);
-  return text.length > length ? `${text.slice(0, length)}...` : text;
-}
-
-function tone(status) {
-  const value = String(status || "").toLowerCase();
-  if (["succeeded", "success", "completed", "running", "queued"].includes(value)) return "success";
-  if (["failed", "error", "cancelled"].includes(value)) return "danger";
-  if (["paused", "skipped", "assigned"].includes(value)) return "warning";
-  return "neutral";
-}
-
-function label(status) {
-  const labels = {
-    queued: "در صف",
-    assigned: "اختصاص داده شده",
-    running: "در حال اجرا",
-    succeeded: "موفق",
-    completed: "کامل شده",
-    failed: "خطا",
-    skipped: "رد شده",
-    paused: "متوقف",
-    cancelled: "لغو شده",
-  };
-  return labels[status] || status || "نامشخص";
+function backendEvent(event) {
+  let diagnostics = {};
+  try { diagnostics = typeof event.diagnostics_json === "string" ? JSON.parse(event.diagnostics_json) : event.diagnostics_json || {}; } catch { diagnostics = {}; }
+  return createDiagnosticEvent({
+    timestamp: event.created_at, event_id: event.id, action: event.event_type,
+    module: diagnostics.module || "backend", account_id: event.account_id,
+    campaign_id: event.campaign_id, success: !/fail|error/i.test(event.status || "") && !event.error_code,
+    status: event.status, error_code: event.error_code, error_message: event.error_message || event.message,
+    endpoint: diagnostics.endpoint, duration_ms: diagnostics.duration_ms,
+    related_files: diagnostics.related_files || [], stack_trace: diagnostics.stack_trace,
+  });
 }
 
 export default function OperationsAndLogs() {
-  const [filters, setFilters] = useState({ campaign_id: "", account_id: "", recipient_id: "" });
-  const [jobs, setJobs] = useState([]);
-  const [events, setEvents] = useState([]);
-  const [scheduler, setScheduler] = useState(null);
+  const [data, setData] = useState({ jobs: [], events: [], logs: [], runs: [], providers: [], health: [], scheduler: null });
+  const [clientEvents, setClientEvents] = useState(getClientDiagnosticEvents);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState("");
+  const [copied, setCopied] = useState(false);
 
   async function load() {
-    setLoading(true);
-    setError("");
-    try {
-      const [jobData, eventData, schedulerData] = await Promise.all([
-        listJobs({ campaign_id: filters.campaign_id, account_id: filters.account_id, limit: 30, offset: 0 }),
-        listEvents({ campaign_id: filters.campaign_id, account_id: filters.account_id, limit: 40, offset: 0 }),
-        getSchedulerStatus().catch(() => null),
-      ]);
-      setJobs(jobData?.items || []);
-      setEvents(eventData?.items || []);
-      setScheduler(schedulerData);
-    } catch (err) {
-      setError(err.message || "دریافت عملیات و لاگ‌ها انجام نشد");
-    } finally {
-      setLoading(false);
-    }
+    setLoading(true); setError("");
+    const sources = await Promise.allSettled([
+      listJobs({ limit: 40, offset: 0 }), listEvents({ limit: 80, offset: 0 }), listLogs(),
+      listDiagnosticRuns(), listBrowserProviders(), request("/automation/accounts/health"), getSchedulerStatus(),
+    ]);
+    const failures = sources.filter((item) => item.status === "rejected");
+    setData({
+      jobs: sources[0].value?.items || [], events: sources[1].value?.items || [],
+      logs: Array.isArray(sources[2].value) ? sources[2].value : [],
+      runs: sources[3].value?.runs || [],
+      providers: Array.isArray(sources[4].value?.items) ? sources[4].value.items : Array.isArray(sources[4].value) ? sources[4].value : [],
+      health: Array.isArray(sources[5].value?.items) ? sources[5].value.items : Array.isArray(sources[5].value) ? sources[5].value : [],
+      scheduler: sources[6].value || null,
+    });
+    if (failures.length) setError(`${failures.length} diagnostic source(s) could not be loaded. Available sources are shown below.`);
+    setLoading(false);
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); return subscribeDiagnostics(() => setClientEvents(getClientDiagnosticEvents())); }, []);
+  const structured = useMemo(() => [...clientEvents, ...data.events.map(backendEvent)]
+    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp))), [clientEvents, data.events]);
+  const failures = structured.filter((event) => !event.success);
+  const context = { scheduler: data.scheduler, diagnostic_runs: data.runs.map((run) => run.name), browser_providers: data.providers };
+  const report = () => readableReport(structured, context);
+  async function copyReport() { await navigator.clipboard.writeText(report()); setCopied(true); window.setTimeout(() => setCopied(false), 1500); }
+  function downloadJson() { downloadDiagnostics("clinicos-diagnostics.json", JSON.stringify({ generated_at: new Date().toISOString(), context, events: structured }, null, 2), "application/json"); }
+  function downloadTxt() { downloadDiagnostics("clinicos-diagnostics.txt", report(), "text/plain"); }
 
   return (
     <section className="operations-logs-page" dir="rtl">
-      <PageHeader
-        title="عملیات و لاگ‌ها"
-        description="نمای یکپارچه فعالیت کمپین، اکانت، گیرنده، خطاها و زمان‌ها بدون تغییر در Backend."
-        actions={<SecondaryButton onClick={load} disabled={loading}><RefreshCw size={17} />تازه‌سازی</SecondaryButton>}
-      />
-
+      <PageHeader title="مرکز عملیات / Operations Center" description="نمای یکپارچه و فقط‌خواندنی سلامت سیستم، عملیات، خطاها، لاگ‌ها و رخدادهای تشخیصی موجود."
+        actions={<div className="operations-export-actions">
+          <SecondaryButton onClick={copyReport}><Copy size={16} />{copied ? "Copied" : "Copy Debug Report"}</SecondaryButton>
+          <SecondaryButton onClick={downloadJson}><Download size={16} />Download JSON</SecondaryButton>
+          <SecondaryButton onClick={downloadTxt}><Download size={16} />Download TXT</SecondaryButton>
+          <SecondaryButton onClick={load} disabled={loading}><RefreshCw size={16} />تازه‌سازی</SecondaryButton>
+        </div>} />
       {error ? <InlineError>{error}</InlineError> : null}
-
-      <ContentCard title="فیلترها" description="فقط برای نمایش UI استفاده می‌شود و لاگ Backend را تغییر نمی‌دهد.">
-        <div className="operations-filter-grid">
-          <FormField label="کمپین"><TextInput value={filters.campaign_id} onChange={(event) => setFilters({ ...filters, campaign_id: event.target.value })} /></FormField>
-          <FormField label="اکانت"><TextInput value={filters.account_id} onChange={(event) => setFilters({ ...filters, account_id: event.target.value })} /></FormField>
-          <FormField label="گیرنده"><TextInput value={filters.recipient_id} onChange={(event) => setFilters({ ...filters, recipient_id: event.target.value })} /></FormField>
-          <SecondaryButton onClick={load}>اعمال فیلتر</SecondaryButton>
-        </div>
-      </ContentCard>
+      {loading ? <LoadingState label="در حال جمع‌آوری اطلاعات عملیاتی" /> : null}
 
       <div className="operations-summary-grid">
-        <ContentCard title="وضعیت عملیات">
+        <ContentCard title="System health"><div className="status-stack">
+          <p><span>Scheduler</span><b>{fmt(data.scheduler?.scheduler_status)}</b></p>
+          <p><span>Available workers</span><b>{fmt(data.scheduler?.available_slots)}</b></p>
+          <p><span>Account health records</span><b>{data.health.length}</b></p>
+          <p><span>Browser providers</span><b>{data.providers.length}</b></p>
+        </div></ContentCard>
+        <ContentCard title="Operational summary"><div className="status-stack">
+          <p><span>Recent actions</span><b>{structured.length}</b></p>
+          <p><span>Errors</span><b>{failures.length}</b></p>
+          <p><span>Campaign operations</span><b>{data.jobs.length}</b></p>
+          <p><span>Backend logs</span><b>{data.logs.length}</b></p>
+        </div></ContentCard>
+      </div>
+
+      <ContentCard title="Recent actions, errors, account/campaign and worker events">
+        {structured.length ? <div className="operations-event-list">{structured.slice(0, 100).map((event) => (
+          <article key={event.event_id}>
+            <div><strong>{event.module} · {event.action}</strong><span>{event.error_message || event.endpoint || "Completed"}</span></div>
+            <StatusBadge tone={tone(event.status)}>{event.status}</StatusBadge>
+            <small>{event.account_id || "-"} · {event.campaign_id || "-"} · {event.timestamp}</small>
+            <button className="secondary-button" onClick={() => setExpanded(expanded === event.event_id ? "" : event.event_id)}>View Details</button>
+            {expanded === event.event_id ? <pre className="diagnostics-file-preview" dir="ltr">{JSON.stringify(event, null, 2)}</pre> : null}
+          </article>
+        ))}</div> : <EmptyState title="No operational events are available." />}
+      </ContentCard>
+
+      <div className="grid two">
+        <ContentCard title="Backend logs">{data.logs.length ? <pre className="diagnostics-file-preview" dir="ltr">{data.logs.slice(-80).map((log) => `${fmt(log.timestamp || log.created_at)} ${fmt(log.status)} ${fmt(log.message)}`).join("\n")}</pre> : <EmptyState title="No backend logs." />}</ContentCard>
+        <ContentCard title="Browser/profile events and diagnostic files">
           <div className="status-stack">
-            <p><span>زمان‌بند</span><b>{fmt(scheduler?.scheduler_status)}</b></p>
-            <p><span>اسلات آزاد</span><b>{fmt(scheduler?.available_slots)}</b></p>
-            <p><span>اکانت فعال</span><b>{fmt(scheduler?.active_account_count)}</b></p>
-          </div>
-        </ContentCard>
-        <ContentCard title="خلاصه">
-          <div className="status-stack">
-            <p><span>فعالیت کمپین</span><b>{jobs.length}</b></p>
-            <p><span>رویدادها</span><b>{events.length}</b></p>
-            <p><span>خطاها</span><b>{events.filter((event) => event.error_code || event.error_message || event.status === "failed").length}</b></p>
+            {data.providers.map((provider, index) => <p key={provider.id || index}><span>{fmt(provider.name || provider.id || provider.provider)}</span><b>{fmt(provider.status || provider.enabled)}</b></p>)}
+            {data.runs.slice(0, 20).map((run) => <p key={run.name}><span>{run.name}</span><b>{run.file_count} files</b></p>)}
           </div>
         </ContentCard>
       </div>
-
-      {loading ? <LoadingState label="در حال دریافت عملیات" /> : null}
-
-      {!loading ? (
-        <ContentCard title="فعالیت کمپین و گیرندگان">
-          {jobs.length ? (
-            <div className="workspace-table-wrap">
-              <table className="table bale-table">
-                <thead><tr><th>کمپین</th><th>گیرنده</th><th>اکانت</th><th>وضعیت</th><th>خطا</th><th>زمان</th></tr></thead>
-                <tbody>
-                  {jobs.map((job) => (
-                    <tr key={job.id}>
-                      <td>{short(job.campaign_id)}</td>
-                      <td>{fmt(job.phone_normalized || job.recipient_id)}</td>
-                      <td>{fmt(job.account_id)}</td>
-                      <td><StatusBadge tone={tone(job.status)}>{label(job.status)}</StatusBadge></td>
-                      <td>{fmt(job.last_error_code || job.last_error_message)}</td>
-                      <td>{fmt(job.started_at || job.scheduled_at || job.created_at)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : <EmptyState title="فعالیت کمپینی ثبت نشده است" />}
-        </ContentCard>
-      ) : null}
-
-      {!loading ? (
-        <ContentCard title="رویدادها و خطاها">
-          {events.length ? (
-            <div className="operations-event-list">
-              {events.map((event) => (
-                <article key={event.id}>
-                  <div>
-                    <strong>{fmt(event.event_type)}</strong>
-                    <span>{fmt(event.message || event.error_message)}</span>
-                  </div>
-                  <StatusBadge tone={tone(event.status)}>{label(event.status)}</StatusBadge>
-                  <small>{fmt(event.account_id)} · {fmt(event.recipient_id)} · {fmt(event.created_at)}</small>
-                </article>
-              ))}
-            </div>
-          ) : <EmptyState title="لاگی برای نمایش وجود ندارد" />}
-        </ContentCard>
-      ) : null}
     </section>
   );
 }

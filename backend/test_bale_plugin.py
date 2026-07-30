@@ -291,7 +291,11 @@ class MockPage:
             raise TimeoutError(f"Cannot click disabled selector: {selector}")
         self.clicked.append(selector)
         self.operations.append(("click", selector, None))
-        if ("button:has-text(\"Add\")" in selector or "button:has-text(\"افزودن\")" in selector) and self.auto_close_contact_modal:
+        if (
+            "button:has-text(\"Add\")" in selector
+            or "button:has-text(\"افزودن\")" in selector
+            or "aria-label=\"افزودن\"" in selector
+        ) and self.auto_close_contact_modal:
             self.close_contact_modal()
         if selector in selectors.SEARCH_RESULT_CANDIDATE_SELECTORS and selectors.MESSAGE_INPUT_SELECTORS[0] in self.visible_selectors:
             self.url = "https://web.bale.ai/chat?uid=mock"
@@ -1734,6 +1738,61 @@ def test_save_contact_by_phone_does_not_use_broad_page_level_add_text_for_submit
     assert result["status"] == "success"
     assert "text=افزودن" not in page.clicked
     assert selectors.ADD_CONTACT_SAVE_BUTTON_SELECTORS[0] in page.clicked
+
+
+def test_save_contact_by_phone_clicks_real_persian_add_button_once_after_name_fill() -> None:
+    submit_selector = '.ReactModal__Overlay button[aria-label="افزودن"]'
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            submit_selector,
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "success"
+    assert page.clicked.count(submit_selector) == 1
+    assert page.dom_clicked == []
+    assert page.operations[-3:] == [
+        ("fill", selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0], "9304073331"),
+        ("fill", selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0], "Bale-000001"),
+        ("click", submit_selector, None),
+    ]
+
+
+def test_save_contact_by_phone_does_not_use_unscoped_real_persian_add_text_for_submit() -> None:
+    submit_selector = '.ReactModal__Overlay button[aria-label="افزودن"]'
+    broad_selector = 'button:has-text("افزودن")'
+    page = MockPage(
+        {
+            selectors.CONTACTS_PAGE_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_ENTRYPOINT_SELECTORS[0],
+            selectors.ADD_CONTACT_MENU_ITEM_SELECTORS[0],
+            selectors.ADD_CONTACT_MODAL_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_MODE_SELECTORS[0],
+            selectors.ADD_CONTACT_NAME_INPUT_SELECTORS[0],
+            selectors.ADD_CONTACT_PHONE_INPUT_SELECTORS[0],
+            submit_selector,
+            broad_selector,
+        },
+        url="https://web.bale.ai/contacts?uid=123",
+    )
+    plugin = BalePlugin(browser_manager=MockBrowserManager(page))
+
+    result = plugin.save_contact_by_phone(page, normalized_phone="989304073331", contact_naming_value="Bale-000001")
+
+    assert result["status"] == "success"
+    assert submit_selector in page.clicked
+    assert broad_selector not in page.clicked
 
 
 def test_save_contact_by_phone_disabled_submit_returns_fast_failure() -> None:
