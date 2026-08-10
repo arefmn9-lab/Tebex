@@ -78,6 +78,9 @@ try {
       blocking_reasons: ["requested_accounts_exceed_runtime_capacity"],
       required_account_count: 9,
       eligible_account_count: 9,
+      effective_runtime_capacity: 1,
+      configured_runtime_concurrency: 1,
+      available_runtime_slots: 1,
       exact_concurrency: { max_concurrent_accounts: 1, browser_concurrency: 1, worker_concurrency: 1 },
     }),
     finalReviewCampaign: async () => blockedCalls.push("final-review"),
@@ -89,7 +92,7 @@ try {
   blockedMessage = error.message;
 }
 check("B validation failure makes zero downstream requests", blockedCalls.length === 0, blockedCalls);
-check("B validation blocker is explicit", blockedMessage.includes("9 account(s)") && blockedMessage.includes("runtime capacity is 1"), blockedMessage);
+check("B validation blocker is operator-readable", blockedMessage.includes("ظرفیت اجرای سیستم") && !blockedMessage.includes("runtime capacity is 1"), blockedMessage);
 
 const capacityCase = await runValidCase({
   validation: validValidation({ required_account_count: 2, exact_concurrency: { max_concurrent_accounts: 2, browser_concurrency: 2, worker_concurrency: 2 } }),
@@ -116,8 +119,11 @@ check("F scheduler claim is possible only after persisted running", JSON.stringi
 check("capacity blocker formatter is generic", campaignValidationFailureMessage({
   blocking_reasons: ["requested_accounts_exceed_runtime_capacity"],
   required_account_count: 9,
+  effective_runtime_capacity: 1,
+  configured_runtime_concurrency: 1,
+  available_runtime_slots: 1,
   exact_concurrency: { max_concurrent_accounts: 1 },
-}).includes("runtime capacity is 1"));
+}).includes("ظرفیت اجرای سیستم"));
 
 const failed = checks.filter((item) => !item.pass);
 console.log(JSON.stringify({ ok: failed.length === 0, checks }, null, 2));

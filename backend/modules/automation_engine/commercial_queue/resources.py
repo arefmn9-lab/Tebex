@@ -40,10 +40,13 @@ class ResourceCapacityProvider:
         self.cpu_percent = cpu_percent
         self.memory_percent = memory_percent
         self.available_memory_mb = available_memory_mb
-        browser_env = os.environ.get("CLINICOS_BROWSER_SLOT_CAPACITY")
-        worker_env = os.environ.get("CLINICOS_WORKER_SLOT_CAPACITY")
-        self.browser_slot_capacity = max(1, int(browser_env)) if browser_env else None
-        self.worker_slot_capacity = max(1, int(worker_env)) if worker_env else None
+        # Account, browser, and worker concurrency are one operator policy.
+        # Older deployments exposed environment overrides for the latter two;
+        # treating those values as hidden ceilings recreated the single-account
+        # defect.  Keep the attributes for read-only compatibility, but never
+        # use them to reduce the canonical runtime capacity.
+        self.browser_slot_capacity = None
+        self.worker_slot_capacity = None
 
     def snapshot(self) -> ResourceSnapshot:
         return ResourceSnapshot(
@@ -62,14 +65,18 @@ class ResourceCapacityProvider:
         unrestricted = str(policy.get("concurrency_mode") or "operator_defined") == "unrestricted"
         if unrestricted:
             max_workers = max(0, int(snap.queued_job_count) + int(snap.active_worker_count))
-            batch_size = max_workers
-            worker_capacity = max_workers
+            runtime_capacity = max_workers
         else:
-            max_workers = int(policy.get("operator_defined_max_concurrent_accounts") or policy.get("max_concurrent_accounts") or 0)
-            batch_size = min(max_workers, int(policy.get("browser_concurrency") or max_workers))
-            worker_capacity = min(max_workers, int(policy.get("worker_concurrency") or max_workers))
-        worker_slots = max(0, worker_capacity - int(snap.active_worker_count))
-        browser_slots = max(0, batch_size - int(snap.browser_starting_count))
+            runtime_capacity = max(
+                0,
+                int(
+                    policy.get("max_concurrent_accounts")
+                    if policy.get("max_concurrent_accounts") is not None
+                    else policy.get("operator_defined_max_concurrent_accounts") or 0
+                ),
+            )
+        worker_slots = max(0, runtime_capacity - int(snap.active_worker_count))
+        browser_slots = max(0, runtime_capacity - int(snap.active_browser_count) - int(snap.browser_starting_count))
         reasons: list[str] = []
         if scheduler_status in {"paused", "stopped"}:
             reasons.append(f"scheduler_{scheduler_status}")
@@ -93,10 +100,14 @@ class ResourceCapacityProvider:
 
     def configuration_inputs(self, configured_max: int, eligible_count: int, host_resource_capacity: int | None = None, *, mode: str = "operator_defined", browser_capacity: int | None = None, worker_capacity: int | None = None) -> dict[str, Any]:
         unrestricted = mode == "unrestricted"
-        browser = max(1, int(browser_capacity or self.browser_slot_capacity or configured_max or 1))
-        worker = max(1, int(worker_capacity or self.worker_slot_capacity or configured_max or 1))
-        host_capacity = None if unrestricted else max(1, int(host_resource_capacity or configured_max or 1))
-        effective = max(0, int(eligible_count)) if unrestricted else min(max(1, int(configured_max)), max(0, int(eligible_count)), browser, worker, host_capacity)
+        canonical = max(0, int(configured_max))
+        # The optional arguments are retained for callers that still submit the
+        # old shape, but account/browser/worker lanes are deliberately derived
+        # from the one canonical runtime setting.
+        browser = None if unrestricted else canonical
+        worker = None if unrestricted else canonical
+        host_capacity = None if unrestricted else canonical
+        effective = max(0, int(eligible_count)) if unrestricted else canonical
         return {
             "concurrency_mode": mode,
             "configured_max_concurrent_accounts": int(configured_max),

@@ -14,12 +14,14 @@ class EffectiveExecutionPolicy:
     source_channel_uid: str = ""
     source_channel_candidates: list[str] = field(default_factory=list)
     operation_order: list[str] = field(default_factory=lambda: ["save_contact", "forward_message"])
-    concurrency_mode: str = "unrestricted"
-    operator_defined_max_concurrent_accounts: int = 1
-    browser_concurrency: int = 1
-    worker_concurrency: int = 1
-    max_concurrent_accounts: int = 1
-    accounts_per_round: int = 1
+    concurrency_mode: str = "operator_defined"
+    # Runtime account capacity is supplied by global settings.  Zero here is
+    # an absence/disabled compatibility value, not an architectural ceiling.
+    operator_defined_max_concurrent_accounts: int = 0
+    browser_concurrency: int = 0
+    worker_concurrency: int = 0
+    max_concurrent_accounts: int = 0
+    accounts_per_round: int = 0
     deliveries_per_round: int = 10
     daily_limit_per_account: int = 50
     max_successful_sends_per_account: int = 50
@@ -163,12 +165,31 @@ class EffectivePolicyResolver:
         campaign = self.repository.get_campaign(campaign_id) if campaign_id else None
         account = self.repository.get_account_settings(account_id) if account_id else None
         global_policy = _normalize_scope(global_settings, GLOBAL_ALIASES)
+        # `max_concurrent_accounts` is the only active runtime ceiling.  The
+        # other three columns remain readable for old clients, but cannot
+        # silently narrow or widen execution capacity.
+        canonical_runtime = global_policy.get("max_concurrent_accounts")
+        if canonical_runtime is None:
+            canonical_runtime = global_policy.get("operator_defined_max_concurrent_accounts")
+        if canonical_runtime is not None:
+            canonical_runtime = max(0, int(canonical_runtime))
+            global_policy["max_concurrent_accounts"] = canonical_runtime
+            global_policy["operator_defined_max_concurrent_accounts"] = canonical_runtime
+            global_policy["browser_concurrency"] = canonical_runtime
+            global_policy["worker_concurrency"] = canonical_runtime
         global_policy["platform"] = platform or global_policy.get("platform") or "bale"
         campaign_overrides = _json_dict((campaign or {}).get("policy_overrides_json"))
         if (campaign or {}).get("source_channel_uid") is not None:
             campaign_overrides.setdefault("source_channel_uid", (campaign or {}).get("source_channel_uid"))
         campaign_overrides.setdefault("platform", (campaign or {}).get("platform") or platform)
         campaign_overrides = _normalize_scope(campaign_overrides, CAMPAIGN_ALIASES)
+        # Campaign demand is stored in the capacity reservation.  A historical
+        # campaign configuration must never become a second runtime-capacity
+        # source (especially its old default of one account).
+        campaign_overrides.pop("max_concurrent_accounts", None)
+        campaign_overrides.pop("operator_defined_max_concurrent_accounts", None)
+        campaign_overrides.pop("browser_concurrency", None)
+        campaign_overrides.pop("worker_concurrency", None)
         account_overrides = _normalize_scope(account, ACCOUNT_ALIASES)
 
         effective = EffectiveExecutionPolicy().__dict__.copy()
@@ -183,6 +204,15 @@ class EffectivePolicyResolver:
                     continue
                 effective[key] = value
                 source[key] = scope_name
+        runtime_value = max(0, int(effective.get("max_concurrent_accounts") or 0))
+        effective["max_concurrent_accounts"] = runtime_value
+        effective["operator_defined_max_concurrent_accounts"] = runtime_value
+        effective["browser_concurrency"] = runtime_value
+        effective["worker_concurrency"] = runtime_value
+        source["max_concurrent_accounts"] = source.get("max_concurrent_accounts") or "global"
+        source["operator_defined_max_concurrent_accounts"] = "derived_from_max_concurrent_accounts"
+        source["browser_concurrency"] = "derived_from_max_concurrent_accounts"
+        source["worker_concurrency"] = "derived_from_max_concurrent_accounts"
         validation = operation_registry.validate(effective.get("operation_order"))
         errors = list(validation.validation_errors)
         effective["operation_order"] = validation.validated_operation_order

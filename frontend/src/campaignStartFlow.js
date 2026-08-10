@@ -2,14 +2,15 @@ export function campaignValidationFailureMessage(validation = {}) {
   const blockers = Array.isArray(validation?.blocking_reasons) ? validation.blocking_reasons : [];
   if (blockers.includes("requested_accounts_exceed_runtime_capacity")) {
     const requested = Number(validation?.required_account_count || validation?.requested_account_count || 0);
-    const ceilings = Object.values(validation?.exact_concurrency || {})
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0);
-    const runtimeCapacity = ceilings.length ? Math.min(...ceilings) : null;
-    if (requested > 0 && runtimeCapacity != null) {
-      return `Campaign cannot start: ${requested} account(s) requested, but runtime capacity is ${runtimeCapacity}. Reduce the campaign capacity or increase runtime concurrency.`;
+    const runtimeCapacity = Number(validation?.effective_runtime_capacity ?? validation?.configured_runtime_concurrency);
+    const available = Number(validation?.available_runtime_slots ?? runtimeCapacity);
+    if (requested > 0 && Number.isFinite(runtimeCapacity)) {
+      return `برای اجرای همزمان ${requested.toLocaleString("fa-IR")} حساب، ظرفیت اجرای سیستم روی ${runtimeCapacity.toLocaleString("fa-IR")} تنظیم شده است. ظرفیت در دسترس اکنون ${available.toLocaleString("fa-IR")} است؛ ظرفیت را در تنظیمات افزایش دهید یا تعداد حساب‌های کمپین را کاهش دهید.`;
     }
-    return "Campaign cannot start because the requested account count exceeds runtime capacity.";
+    return "ظرفیت اجرای همزمان برای تعداد حساب‌های درخواستی کافی نیست.";
+  }
+  if (blockers.includes("runtime_slots_unavailable")) {
+    return "اسلات‌های اجرای سیستم در حال حاضر توسط کمپین دیگری استفاده می‌شوند. بعداً دوباره تلاش کنید.";
   }
   return blockers.join(", ") || "campaign_validation_failed";
 }

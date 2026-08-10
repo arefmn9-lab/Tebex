@@ -6,6 +6,7 @@ import { ErrorState, LoadingState, PageHeader } from "../components/commercial/C
 // These are the few sending limits an operator can meaningfully manage. Account
 // allocation belongs to an individual campaign, not to this global screen.
 const operatorFields = [
+  ["max_concurrent_accounts", "حداکثر همزمانی اجرای حساب‌ها", "number"],
   ["deliveries_per_account_round", "ارسال در هر نوبت", "number"],
   ["delay_between_deliveries_seconds", "فاصله بین ارسال‌ها (ثانیه)", "number"],
   ["round_cooldown_seconds", "فاصله بین نوبت‌ها (ثانیه)", "number"],
@@ -16,9 +17,6 @@ const operatorFields = [
 // choices as part of the normal operator workflow.
 const advancedFields = [
   ["concurrency_mode", "حالت همزمانی", "select"],
-  ["operator_defined_max_concurrent_accounts", "حداکثر اکانت همزمان", "number"],
-  ["browser_concurrency", "همزمانی مرورگر", "number"],
-  ["worker_concurrency", "همزمانی Worker", "number"],
   ["default_source_channel_uid", "کانال منبع پیش‌فرض", "text"],
   ["account_assignment_strategy", "راهبرد تخصیص", "select"],
   ["max_job_duration_seconds", "حداکثر زمان کار", "number"],
@@ -55,6 +53,14 @@ function payloadFromForm(form) {
   return payload;
 }
 
+function normalizeSettings(payload) {
+  if (!payload || payload.max_concurrent_accounts != null) return payload;
+  return {
+    ...payload,
+    max_concurrent_accounts: payload.operator_defined_max_concurrent_accounts ?? 0,
+  };
+}
+
 function SettingsField({ field, form, setForm }) {
   const [key, label, type] = field;
   if (type === "checkbox") {
@@ -78,7 +84,7 @@ export default function CommercialSettings() {
     setLoading(true);
     setError(null);
     try {
-      setForm(await getGlobalSettings());
+      setForm(normalizeSettings(await getGlobalSettings()));
     } catch (err) {
       setError(err);
     } finally {
@@ -113,6 +119,7 @@ export default function CommercialSettings() {
       {loading || !form ? <LoadingState /> : (
         <section className="panel">
           <div className="toast">سامانه ارسال به‌صورت امن مدیریت می‌شود.</div>
+          <p className="page-copy">ظرفیت مرورگر و Worker به‌صورت خودکار از همین مقدار مشتق می‌شود.</p>
           <div className="settings-grid">
             {operatorFields.map((field) => <SettingsField key={field[0]} field={field} form={form} setForm={setForm} />)}
           </div>

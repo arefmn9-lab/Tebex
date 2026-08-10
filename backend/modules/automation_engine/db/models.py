@@ -37,9 +37,9 @@ CREATE TABLE IF NOT EXISTS commercial_global_settings (
     id TEXT PRIMARY KEY,
     max_concurrent_accounts INTEGER NOT NULL,
     concurrency_mode TEXT NOT NULL DEFAULT 'operator_defined',
-    operator_defined_max_concurrent_accounts INTEGER NOT NULL DEFAULT 1,
-    browser_concurrency INTEGER NOT NULL DEFAULT 1,
-    worker_concurrency INTEGER NOT NULL DEFAULT 1,
+    operator_defined_max_concurrent_accounts INTEGER NOT NULL DEFAULT 0,
+    browser_concurrency INTEGER NOT NULL DEFAULT 0,
+    worker_concurrency INTEGER NOT NULL DEFAULT 0,
     deliveries_per_account_round INTEGER NOT NULL,
     delay_between_deliveries_seconds INTEGER NOT NULL,
     round_cooldown_seconds INTEGER NOT NULL,
@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS commercial_campaign_capacity_reservations (
     remaining_capacity INTEGER NOT NULL CHECK(remaining_capacity >= 0),
     requested_account_count INTEGER NOT NULL DEFAULT 0 CHECK(requested_account_count >= 0),
     allocated_account_count INTEGER NOT NULL DEFAULT 0 CHECK(allocated_account_count >= 0),
+    execution_reserved_count INTEGER NOT NULL DEFAULT 0 CHECK(execution_reserved_count >= 0),
     reservation_status TEXT NOT NULL DEFAULT 'active',
     released_at TEXT,
     release_reason TEXT,
@@ -882,9 +883,9 @@ SCHEMA_ALTERATIONS = {
     },
     "commercial_global_settings": {
         "concurrency_mode": "TEXT NOT NULL DEFAULT 'operator_defined'",
-        "operator_defined_max_concurrent_accounts": "INTEGER NOT NULL DEFAULT 1",
-        "browser_concurrency": "INTEGER NOT NULL DEFAULT 1",
-        "worker_concurrency": "INTEGER NOT NULL DEFAULT 1",
+        "operator_defined_max_concurrent_accounts": "INTEGER NOT NULL DEFAULT 0",
+        "browser_concurrency": "INTEGER NOT NULL DEFAULT 0",
+        "worker_concurrency": "INTEGER NOT NULL DEFAULT 0",
         "send_method": "TEXT NOT NULL DEFAULT 'forward_latest_channel_message'",
         "operation_order_json": "TEXT",
         "link_open_delay_seconds": "INTEGER NOT NULL DEFAULT 0",
@@ -897,6 +898,9 @@ SCHEMA_ALTERATIONS = {
         "campaign_overrides_enabled": "INTEGER NOT NULL DEFAULT 1",
         "automatic_retry_enabled": "INTEGER NOT NULL DEFAULT 0",
         "live_campaign_execution_enabled": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "commercial_campaign_capacity_reservations": {
+        "execution_reserved_count": "INTEGER NOT NULL DEFAULT 0",
     },
     "commercial_campaigns": {
         "policy_overrides_json": "TEXT",
@@ -1045,6 +1049,24 @@ SCHEMA_ALTERATIONS = {
 }
 
 
+def apply_schema_alterations(connection: sqlite3.Connection, *, skip_missing_tables: bool = False) -> None:
+    """Apply additive columns for both fresh and already-existing databases."""
+    for table_name, columns in SCHEMA_ALTERATIONS.items():
+        table_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        if skip_missing_tables and table_exists is None:
+            continue
+        existing = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        for column_name, definition in columns.items():
+            if column_name not in existing:
+                connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_TASKS_TABLE)
     connection.execute(CREATE_TASK_LOGS_TABLE)
@@ -1078,14 +1100,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_EXECUTION_AUTHORIZATIONS_TABLE)
     connection.execute(CREATE_EXECUTION_BATCHES_TABLE)
     connection.execute(CREATE_EXECUTION_ATTEMPTS_TABLE)
-    for table_name, columns in SCHEMA_ALTERATIONS.items():
-        existing = {
-            str(row[1])
-            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
-        for column_name, definition in columns.items():
-            if column_name not in existing:
-                connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+    apply_schema_alterations(connection)
     # Legacy reservation values represented an operator-entered integer. Preserve that
     # integer as an account reservation; no unit conversion or message-volume scaling.
     connection.execute(

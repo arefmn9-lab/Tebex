@@ -192,6 +192,14 @@ function capacityActionError(error) {
   const capacity = detail?.details || detail?.context || detail?.validation || detail;
   const requested = Number(capacity?.requested_account_count ?? capacity?.required_account_count);
   const eligible = Number(capacity?.eligible_account_count);
+  if (code === "requested_accounts_exceed_runtime_capacity" || code === "runtime_slots_unavailable") {
+    const runtime = Number(capacity?.effective_runtime_capacity ?? capacity?.configured_runtime_concurrency ?? 0);
+    const available = Number(capacity?.available_runtime_slots ?? runtime);
+    if (Number.isFinite(requested) && requested > 0 && Number.isFinite(runtime)) {
+      return `برای اجرای همزمان ${requested.toLocaleString("fa-IR")} حساب، ظرفیت اجرای سیستم روی ${runtime.toLocaleString("fa-IR")} تنظیم شده است. ظرفیت در دسترس اکنون ${available.toLocaleString("fa-IR")} است؛ ظرفیت را در تنظیمات افزایش دهید یا تعداد حساب‌های کمپین را کاهش دهید.`;
+    }
+    return "ظرفیت اجرای همزمان این کمپین در حال حاضر کافی نیست.";
+  }
   if (["requested_accounts_exceed_eligible", "campaign_capacity_pool_insufficient"].includes(code)) {
     if (Number.isInteger(requested) && requested > 0 && Number.isInteger(eligible) && eligible >= 0) {
       return `برای اجرای این کمپین ${requested.toLocaleString("fa-IR")} اکانت لازم است؛ در حال حاضر ${eligible.toLocaleString("fa-IR")} اکانت آماده است.`;
@@ -211,10 +219,7 @@ function capacityActionError(error) {
 }
 
 function runtimeCapacityLabel(capacity = {}) {
-  const ceilings = Object.values(capacity.exact_concurrency || {})
-    .map((value) => Number(value))
-    .filter((value) => Number.isFinite(value) && value > 0);
-  return ceilings.length ? Math.min(...ceilings) : 0;
+  return Number(capacity.effective_runtime_capacity ?? capacity.configured_runtime_concurrency ?? 0);
 }
 
 function importCountMessage(counts = {}) {
@@ -817,6 +822,8 @@ export default function CommercialCampaigns() {
                   <p><span>اکانت‌های آماده</span><b>{capacityState.data?.eligible_account_count ?? "—"}</b></p>
                   <p><span>تعداد درخواستی</span><b>{capacityState.data?.requested_account_count ?? draft.capacityReservation ?? 0}</b></p>
                   <p><span>تخصیص فعلی</span><b>{capacityState.data?.allocated_account_count ?? draft.capacityReservation ?? 0}</b></p>
+                  <p><span>ظرفیت اجرای سیستم</span><b>{capacityState.data?.effective_runtime_capacity ?? "—"}</b></p>
+                  <p><span>اسلات در دسترس</span><b>{capacityState.data?.available_runtime_slots ?? "—"}</b></p>
                 </div>
                 <FormField label="تعداد اکانت مورد نیاز این کمپین">
                   <NumberInput
@@ -841,7 +848,7 @@ export default function CommercialCampaigns() {
                 {capacityState.data?.ready_for_exact_account_execution ? <div className="toast">اکانت‌های درخواستی برای اجرای این کمپین آماده‌اند.</div> : null}
                 {capacityState.data?.exact_blockers?.includes("requested_accounts_exceed_runtime_capacity") ? (
                   <InlineError>
-                    Campaign capacity exceeds the current runtime concurrency. Requested {capacityState.data.required_account_count} account(s), runtime capacity {runtimeCapacityLabel(capacityState.data)}. Reduce the requested capacity or increase runtime concurrency before Execute.
+                    برای اجرای همزمان {Number(capacityState.data.required_account_count || 0).toLocaleString("fa-IR")} حساب، ظرفیت اجرای سیستم روی {runtimeCapacityLabel(capacityState.data).toLocaleString("fa-IR")} تنظیم شده است. ظرفیت را در تنظیمات افزایش دهید یا تعداد حساب‌های کمپین را کاهش دهید.
                   </InlineError>
                 ) : null}
               </div>

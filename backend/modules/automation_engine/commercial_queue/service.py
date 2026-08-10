@@ -182,7 +182,7 @@ def calculate_round_account_limit(
     host_resource_capacity: int,
 ) -> int:
     return min(
-        max(1, int(requested_accounts_per_round)),
+        max(0, int(requested_accounts_per_round)),
         max(0, int(configured_max_concurrent_accounts)),
         max(0, int(eligible_account_count)),
         max(0, int(browser_slot_capacity)),
@@ -230,11 +230,15 @@ def deepest_execution_evidence(result: dict[str, Any]) -> dict[str, Any]:
 
 
 DEFAULT_GLOBAL_SETTINGS: dict[str, Any] = {
-    "concurrency_mode": os.environ.get("CLINICOS_CONCURRENCY_MODE", "unrestricted"),
+    "concurrency_mode": os.environ.get("CLINICOS_CONCURRENCY_MODE", "operator_defined"),
+    # Compatibility fallback only.  Once persisted, this remains the single
+    # operator-controlled max field; browser/worker lanes are derived below.
     "operator_defined_max_concurrent_accounts": max(1, int(os.environ.get("CLINICOS_MAX_CONCURRENT_ACCOUNTS", "1"))),
     "max_concurrent_accounts": max(1, int(os.environ.get("CLINICOS_MAX_CONCURRENT_ACCOUNTS", "1"))),  # compatibility mirror
-    "browser_concurrency": max(1, int(os.environ.get("CLINICOS_BROWSER_SLOT_CAPACITY", "1"))),
-    "worker_concurrency": max(1, int(os.environ.get("CLINICOS_WORKER_SLOT_CAPACITY", "1"))),
+    # Compatibility mirrors.  Active execution derives both lanes from
+    # max_concurrent_accounts; these values are never a hidden ceiling.
+    "browser_concurrency": max(0, int(os.environ.get("CLINICOS_MAX_CONCURRENT_ACCOUNTS", "1"))),
+    "worker_concurrency": max(0, int(os.environ.get("CLINICOS_MAX_CONCURRENT_ACCOUNTS", "1"))),
     "deliveries_per_account_round": 10,
     "delay_between_deliveries_seconds": 60,
     "round_cooldown_seconds": 900,
@@ -289,7 +293,9 @@ CONFIGURATION_FIELDS: dict[str, dict[str, Any]] = {
     "accounts.allowed_account_ids": {"default": [], "critical": False},
     "accounts.account_selection_mode": {"default": "auto", "critical": False},
     "accounts.account_selection_strategy": {"default": "priority_round_robin", "critical": False},
-    "accounts.max_concurrent_accounts": {"default": 1, "critical": False},
+    # Campaign demand is stored in the capacity reservation.  This field is a
+    # derived compatibility value, not a campaign-level runtime override.
+    "accounts.max_concurrent_accounts": {"default": 0, "critical": False},
     "delivery.daily_delivery_limit": {"default": 50, "critical": False},
     "delivery.deliveries_per_round": {"default": 1, "critical": False},
     "delivery.max_jobs_per_execution": {"default": 1, "critical": True},
@@ -519,28 +525,148 @@ class CommercialQueueService:
         if existing is None:
             # Reads never create settings. Defaults are a display-only absence
             # representation until an operator explicitly saves settings.
-            return {**_bool_fields(DEFAULT_GLOBAL_SETTINGS), "persisted": False}
-        return _bool_fields(existing)
+            defaults = {**_bool_fields(DEFAULT_GLOBAL_SETTINGS), "persisted": False}
+            canonical = int(defaults.get("max_concurrent_accounts") or 0)
+            defaults["effective_browser_concurrency"] = canonical
+            defaults["effective_worker_concurrency"] = canonical
+            defaults["legacy_concurrency_mismatches"] = {}
+            return defaults
+        result = _bool_fields(existing)
+        canonical = result.get("max_concurrent_accounts")
+        if canonical is None:
+            canonical = result.get("operator_defined_max_concurrent_accounts")
+        canonical = max(0, int(canonical or 0))
+        result["max_concurrent_accounts"] = canonical
+        result["operator_defined_max_concurrent_accounts"] = canonical
+        # These fields are returned for old clients and diagnostics only.  The
+        # effective lanes are explicit so a stale legacy value cannot be
+        # mistaken for an active resource ceiling.
+        result["effective_browser_concurrency"] = canonical
+        result["effective_worker_concurrency"] = canonical
+        legacy_mismatches = {
+            field: int(result[field])
+            for field in ("browser_concurrency", "worker_concurrency")
+            if result.get(field) is not None and int(result[field]) != canonical
+        }
+        result["legacy_concurrency_mismatches"] = legacy_mismatches
+        return result
 
     def update_global_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.get_global_settings()
         merged = {**DEFAULT_GLOBAL_SETTINGS, **current, **{key: value for key, value in payload.items() if value is not None}}
-        if payload.get("max_concurrent_accounts") is not None and payload.get("operator_defined_max_concurrent_accounts") is None:
+        # max_concurrent_accounts is the sole active operator setting.  The
+        # historical operator_defined field remains a lossless input alias.
+        if payload.get("max_concurrent_accounts") is not None:
+            canonical_runtime = int(payload["max_concurrent_accounts"])
             merged["concurrency_mode"] = "operator_defined"
-            merged["operator_defined_max_concurrent_accounts"] = int(payload["max_concurrent_accounts"])
-            merged["browser_concurrency"] = int(payload["max_concurrent_accounts"])
-            merged["worker_concurrency"] = int(payload["max_concurrent_accounts"])
+        elif payload.get("operator_defined_max_concurrent_accounts") is not None:
+            canonical_runtime = int(payload["operator_defined_max_concurrent_accounts"])
+            merged["concurrency_mode"] = str(payload.get("concurrency_mode") or "operator_defined")
+        elif payload.get("browser_concurrency") is not None and payload.get("worker_concurrency") is not None and int(payload["browser_concurrency"]) == int(payload["worker_concurrency"]):
+            canonical_runtime = int(payload["browser_concurrency"])
+        else:
+            canonical_runtime = int(current.get("max_concurrent_accounts") or DEFAULT_GLOBAL_SETTINGS["max_concurrent_accounts"])
         mode = str(merged.get("concurrency_mode") or "operator_defined")
         if mode not in {"operator_defined", "unrestricted"}:
             raise CampaignLifecycleError("invalid_concurrency_mode", "Concurrency mode must be operator_defined or unrestricted")
-        for field in ("operator_defined_max_concurrent_accounts", "browser_concurrency", "worker_concurrency"):
-            if int(merged.get(field) or 0) < 0:
-                raise CampaignLifecycleError("invalid_concurrency", f"{field} must be a non-negative integer")
-        # Preserve the historical column for older consumers without changing the
-        # exact operator-entered value.
-        merged["max_concurrent_accounts"] = int(merged["operator_defined_max_concurrent_accounts"])
+        if canonical_runtime < 0:
+            raise CampaignLifecycleError("invalid_concurrency", "max_concurrent_accounts must be a non-negative integer")
+        merged["max_concurrent_accounts"] = canonical_runtime
+        merged["operator_defined_max_concurrent_accounts"] = canonical_runtime
+        # Do not turn legacy browser/worker values into active controls.  Keep
+        # explicitly supplied values for compatibility/audit, while exposing
+        # the derived effective lanes in the response.
+        if payload.get("max_concurrent_accounts") is not None:
+            merged["browser_concurrency"] = canonical_runtime
+            merged["worker_concurrency"] = canonical_runtime
+        else:
+            merged["browser_concurrency"] = int(payload.get("browser_concurrency", merged.get("browser_concurrency") or canonical_runtime))
+            merged["worker_concurrency"] = int(payload.get("worker_concurrency", merged.get("worker_concurrency") or canonical_runtime))
         updated = _bool_fields(self.repository.upsert_global_settings(merged))
-        return {**updated, "mutation_audit": _operator_audit("update_global_settings", current, updated)}
+        updated = self.get_global_settings()
+        # Capacity projections are cheap read models, but a runtime setting
+        # change is a hard revision boundary.  Do not serve a previous lane
+        # calculation from process memory.
+        self._readiness_cache.clear()
+        return {
+            **updated,
+            "mutation_audit": _operator_audit("update_global_settings", current, updated),
+            "runtime_capacity_source": "max_concurrent_accounts",
+            "effective_browser_concurrency": canonical_runtime,
+            "effective_worker_concurrency": canonical_runtime,
+        }
+
+    def _canonical_runtime_concurrency(self) -> tuple[str, int | None]:
+        settings = self.get_global_settings()
+        mode = str(settings.get("concurrency_mode") or "operator_defined")
+        if mode == "unrestricted":
+            return mode, None
+        return mode, max(0, int(settings.get("max_concurrent_accounts") or 0))
+
+    def _runtime_capacity_projection(
+        self,
+        *,
+        eligible_count: int,
+        campaign_id: str | None = None,
+        requested_account_count: int = 0,
+    ) -> dict[str, Any]:
+        mode, configured = self._canonical_runtime_concurrency()
+        effective = max(0, int(eligible_count)) if configured is None else configured
+        active_global = self.repository.active_runtime_slots()
+        reserved_other = self.repository.reserved_runtime_slots(exclude_campaign_id=campaign_id)
+        available = max(0, effective - active_global - reserved_other)
+        lanes = {
+            "max_concurrent_accounts": effective,
+            "browser_concurrency": effective,
+            "worker_concurrency": effective,
+        }
+        shortfalls = {}
+        if requested_account_count and configured is not None and effective < requested_account_count:
+            shortfalls = {field: value for field, value in lanes.items() if value < requested_account_count}
+        return {
+            "concurrency_mode": mode,
+            "configured_runtime_concurrency": configured,
+            "effective_runtime_capacity": effective,
+            "effective_concurrency": effective,
+            "exact_concurrency": lanes,
+            "concurrency_floor_shortfalls": shortfalls,
+            "active_runtime_slots": active_global,
+            "reserved_runtime_slots": reserved_other,
+            "available_runtime_slots": available,
+            "requested_account_count": int(requested_account_count),
+            "replacement_deficit": 0,
+            "runtime_capacity_source": "max_concurrent_accounts" if configured is not None else "eligible_account_pool",
+        }
+
+    def _capacity_account_rows(self, campaign_id: str | None = None) -> list[dict[str, Any]]:
+        readiness_provider = self.account_readiness_matrix
+        provider_is_injected = getattr(readiness_provider, "__self__", None) is None
+        # Isolated callers inject a readiness matrix explicitly.  Do not let
+        # the process-global onboarding service leak its production registry
+        # into a temporary repository used by tests or controlled adapters.
+        rows = list(readiness_provider()) if (not self._uses_operational_auth_source and provider_is_injected) else (
+            list(readiness_provider()) if self._uses_operational_auth_source else []
+        )
+        # Dependency-injected services use their commercial account settings as
+        # the isolated readiness fixture.  Production services use the
+        # persisted onboarding projection above and never launch a browser here.
+        if not rows and not self._uses_operational_auth_source:
+            for account in self.repository.list_all_account_settings():
+                ready, reason, effective = self._worker_readiness_for_account(account)
+                rows.append({
+                    **account,
+                    "account_id": str(account["account_id"]),
+                    "worker_eligible": ready,
+                    "eligibility_reasons": [] if ready else [reason],
+                    "blockers": [] if ready else [reason],
+                    "enabled": bool(effective.get("enabled")),
+                    "commercial_enabled": bool(effective.get("enabled")),
+                    "worker_status": effective.get("worker_status"),
+                    "worker_eligibility_predicates": {
+                        "authentication_available": reason != "auth_unavailable",
+                    },
+                })
+        return rows
 
     def list_account_settings(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         limit, offset = _pagination(limit, offset)
@@ -606,7 +732,9 @@ class CommercialQueueService:
             "send_method": delivery.get("send_method"),
             "source_channel_uid": source.get("source_channel_uid"),
             "operation_order": delivery.get("operation_order"),
-            "max_concurrent_accounts": accounts.get("max_concurrent_accounts"),
+            # Runtime concurrency is global and dynamic.  A campaign snapshot
+            # may describe demand/selection, but it cannot freeze a historical
+            # account/browser/worker ceiling.
             "deliveries_per_round": delivery.get("deliveries_per_round"),
             "daily_limit_per_account": delivery.get("daily_delivery_limit"),
             "delay_between_deliveries_seconds": delivery.get("delay_between_deliveries_seconds"),
@@ -691,7 +819,7 @@ class CommercialQueueService:
                 "allowed_account_ids": selected_accounts,
                 "account_selection_mode": "pinned" if selection_mode == "pinned" else "auto",
                 "account_selection_strategy": str(policy.get("account_assignment_strategy") or "priority_then_least_sent"),
-                "max_concurrent_accounts": int(policy.get("max_concurrent_accounts") or 1),
+                "max_concurrent_accounts": int(policy.get("max_concurrent_accounts") or 0),
             },
             "delivery": {
                 "send_method": str(policy.get("send_method") or "forward_latest_channel_message"),
@@ -1629,12 +1757,17 @@ class CommercialQueueService:
             else "current_runtime_heartbeat_expired" if heartbeat_age_seconds is not None and heartbeat_age_seconds > heartbeat_limit
             else None
         )
+        mode, configured_runtime = self._canonical_runtime_concurrency()
+        configured_for_projection = len(ready_accounts) if configured_runtime is None else configured_runtime
         concurrency = self.resource_provider.configuration_inputs(
-            int(global_settings["operator_defined_max_concurrent_accounts"]), len(ready_accounts),
-            mode=str(global_settings["concurrency_mode"]),
-            browser_capacity=int(global_settings["browser_concurrency"]),
-            worker_capacity=int(global_settings["worker_concurrency"]),
+            configured_for_projection,
+            len(ready_accounts),
+            mode=mode,
         )
+        active_runtime_slots = self.repository.active_runtime_slots()
+        reserved_runtime_slots = self.repository.reserved_runtime_slots()
+        effective_runtime_capacity = len(ready_accounts) if configured_runtime is None else configured_runtime
+        available_runtime_slots = max(0, effective_runtime_capacity - active_runtime_slots - reserved_runtime_slots)
         return {
             "scheduler_status": reported_scheduler_status,
             "configured_scheduler_status": state["scheduler_status"],
@@ -1650,9 +1783,14 @@ class CommercialQueueService:
             "last_tick_error": state.get("last_tick_error"),
             "global_live_execution_enabled": bool(global_settings.get("live_campaign_execution_enabled")),
             "concurrency_mode": str(global_settings["concurrency_mode"]),
-            "max_concurrent_accounts": None if global_settings["concurrency_mode"] == "unrestricted" else int(global_settings["operator_defined_max_concurrent_accounts"]),
-            "active_account_count": len(active_locks),
-            "available_slots": max(0, len(ready_accounts) - len(active_locks)) if global_settings["concurrency_mode"] == "unrestricted" else max(0, int(global_settings["operator_defined_max_concurrent_accounts"]) - len(active_locks)),
+            "max_concurrent_accounts": configured_runtime,
+            "configured_runtime_concurrency": configured_runtime,
+            "effective_runtime_capacity": effective_runtime_capacity,
+            "active_runtime_slots": active_runtime_slots,
+            "reserved_runtime_slots": reserved_runtime_slots,
+            "active_account_count": active_runtime_slots,
+            "available_slots": available_runtime_slots,
+            "available_runtime_slots": available_runtime_slots,
             "eligible_account_count": len(ready_accounts),
             "concurrency_inputs": concurrency,
             "effective_concurrency": concurrency["effective_concurrency"],
@@ -1791,7 +1929,13 @@ class CommercialQueueService:
         runnable.sort(key=lambda pair: (-int(pair[1].get("priority") or 0), str(pair[0].get("created_at") or ""), str(pair[0]["id"])))
         if not runnable:
             return {**self.scheduler_status(), "started_accounts": [], "results": [], "reason": "no_running_campaigns"}
-        global_policy = runnable[0][1]
+        global_policy = dict(runnable[0][1])
+        runtime_mode, configured_runtime = self._canonical_runtime_concurrency()
+        global_policy["concurrency_mode"] = runtime_mode
+        global_policy["max_concurrent_accounts"] = configured_runtime
+        global_policy["operator_defined_max_concurrent_accounts"] = configured_runtime or 0
+        global_policy["browser_concurrency"] = configured_runtime or 0
+        global_policy["worker_concurrency"] = configured_runtime or 0
         selected_campaign = runnable[0][0]
         selected_campaign_id = str(selected_campaign["id"])
         reservation = self.repository.get_campaign_capacity_reservation(selected_campaign_id)
@@ -1807,22 +1951,27 @@ class CommercialQueueService:
         snapshot = self.resource_provider.snapshot()
         capacity = self.resource_provider.decide(global_policy, snapshot, scheduler_status=str(state["scheduler_status"]))
         active_locks = self.repository.list_active_worker_locks()
-        unrestricted = str(global_policy.get("concurrency_mode") or "operator_defined") == "unrestricted"
+        unrestricted = configured_runtime is None
         # Requested account count owns campaign slot demand.  Older campaigns
         # have no requested-account reservation, so their established meaning
         # remains "up to the configured concurrent-account ceiling".  The
         # legacy ``accounts_per_round`` default is therefore not allowed to
         # silently collapse a no-demand campaign from its configured capacity
         # to one account.
-        requested_round = exact_required or int(global_policy.get("max_concurrent_accounts") or 0)
-        available_slots = min(requested_round, capacity.available_worker_slots, capacity.available_browser_start_slots)
-        if not unrestricted:
-            available_slots = min(available_slots, max(0, int(global_policy.get("operator_defined_max_concurrent_accounts") or global_policy["max_concurrent_accounts"]) - len(active_locks)))
-        if exact_required and str(global_policy.get("concurrency_mode") or "operator_defined") != "unrestricted":
+        requested_round = exact_required or int(configured_runtime or (snapshot.queued_job_count + snapshot.active_worker_count))
+        active_runtime_slots = self.repository.active_runtime_slots()
+        reserved_other = self.repository.reserved_runtime_slots(exclude_campaign_id=selected_campaign_id)
+        global_available_slots = (
+            max(0, int(configured_runtime) - active_runtime_slots - reserved_other)
+            if not unrestricted
+            else min(capacity.available_worker_slots, capacity.available_browser_start_slots)
+        )
+        available_slots = min(requested_round, capacity.available_worker_slots, capacity.available_browser_start_slots, global_available_slots)
+        if exact_required and not unrestricted:
             configured = {
-                "max_concurrent_accounts": int(global_policy.get("operator_defined_max_concurrent_accounts") or global_policy.get("max_concurrent_accounts") or 0),
-                "browser_concurrency": int(global_policy.get("browser_concurrency") or 0),
-                "worker_concurrency": int(global_policy.get("worker_concurrency") or 0),
+                "max_concurrent_accounts": int(configured_runtime or 0),
+                "browser_concurrency": int(configured_runtime or 0),
+                "worker_concurrency": int(configured_runtime or 0),
             }
             mismatches = {key: value for key, value in configured.items() if value < exact_required}
             if mismatches:
@@ -1873,6 +2022,7 @@ class CommercialQueueService:
                     selected_campaign_id,
                     [str(account["account_id"]) for account in selected],
                     str(selected_campaign.get("source_channel_uid") or ""),
+                    max_active_account_slots=configured_runtime,
                 )
             except ValueError as exc:
                 return {
@@ -2057,7 +2207,14 @@ class CommercialQueueService:
             "scheduler_snapshot": scheduler,
         }
 
-    def assign_jobs(self, account_id: str, campaign_id: str | None = None, limit: int | None = None) -> dict[str, Any]:
+    def assign_jobs(
+        self,
+        account_id: str,
+        campaign_id: str | None = None,
+        limit: int | None = None,
+        *,
+        account_slot_already_owned: bool = False,
+    ) -> dict[str, Any]:
         policy_result = self.resolve_effective_policy(account_id=account_id, campaign_id=campaign_id)
         policy = policy_result["effective_policy"]
         legacy_effective = self.resolve_account_settings(account_id)
@@ -2109,7 +2266,15 @@ class CommercialQueueService:
         if effective_limit <= 0:
             return {**base, "reason": "assignment_limit_zero"}
         blocked_count = self.repository.quarantine_ineligible_queued_jobs(campaign_id)
-        jobs = self.repository.assign_queued_jobs_atomic(account_id, campaign_id, effective_limit, source_uid)
+        _runtime_mode, runtime_capacity = self._canonical_runtime_concurrency()
+        jobs = self.repository.assign_queued_jobs_atomic(
+            account_id,
+            campaign_id,
+            effective_limit,
+            source_uid,
+            max_active_account_slots=runtime_capacity,
+            account_slot_already_owned=account_slot_already_owned,
+        )
         if not jobs:
             return {**base, "reason": "no_eligible_queued_jobs" if blocked_count else "no_queued_jobs", "blocked_ineligible_queued_count": blocked_count}
         refreshed_reservation = self.repository.get_campaign_capacity_reservation(campaign_id) if campaign_id else None
@@ -2136,23 +2301,12 @@ class CommercialQueueService:
     # ============================================================
 
     def campaign_capacity_pool(self) -> dict[str, Any]:
-        rows = self.account_readiness_matrix()
+        rows = self._capacity_account_rows()
         # Dependency-injected workers are used only by isolated tests and
         # controlled adapters.  They do not have onboarding rows, but their
         # durable account-settings fixtures still describe a valid pool.  Real
         # production services keep the canonical onboarding projection as the
         # sole source of account readiness.
-        if not rows and not self._uses_operational_auth_source:
-            rows = []
-            for account in self.repository.list_all_account_settings():
-                ready, reason, effective = self._worker_readiness_for_account(account)
-                rows.append({
-                    **account,
-                    "worker_eligible": ready,
-                    "eligibility_reasons": [] if ready else [reason],
-                    "enabled": bool(effective.get("enabled")),
-                    "worker_status": effective.get("worker_status"),
-                })
         eligible_rows = [row for row in rows if bool(row.get("worker_eligible"))]
         total_capacity = len(eligible_rows)
         reserved_capacity = self.repository.reserved_campaign_capacity()
@@ -2175,13 +2329,12 @@ class CommercialQueueService:
     def create_campaign(self, payload: dict[str, Any]) -> dict[str, Any]:
         reservation_present = "capacity_reservation" in payload
         reservation_capacity = max(0, int(payload.pop("capacity_reservation", 0) or 0))
-        pool = self.campaign_capacity_pool()
-        if reservation_present and reservation_capacity > pool["free_account_count"]:
-            raise ValueError("campaign_capacity_pool_insufficient")
+        pool = self.campaign_capacity_pool() if reservation_present else None
         campaign = self.repository.create_campaign(payload)
         if reservation_present:
             self.repository.upsert_campaign_capacity_reservation(
-                campaign["id"], reservation_capacity, pool["eligible_account_count"],
+                campaign["id"], reservation_capacity,
+                max(int((pool or {}).get("eligible_account_count") or 0), reservation_capacity),
             )
         logger.info(
             "[CAMPAIGN_RESERVATION] campaign_id=%s operation=create capacity=%s",
@@ -2253,7 +2406,7 @@ class CommercialQueueService:
         campaign = self.get_campaign(campaign_id)
         if not campaign:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
-        rows = self.account_readiness_matrix()
+        rows = self._capacity_account_rows(campaign_id)
         registered = len(rows)
         durable = sum(bool(row.get("durable_identity_verified") or row.get("authentication_status") == "authenticated") for row in rows)
         session_acceptable = sum(
@@ -2271,35 +2424,30 @@ class CommercialQueueService:
         commercial_enabled = sum(bool(row.get("commercial_enabled")) for row in rows)
         eligible_rows = [row for row in rows if bool(row.get("worker_eligible"))]
         eligible = len(eligible_rows)
-        active = sum(str(row.get("worker_status") or "idle") != "idle" for row in rows)
+        active = self.repository.active_runtime_slots(campaign_id)
         reservation = campaign.get("capacity_reservation")
-        policy = self.resolve_effective_policy(campaign_id=campaign_id)["effective_policy"]
         required = int(
             (reservation or {}).get("requested_account_count")
             or (reservation or {}).get("allocated_account_count")
             or 0
         )
-        # Capacity allocation and exact start validation must expose the same
-        # runtime ceiling.  A reservation can be persisted for a larger
-        # desired round, but it is not execution-ready when any bounded
-        # runtime lane is smaller than that round.
-        exact_concurrency = {
-            "max_concurrent_accounts": int(policy.get("operator_defined_max_concurrent_accounts") or policy.get("max_concurrent_accounts") or 0),
-            "browser_concurrency": int(policy.get("browser_concurrency") or 0),
-            "worker_concurrency": int(policy.get("worker_concurrency") or 0),
-        }
-        concurrency_floor_shortfalls = {}
-        if required and str(policy.get("concurrency_mode") or "operator_defined") != "unrestricted":
-            concurrency_floor_shortfalls = {
-                field: value for field, value in exact_concurrency.items()
-                if value < required
-            }
-        queued_jobs = int(campaign.get("queued_count") or 0)
+        runtime = self._runtime_capacity_projection(
+            eligible_count=eligible,
+            campaign_id=campaign_id,
+            requested_account_count=required,
+        )
+        exact_concurrency = runtime["exact_concurrency"]
+        concurrency_floor_shortfalls = runtime["concurrency_floor_shortfalls"]
+        # Campaign aggregates include historical recipient-run states and can
+        # remain stale while jobs are staged.  Start capacity is gated by the
+        # persisted queued delivery jobs themselves.
+        queued_jobs = int(self.repository.campaign_job_counts(campaign_id).get("queued", 0))
         exact_runtime_ready = bool(
             required
             and eligible >= required
             and queued_jobs >= required
             and not concurrency_floor_shortfalls
+            and int(runtime["available_runtime_slots"]) >= required
         )
         unavailable = [
             {"account_id": str(row["account_id"]), "reasons": list(row.get("eligibility_reasons") or ([row.get("exact_failing_eligibility_predicate")] if row.get("exact_failing_eligibility_predicate") else []))}
@@ -2308,8 +2456,11 @@ class CommercialQueueService:
         round_rows = []
         for row in rows:
             account_id = str(row["account_id"])
-            active_job = self.repository.get_active_job_for_account(account_id)
-            session = self.runtime_session_manager.get_session(account_id)
+            active_job = row.get("active_job") or self.repository.get_active_job_for_account(account_id)
+            # Capacity/readiness is a persisted projection.  Only inspect an
+            # in-memory runtime session when this account is already active;
+            # an idle registry of 1,000 accounts must not probe 1,000 browsers.
+            session = self.runtime_session_manager.get_session(account_id) if active_job else None
             round_rows.append({
                 "account_id": account_id,
                 "job_id": (active_job or {}).get("id"),
@@ -2330,6 +2481,7 @@ class CommercialQueueService:
             "campaign_status": campaign.get("status"),
             "lifecycle_stage": campaign.get("lifecycle_stage"),
             "registered_bale_accounts": registered,
+            "registered_account_count": registered,
             "durable_identity_verified_accounts": durable,
             "session_acceptable_accounts": session_acceptable,
             "enabled_accounts": enabled,
@@ -2342,14 +2494,32 @@ class CommercialQueueService:
             "allocated_account_count": int((reservation or {}).get("allocated_account_count") or 0),
             "reserved_account_count": self.repository.reserved_campaign_capacity(),
             "free_account_count": self.campaign_capacity_pool()["free_account_count"],
-            "exact_blockers": sorted({reason for row in rows if not row.get("worker_eligible") for reason in (row.get("eligibility_reasons") or [row.get("exact_failing_eligibility_predicate")]) if reason} | ({"requested_accounts_exceed_runtime_capacity"} if concurrency_floor_shortfalls else set())),
+            "exact_blockers": sorted(
+                {
+                    reason
+                    for row in rows
+                    if not row.get("worker_eligible")
+                    for reason in (row.get("eligibility_reasons") or [row.get("exact_failing_eligibility_predicate")])
+                    if reason
+                }
+                | ({"requested_accounts_exceed_runtime_capacity"} if concurrency_floor_shortfalls else set())
+                | ({"runtime_slots_unavailable"} if required and int(runtime["available_runtime_slots"]) < required else set())
+            ),
             "reservation": reservation,
             "required_account_count": required,
-            "atomically_claimable_account_count": min(eligible, queued_jobs),
+            "queued_job_count": queued_jobs,
+            "atomically_claimable_account_count": min(eligible, queued_jobs, int(runtime["available_runtime_slots"])),
             "exact_concurrency": exact_concurrency,
             "concurrency_floor_shortfalls": concurrency_floor_shortfalls,
             "ready_for_exact_account_execution": exact_runtime_ready,
             "requested_account_shortfall": max(0, required - eligible),
+            "configured_runtime_concurrency": runtime["configured_runtime_concurrency"],
+            "effective_runtime_capacity": runtime["effective_runtime_capacity"],
+            "active_runtime_slots": runtime["active_runtime_slots"],
+            "reserved_runtime_slots": runtime["reserved_runtime_slots"],
+            "available_runtime_slots": runtime["available_runtime_slots"],
+            "replacement_deficit": max(0, required - active),
+            "runtime_capacity_source": runtime["runtime_capacity_source"],
             "unavailable_accounts": unavailable,
             "round_observability": round_rows,
             "capacity_pool": self.campaign_capacity_pool(),
@@ -3292,48 +3462,29 @@ class CommercialQueueService:
             blocking.append("live_recipient_authorization_required")
         if self.repository.campaign_has_importing_batch(campaign_id):
             blocking.append("campaign_import_in_progress")
-        eligible_count = 0
-        account_results: list[dict[str, Any]] = []
         campaign_policy = self.resolve_effective_policy(campaign_id=campaign_id)["effective_policy"]
         allowed_ids = self._campaign_pinned_account_ids(campaign_id, campaign_policy)
         source_resolved = bool(campaign.get("source_channel_uid") or self.get_global_settings().get("default_source_channel_uid"))
-        for account in self.repository.list_all_account_settings():
-            account_id = str(account["account_id"])
-            effective = self.resolve_account_settings(account_id)
-            predicates: dict[str, bool] = {}
-            blockers: list[str] = []
-            predicates["campaign_account_scope"] = not allowed_ids or account_id in allowed_ids
-            if not predicates["campaign_account_scope"]: blockers.append("campaign_account_scope_excluded")
-            health = self.account_health.repository.get(account_id)
-            predicates["health_not_blocking"] = str(health.get("health_status")) not in BLOCKING_STATES
-            if not predicates["health_not_blocking"]: blockers.append(f"health_{health.get('health_status')}")
-            predicates["enabled"] = bool(effective["enabled"])
-            if not predicates["enabled"]: blockers.append("disabled")
-            predicates["worker_idle"] = effective.get("worker_status") == "idle"
-            if not predicates["worker_idle"]: blockers.append("worker_not_idle")
-            lock = self.repository.get_worker_lock(account_id)
-            predicates["worker_lock_clear"] = not lock or self._lock_expired(lock)
-            if not predicates["worker_lock_clear"]: blockers.append("lock_active")
-            predicates["cooldown_clear"] = not self._cooldown_active(effective)
-            if not predicates["cooldown_clear"]: blockers.append("cooling_down")
-            predicates["daily_limit_available"] = int(effective["current_daily_sent_count"]) < int(effective["daily_limit"])
-            if not predicates["daily_limit_available"]: blockers.append("daily_limited")
-            auth_blockers, operational = self._authentication_blockers(account_id)
-            predicates["authentication_available"] = not auth_blockers
-            blockers.extend(auth_blockers)
-            predicates["source_channel_resolved"] = bool(self._assignment_source_uid(effective, campaign_id))
-            if not predicates["source_channel_resolved"]: blockers.append("source_missing")
-            if effective.get("source_channel_uid") or campaign.get("source_channel_uid"):
-                source_resolved = True
-            eligible = not blockers
-            eligible_count += int(eligible)
+        capacity_rows = self._capacity_account_rows(campaign_id)
+        account_results: list[dict[str, Any]] = []
+        for row in capacity_rows:
+            account_id = str(row.get("account_id") or "")
+            blockers = list(dict.fromkeys(str(item) for item in (row.get("blockers") or row.get("eligibility_reasons") or []) if item))
+            predicates = dict(row.get("worker_eligibility_predicates") or {})
+            if allowed_ids and account_id not in allowed_ids:
+                blockers.append("campaign_account_scope_excluded")
+                predicates["campaign_account_scope"] = False
+            else:
+                predicates["campaign_account_scope"] = True
+            eligible = bool(row.get("worker_eligible")) and not blockers
             account_results.append({
                 "account_id": account_id,
                 "eligible": eligible,
                 "blockers": list(dict.fromkeys(blockers)),
-                "verification_expires_at": operational.get("verification_expires_at"),
+                "verification_expires_at": row.get("verification_expires_at"),
                 "predicates": predicates,
             })
+        eligible_count = sum(1 for row in account_results if row["eligible"])
         if not source_resolved:
             blocking.append("source_channel_not_resolved")
         if eligible_count <= 0:
@@ -3347,34 +3498,29 @@ class CommercialQueueService:
             or (reservation or {}).get("allocated_account_count")
             or 0
         )
-        registered_account_count = len(self.account_readiness_matrix())
+        registered_account_count = len(capacity_rows)
         unavailable_accounts = [
             {"account_id": row["account_id"], "reasons": row["blockers"]}
             for row in account_results if not row["eligible"]
         ]
         policy = campaign_policy
         # ``accounts_per_round`` is a legacy batching preference, not a second
-        # operator demand.  In AUTO mode the scheduler derives the account
-        # batch from requested_account_count.  The remaining values are safety
-        # ceilings, so only an actual lower-than-N ceiling is a blocker.
-        exact_concurrency = {
-            "max_concurrent_accounts": int(policy.get("operator_defined_max_concurrent_accounts") or policy.get("max_concurrent_accounts") or 0),
-            "browser_concurrency": int(policy.get("browser_concurrency") or 0),
-            "worker_concurrency": int(policy.get("worker_concurrency") or 0),
-        }
-        concurrency_floor_shortfalls: dict[str, int] = {}
+        # operator demand.  Runtime lanes come from the same projection used by
+        # the campaign capacity endpoint.
+        runtime = self._runtime_capacity_projection(
+            eligible_count=eligible_count,
+            campaign_id=campaign_id,
+            requested_account_count=required_account_count,
+        )
+        exact_concurrency = runtime["exact_concurrency"]
+        concurrency_floor_shortfalls: dict[str, int] = runtime["concurrency_floor_shortfalls"]
         if required_account_count:
             if eligible_count < required_account_count:
                 blocking.append("requested_accounts_exceed_eligible")
             if deliverable < required_account_count:
                 blocking.append("exact_round_claimable_jobs_insufficient")
-            if str(policy.get("concurrency_mode") or "operator_defined") != "unrestricted":
-                concurrency_floor_shortfalls = {
-                    field: value for field, value in exact_concurrency.items()
-                    if value < required_account_count
-                }
-                if concurrency_floor_shortfalls:
-                    blocking.append("requested_accounts_exceed_runtime_capacity")
+            if concurrency_floor_shortfalls or int(runtime["available_runtime_slots"]) < required_account_count:
+                blocking.append("requested_accounts_exceed_runtime_capacity")
         reason_summary: dict[str, int] = {}
         for recipient in recipient_rows:
             job_status = str(recipient.get("existing_job_status") or "")
@@ -3413,16 +3559,25 @@ class CommercialQueueService:
             "eligible_account_count": eligible_count,
             "registered_account_count": registered_account_count,
             "required_account_count": required_account_count,
-            "atomically_claimable_account_count": min(eligible_count, deliverable),
+            "requested_account_count": required_account_count,
+            "atomically_claimable_account_count": min(eligible_count, deliverable, int(runtime["available_runtime_slots"])),
             "ready_for_exact_account_execution": bool(
                 required_account_count
                 and eligible_count >= required_account_count
                 and deliverable >= required_account_count
                 and not concurrency_floor_shortfalls
+                and int(runtime["available_runtime_slots"]) >= required_account_count
             ),
             "unavailable_accounts": unavailable_accounts,
             "exact_concurrency": exact_concurrency,
             "concurrency_floor_shortfalls": concurrency_floor_shortfalls,
+            "configured_runtime_concurrency": runtime["configured_runtime_concurrency"],
+            "effective_runtime_capacity": runtime["effective_runtime_capacity"],
+            "active_runtime_slots": runtime["active_runtime_slots"],
+            "reserved_runtime_slots": runtime["reserved_runtime_slots"],
+            "available_runtime_slots": runtime["available_runtime_slots"],
+            "replacement_deficit": max(0, required_account_count - int(runtime["active_runtime_slots"])),
+            "runtime_capacity_source": runtime["runtime_capacity_source"],
             "requested_account_shortfall": max(0, required_account_count - eligible_count),
             "account_selection_mode": "pinned" if allowed_ids else "auto",
             "accounts": account_results,
@@ -3771,6 +3926,27 @@ class CommercialQueueService:
             or (self.repository.get_campaign_capacity_reservation(campaign_id) or {}).get("allocated_account_count")
             or 0
         )
+        _runtime_mode, runtime_capacity = self._canonical_runtime_concurrency()
+        if requested_account_count:
+            try:
+                reservation = self.repository.reserve_campaign_start_capacity(
+                    campaign_id,
+                    requested_account_count,
+                    runtime_capacity,
+                )
+            except ValueError as exc:
+                code = str(exc)
+                if code == "global_runtime_capacity_exhausted":
+                    summary = {
+                        **summary,
+                        "requested_account_count": requested_account_count,
+                        "configured_runtime_concurrency": runtime_capacity,
+                        "effective_runtime_capacity": runtime_capacity,
+                        "available_runtime_slots": max(0, int(runtime_capacity or 0) - self.repository.active_runtime_slots() - self.repository.reserved_runtime_slots(exclude_campaign_id=campaign_id)) if runtime_capacity is not None else None,
+                    }
+                else:
+                    summary = {**summary, "reservation_error": code}
+                raise CampaignLifecycleError(code, "Campaign execution slots could not be reserved atomically", summary) from exc
         # The first scheduler tick atomically claims exactly N accounts/jobs.
         # Once that succeeds the campaign returns to the ordinary dynamic AUTO
         # pool, where it may safely run below N while seeking replacements.
@@ -3782,6 +3958,8 @@ class CommercialQueueService:
             updates["started_at"] = utc_now()
         updated = self.repository.update_campaign(campaign_id, updates)
         if self.scheduler_runtime_required and not self.scheduler_runtime.wake(campaign_id):
+            if requested_account_count:
+                self.repository.release_campaign_capacity_reservation(campaign_id, "scheduler_signal_failed")
             self.repository.update_campaign(campaign_id, {"status": "queued", "lifecycle_stage": "blocked_runtime"})
             raise CampaignLifecycleError("scheduler_runtime_unavailable", "Scheduler could not be signalled", self.scheduler_status())
         logger.info(
@@ -3797,6 +3975,7 @@ class CommercialQueueService:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
         self._require_transition(campaign, {"running"}, "paused")
         requeued = self.repository.requeue_campaign_assigned_jobs(campaign_id)
+        self.repository.release_execution_slot_reservation(campaign_id)
         updated = self.repository.update_campaign(campaign_id, {"status": "paused", "lifecycle_stage": "paused", "paused_at": utc_now()})
         logger.info(
             "[CAMPAIGN_TRANSITION] campaign_id=%s from=running to=paused result=success",
@@ -6451,7 +6630,12 @@ class CommercialQueueService:
                     "reason": None if valid_preassignment else "exact_round_preassignment_invalid",
                 }
             else:
-                assign_result = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
+                assign_result = self.assign_jobs(
+                    account_id=account_id,
+                    campaign_id=campaign_id,
+                    limit=max_jobs,
+                    account_slot_already_owned=True,
+                )
             if assign_result["assigned_count"] == 0:
                 stop_reason = assign_result.get("reason") or "no_jobs_assigned"
                 return {

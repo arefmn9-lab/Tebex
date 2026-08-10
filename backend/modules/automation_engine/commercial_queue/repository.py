@@ -13,7 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from modules.automation_engine.db.database import DATABASE_PATH
-from modules.automation_engine.db.models import initialize_schema
+from modules.automation_engine.db.models import apply_schema_alterations, initialize_schema
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +280,11 @@ class CommercialQueueRepository:
                         missing = sorted(required - present)
                         if missing:
                             raise RuntimeError(f"database_schema_missing:{','.join(missing)}")
+                        # Additive commercial migrations must also run when a
+                        # long-lived database predates this runtime-capacity
+                        # release.  No data rows are rewritten here.
+                        apply_schema_alterations(connection, skip_missing_tables=True)
+                        connection.commit()
                     else:
                         connection.execute("PRAGMA journal_mode=WAL")
                         connection.execute("PRAGMA synchronous=NORMAL")
@@ -871,6 +876,7 @@ class CommercialQueueRepository:
             connection.execute(
                 """UPDATE commercial_campaign_capacity_reservations
                    SET reservation_status='released', allocated_account_count=0,
+                       execution_reserved_count=0,
                        released_at=?, release_reason=?, updated_at=?
                    WHERE campaign_id=? AND reservation_status='active'""",
                 (now, str(reason), now, campaign_id),
@@ -892,6 +898,108 @@ class CommercialQueueRepository:
             params = (exclude_campaign_id,)
         with self.connection() as connection:
             return int(connection.execute(query, params).fetchone()[0])
+
+    def active_runtime_slots(self, campaign_id: str | None = None) -> int:
+        """Count distinct account execution owners across all campaigns.
+
+        Assigned jobs are execution ownership even before the browser starts;
+        worker locks are included for the short pre-job window.  The query is
+        global by default so two scheduler callers cannot each spend the same
+        account slot.
+        """
+        job_query = """
+            SELECT DISTINCT account_id
+            FROM commercial_delivery_jobs
+            WHERE account_id IS NOT NULL AND status IN ('assigned','running')
+        """
+        params: list[Any] = []
+        if campaign_id:
+            job_query += " AND campaign_id = ?"
+            params.append(campaign_id)
+        with self.connection() as connection:
+            job_accounts = {
+                str(row["account_id"])
+                for row in connection.execute(job_query, tuple(params)).fetchall()
+                if row["account_id"]
+            }
+            if campaign_id:
+                # A worker lock has no durable campaign column.  The active
+                # job query above is the exact campaign view.
+                return len(job_accounts)
+            lock_accounts = {
+                str(row["account_id"])
+                for row in connection.execute("SELECT DISTINCT account_id FROM commercial_account_worker_locks").fetchall()
+                if row["account_id"]
+            }
+        return len(job_accounts | lock_accounts)
+
+    def reserved_runtime_slots(self, exclude_campaign_id: str | None = None) -> int:
+        query = """
+            SELECT COALESCE(SUM(reservation.execution_reserved_count), 0)
+            FROM commercial_campaign_capacity_reservations AS reservation
+            JOIN commercial_campaigns AS campaign ON campaign.id = reservation.campaign_id
+            WHERE campaign.status IN ('queued','running','paused')
+              AND reservation.reservation_status = 'active'
+        """
+        params: tuple[Any, ...] = ()
+        if exclude_campaign_id:
+            query += " AND reservation.campaign_id != ?"
+            params = (exclude_campaign_id,)
+        with self.connection() as connection:
+            return int(connection.execute(query, params).fetchone()[0] or 0)
+
+    def release_execution_slot_reservation(self, campaign_id: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE commercial_campaign_capacity_reservations SET execution_reserved_count=0, updated_at=? WHERE campaign_id=?",
+                (utc_now(), campaign_id),
+            )
+            connection.commit()
+
+    def reserve_campaign_start_capacity(self, campaign_id: str, requested_count: int, runtime_capacity: int | None) -> dict[str, Any]:
+        """Atomically reserve global runtime slots for an initial campaign start."""
+        requested = max(0, int(requested_count))
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = connection.execute(
+                "SELECT * FROM commercial_campaign_capacity_reservations WHERE campaign_id=? AND reservation_status='active'",
+                (campaign_id,),
+            ).fetchone()
+            if reservation is None:
+                connection.rollback()
+                raise ValueError("campaign_capacity_reservation_missing")
+            active = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT account_id FROM commercial_delivery_jobs
+                    WHERE account_id IS NOT NULL AND status IN ('assigned','running')
+                    UNION
+                    SELECT DISTINCT account_id FROM commercial_account_worker_locks
+                )
+                """
+            ).fetchone()[0] or 0)
+            reserved_elsewhere = int(connection.execute(
+                """
+                SELECT COALESCE(SUM(execution_reserved_count),0)
+                FROM commercial_campaign_capacity_reservations
+                WHERE campaign_id != ? AND reservation_status='active'
+                """,
+                (campaign_id,),
+            ).fetchone()[0] or 0)
+            if runtime_capacity is not None and active + reserved_elsewhere + requested > max(0, int(runtime_capacity)):
+                connection.rollback()
+                raise ValueError("global_runtime_capacity_exhausted")
+            connection.execute(
+                """
+                UPDATE commercial_campaign_capacity_reservations
+                SET execution_reserved_count=?, updated_at=?
+                WHERE campaign_id=? AND reservation_status='active'
+                """,
+                (requested, now, campaign_id),
+            )
+            connection.commit()
+        return self.get_campaign_capacity_reservation(campaign_id) or {}
 
     # ============================================================
     # END BLOCK: CAMPAIGN_CAPACITY_RESERVATION_PERSISTENCE
@@ -3470,6 +3578,8 @@ class CommercialQueueRepository:
         campaign_id: str | None,
         limit: int,
         source_channel_uid: str,
+        max_active_account_slots: int | None = None,
+        account_slot_already_owned: bool = False,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -3500,11 +3610,27 @@ class CommercialQueueRepository:
             if active is not None:
                 connection.rollback()
                 return []
+            if max_active_account_slots is not None:
+                active_slots = int(connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT DISTINCT account_id FROM commercial_delivery_jobs
+                        WHERE account_id IS NOT NULL AND status IN ('assigned','running')
+                        UNION
+                        SELECT DISTINCT account_id FROM commercial_account_worker_locks
+                    )
+                    """
+                ).fetchone()[0] or 0)
+                owned_slot = 1 if account_slot_already_owned else 0
+                if active_slots - owned_slot >= max(0, int(max_active_account_slots)):
+                    connection.rollback()
+                    return []
             filters = ["job.status = 'queued'", "(job.account_id IS NULL OR job.account_id = ?)", queue_claim_eligibility_where()]
             params: list[Any] = [account_id]
             if campaign_id:
                 filters.append("job.campaign_id = ?")
                 params.append(campaign_id)
+                filters.append("EXISTS (SELECT 1 FROM commercial_campaigns AS campaign WHERE campaign.id = job.campaign_id AND campaign.status = 'running')")
             else:
                 filters.append("job.campaign_id IN (SELECT id FROM commercial_campaigns WHERE status = 'running')")
             query = f"""
@@ -3600,7 +3726,8 @@ class CommercialQueueRepository:
         return assigned_jobs
 
     def claim_exact_campaign_round_atomic(
-        self, campaign_id: str, account_ids: list[str], source_channel_uid: str
+        self, campaign_id: str, account_ids: list[str], source_channel_uid: str,
+        max_active_account_slots: int | None = None,
     ) -> list[dict[str, Any]]:
         """Bind one queued job to every distinct account, or commit nothing."""
         distinct_accounts = list(dict.fromkeys(str(value) for value in account_ids if str(value)))
@@ -3617,11 +3744,36 @@ class CommercialQueueRepository:
             if active:
                 connection.rollback()
                 raise ValueError("exact_round_account_already_active")
+            if max_active_account_slots is not None:
+                active_slots = int(connection.execute(
+                    """
+                    SELECT COUNT(*) FROM (
+                        SELECT DISTINCT account_id FROM commercial_delivery_jobs
+                        WHERE account_id IS NOT NULL AND status IN ('assigned','running')
+                        UNION
+                        SELECT DISTINCT account_id FROM commercial_account_worker_locks
+                    )
+                    """
+                ).fetchone()[0] or 0)
+                reservation_row = connection.execute(
+                    """
+                    SELECT execution_reserved_count
+                    FROM commercial_campaign_capacity_reservations
+                    WHERE campaign_id=? AND reservation_status='active'
+                    """,
+                    (campaign_id,),
+                ).fetchone()
+                reserved_for_campaign = int(reservation_row[0] if reservation_row is not None else 0)
+                if active_slots + len(distinct_accounts) > max(0, int(max_active_account_slots)) + reserved_for_campaign:
+                    connection.rollback()
+                    raise ValueError("global_runtime_capacity_exhausted")
             jobs = connection.execute(
                 f"""SELECT job.* FROM commercial_delivery_jobs AS job
                     JOIN commercial_recipients AS recipient ON recipient.id=job.recipient_id
                     JOIN commercial_recipient_input_manifests AS manifest ON manifest.manifest_id=recipient.input_manifest_id
-                    WHERE job.campaign_id=? AND job.status='queued' AND {queue_claim_eligibility_where()}
+                    WHERE job.campaign_id=? AND job.status='queued'
+                      AND EXISTS (SELECT 1 FROM commercial_campaigns AS campaign WHERE campaign.id=job.campaign_id AND campaign.status='running')
+                      AND {queue_claim_eligibility_where()}
                     ORDER BY job.priority DESC, job.scheduled_at IS NOT NULL ASC,
                              job.scheduled_at ASC, job.created_at ASC LIMIT ?""",
                 (campaign_id, len(distinct_accounts)),
@@ -3641,6 +3793,14 @@ class CommercialQueueRepository:
                     connection.rollback()
                     raise ValueError("exact_round_claim_conflict")
                 claimed.append({**dict(job), "account_id": account_id, "status": "assigned", "claimed_at": now})
+            connection.execute(
+                """
+                UPDATE commercial_campaign_capacity_reservations
+                SET execution_reserved_count=0, updated_at=?
+                WHERE campaign_id=? AND reservation_status='active'
+                """,
+                (now, campaign_id),
+            )
             connection.commit()
         return claimed
 
