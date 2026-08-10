@@ -47,7 +47,7 @@ def _service(path: Path, orchestrator: OrchestratorStub | None = None) -> Commer
 
 
 def _campaign(service: CommercialQueueService) -> dict:
-    return service.create_campaign({"name": "Authorization Campaign", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
+    return service.create_campaign({"name": "Authorization Campaign", "platform": "bale", "status": "running", "source_channel_uid": "5613544284", "capacity_reservation": 10})
 
 
 def _add_recipient(service: CommercialQueueService, campaign: dict, phone: str, name: str | None = None) -> tuple[dict, dict]:
@@ -114,7 +114,7 @@ def test_authorized_real_recipient_passes_normal_mode_validation() -> None:
         recipient, job = _add_recipient(service, campaign, "989304073331", "Bale-000001")
         _authorize(service, recipient["id"])
         details = service.repository.get_job_with_recipient(job["id"])
-        assert service.validate_live_recipient_authorization(job, details, dry_run=False)["ok"] is True
+        assert service.validate_live_recipient_authorization(job, details, execution_mode="real_send")["ok"] is True
 
 
 def test_synthetic_and_unauthorized_rejected_in_normal_mode_but_allowed_in_dry_run() -> None:
@@ -126,26 +126,29 @@ def test_synthetic_and_unauthorized_rejected_in_normal_mode_but_allowed_in_dry_r
         _mark_synthetic(service, synthetic_recipient["id"])
         for job in [synthetic_job, unauthorized_job]:
             details = service.repository.get_job_with_recipient(job["id"])
-            normal = service.validate_live_recipient_authorization(job, details, dry_run=False)
-            dry = service.validate_live_recipient_authorization(job, details, dry_run=True)
+            normal = service.validate_live_recipient_authorization(job, details, execution_mode="real_send")
+            dry = service.validate_live_recipient_authorization(job, details, execution_mode="simulation")
             assert normal["ok"] is False
             assert normal["error_code"] in {"recipient_input_manifest_required", "live_recipient_authorization_required"}
             assert dry["ok"] is True
-            assert dry["dry_run_only"] is True
+            assert dry["simulation_only"] is True
 
 
-def test_contact_store_display_name_and_previous_dry_run_do_not_authorize() -> None:
+def test_production_worker_rejects_simulation_override_and_does_not_authorize() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         service = _service(Path(tmp) / "auth.db")
         campaign = _campaign(service)
         recipient, job = _add_recipient(service, campaign, "989304073334", "Bale-000004")
-        dry = service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=True)
-        assert dry["processed_count"] == 0
-        assert dry["reason"] in {"no_eligible_queued_jobs", "no_queued_jobs"}
+        try:
+            service.run_account_round("bale_a", campaign["id"], max_jobs=1, execution_mode="simulation")
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("Production worker must reject execution_mode overrides")
         rerun_campaign = _campaign(service)
         recipient2, job2 = _add_recipient(service, rerun_campaign, "989304073334", "Bale-000004")
         details = service.repository.get_job_with_recipient(job2["id"])
-        check = service.validate_live_recipient_authorization(job2, details, dry_run=False)
+        check = service.validate_live_recipient_authorization(job2, details, execution_mode="real_send")
         assert check["ok"] is False
         assert check["authorization"]["live_execution_authorized"] is False
 
@@ -192,7 +195,7 @@ def test_authorization_rejection_before_adapter_execution_and_worker_continues()
         good_recipient, good_job = _add_recipient(service, campaign, "989304073331", "Bale-000001")
         _mark_synthetic(service, bad_recipient["id"])
         _authorize(service, good_recipient["id"])
-        result = service.run_account_round("bale_a", campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round("bale_a", campaign["id"], max_jobs=2)
         jobs = {job["id"]: job for job in service.list_jobs(campaign_id=campaign["id"], limit=10)["items"]}
         assert result["processed_count"] == 1
         assert len(orchestrator.calls) == 1
@@ -212,11 +215,11 @@ def test_campaign_validation_reports_and_blocks_unsafe_queued_jobs() -> None:
         synthetic_recipient, _ = _add_recipient(service, campaign, "989304073332", "Bale-000002")
         _mark_synthetic(service, synthetic_recipient["id"])
         validation = service.validate_campaign_start(campaign["id"])
-        dry = service.validate_campaign_recipient_authorization(campaign["id"], dry_run=True)
+        dry = service.validate_campaign_recipient_authorization(campaign["id"], execution_mode="simulation")
         assert validation["unauthorized_job_count"] == 0
         assert validation["synthetic_test_job_count"] == 0
         assert "campaign_has_no_deliverable_jobs" in validation["blocking_reasons"]
-        assert dry["dry_run_eligible_job_count"] == 0
+        assert dry["simulation_eligible_job_count"] == 0
         assert dry["blocking_jobs"] == []
 
 
@@ -228,7 +231,7 @@ def test_revoke_prevents_future_normal_execution() -> None:
         _authorize(service, recipient["id"])
         service.revoke_recipient_live(recipient["id"], "operator revoked")
         details = service.repository.get_job_with_recipient(job["id"])
-        assert service.validate_live_recipient_authorization(job, details, dry_run=False)["ok"] is False
+        assert service.validate_live_recipient_authorization(job, details, execution_mode="real_send")["ok"] is False
 
 
 def test_migration_dry_run_apply_idempotent_and_preserves_historical_jobs() -> None:

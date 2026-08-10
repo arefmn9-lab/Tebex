@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import sqlite3
+from time import perf_counter
+from threading import Lock
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +14,8 @@ from uuid import uuid4
 
 from modules.automation_engine.db.database import DATABASE_PATH
 from modules.automation_engine.db.models import initialize_schema
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -72,16 +77,102 @@ def commercial_send_completed(result: dict[str, Any] | None) -> bool:
     if has_modern_fields:
         return (
             bool(payload.get("success"))
+            and bool(payload.get("recipient_resolved"))
+            and int(payload.get("confirm_click_count") or payload.get("send_confirmation_click_count") or 0) >= 1
             and str(payload.get("delivery_status") or "") in {"submitted", "delivered"}
             and payload.get("send_action_verified") is True
             and not payload.get("error_code")
         )
     return (
         bool(payload.get("success"))
+        and int(payload.get("verified_forwarded_recipient_count") or 0) >= 1
+        and int(payload.get("confirm_click_count") or 0) >= 1
         and bool(payload.get("forward_verified"))
         and bool(payload.get("diagnostics_consistent"))
         and not payload.get("error_code")
     )
+
+
+def classify_failed_delivery_recovery_evidence(
+    job: dict[str, Any],
+    diagnostics: dict[str, Any],
+    *,
+    platform_outcome: str | None = None,
+    attempt_statuses: list[str] | None = None,
+) -> dict[str, Any]:
+    """Classify a failed delivery using only persisted irreversible-action evidence."""
+    result = diagnostics.get("orchestrator_result") if isinstance(diagnostics.get("orchestrator_result"), dict) else diagnostics
+    scenario = result.get("scenario_result") if isinstance(result.get("scenario_result"), dict) else {}
+    records = scenario.get("records") if isinstance(scenario.get("records"), dict) else {}
+    forward_picker_opened = bool(records.get("recipient_picker_visible") or result.get("forward_picker_opened"))
+    recipient_selected = bool(result.get("recipient_selected") or records.get("recipient_selected"))
+    confirm_count = max(
+        int(result.get("confirm_click_count") or 0),
+        int(result.get("send_confirmation_click_count") or 0),
+        int(records.get("confirm_click_count") or 0),
+    )
+    confirm_clicked = confirm_count > 0
+    forward_verified = bool(result.get("forward_verified") or result.get("delivery_verified") or records.get("forward_verified"))
+    final_send_invoked = bool(result.get("final_send_invoked") or scenario.get("final_send_invoked") or records.get("final_send_invoked"))
+    send_action_verified = bool(result.get("send_action_verified") or records.get("send_action_verified"))
+    send_network_request_observed = bool(
+        result.get("send_network_request_observed")
+        or result.get("forward_network_request_observed")
+        or records.get("send_network_request_observed")
+        or records.get("forward_network_request_observed")
+    )
+    success_marker_observed = bool(
+        result.get("success_marker_observed")
+        or records.get("success_marker_observed")
+        or str(result.get("success_toast_text") or records.get("success_toast_text") or "").strip()
+    )
+    browser_shutdown_ambiguous = bool(
+        result.get("browser_terminated_after_confirm")
+        or result.get("browser_shutdown_after_confirm")
+        or records.get("browser_terminated_after_confirm")
+        or records.get("browser_shutdown_after_confirm")
+    )
+    delivery_status = str(result.get("delivery_status") or records.get("delivery_status") or "")
+    statuses = {str(value) for value in (attempt_statuses or [])}
+    delivery_side_mutation = (
+        str(job.get("status") or "") == "succeeded"
+        or bool(job.get("result_success"))
+        or bool(job.get("forward_verified"))
+        or int(job.get("verified_forwarded_recipient_count") or 0) > 0
+        or str(platform_outcome or "") in {"sent", "succeeded", "submitted", "delivered"}
+        or bool(statuses & {"sent", "succeeded", "submitted", "delivered"})
+        or delivery_status in {"submitted", "delivered"}
+    )
+    reasons: list[str] = []
+    if recipient_selected:
+        reasons.append("recipient_selected")
+    if confirm_clicked:
+        reasons.append("confirm_clicked")
+    if final_send_invoked or send_action_verified or send_network_request_observed:
+        reasons.append("send_action_or_network_observed")
+    if success_marker_observed:
+        reasons.append("success_marker_observed")
+    if browser_shutdown_ambiguous:
+        reasons.append("ambiguous_browser_shutdown_after_confirm")
+    if delivery_side_mutation:
+        reasons.append("conflicting_delivery_side_state")
+    safe = str(job.get("status") or "") == "failed" and not reasons and not forward_verified
+    return {
+        "classification": "safe_to_requeue" if safe else "manual_review",
+        "safe_to_requeue": safe,
+        "forward_picker_opened": forward_picker_opened,
+        "recipient_selected": recipient_selected,
+        "confirm_clicked": confirm_clicked,
+        "confirm_click_count": confirm_count,
+        "forward_verified": forward_verified,
+        "send_network_request_observed": send_network_request_observed,
+        "final_send_invoked": final_send_invoked,
+        "success_marker_observed": success_marker_observed,
+        "browser_shutdown_ambiguous": browser_shutdown_ambiguous,
+        "delivery_side_mutation": delivery_side_mutation,
+        "delivery_status": delivery_status,
+        "reasons": reasons,
+    }
 
 
 def aggregate_scenario_status(outcomes: list[str]) -> str:
@@ -149,15 +240,51 @@ def queue_claim_eligibility_where(job_alias: str = "job", recipient_alias: str =
     """
 
 
+class _TimedConnection(sqlite3.Connection):
+    def execute(self, sql: str, parameters=(), /):
+        started = perf_counter()
+        try:
+            return super().execute(sql, parameters)
+        finally:
+            try:
+                from app.performance import record_db_query
+                if not sql.lstrip().upper().startswith("PRAGMA"):
+                    record_db_query((perf_counter() - started) * 1000)
+            except ImportError:
+                pass
+
+
 class CommercialQueueRepository:
     def __init__(self, database_path: Path | None = None) -> None:
         self.database_path = database_path or DATABASE_PATH
+        self._database_preexisting = self.database_path.exists()
+        self._schema_initialized = False
+        self._schema_lock = Lock()
 
     def connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path)
+        # The scheduler and the operator UI use short, independent SQLite
+        # transactions. A bounded wait prevents a campaign create/update from
+        # becoming a transient HTTP 500 merely because a worker tick owns the
+        # writer lock at that instant.
+        connection = sqlite3.connect(self.database_path, timeout=10.0, factory=_TimedConnection)
         connection.row_factory = sqlite3.Row
-        initialize_schema(connection)
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=10000")
+        if not self._schema_initialized:
+            with self._schema_lock:
+                if not self._schema_initialized:
+                    if self._database_preexisting:
+                        required = {"commercial_campaigns", "commercial_delivery_jobs", "commercial_account_settings"}
+                        present = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                        missing = sorted(required - present)
+                        if missing:
+                            raise RuntimeError(f"database_schema_missing:{','.join(missing)}")
+                    else:
+                        connection.execute("PRAGMA journal_mode=WAL")
+                        connection.execute("PRAGMA synchronous=NORMAL")
+                        initialize_schema(connection)
+                    self._schema_initialized = True
         return connection
 
     @contextmanager
@@ -172,60 +299,95 @@ class CommercialQueueRepository:
         with self.connection() as connection:
             return row_to_dict(connection.execute("SELECT * FROM commercial_global_settings WHERE id = 'global'").fetchone())
 
+    @staticmethod
+    def _scheduler_state_defaults() -> dict[str, Any]:
+        """Normalize legacy scheduler rows without mutating an existing DB."""
+        return {
+            "id": "default",
+            "scheduler_status": "stopped",
+            "round_robin_cursor": None,
+            "last_tick_at": None,
+            "last_started_at": None,
+            "last_stopped_at": None,
+            "current_tick_id": None,
+            "last_tick_results_json": "[]",
+            "runtime_owner_id": None,
+            "process_id": None,
+            "application_started_at": None,
+            "loop_interval_seconds": None,
+            "loop_heartbeat_at": None,
+            "last_loop_iteration_at": None,
+            "tick_in_progress": 0,
+            "last_tick_started_at": None,
+            "last_tick_completed_at": None,
+            "last_failed_tick_at": None,
+            "last_tick_error": None,
+            # These were added for current-runtime versus historical-runtime
+            # diagnostics.  They remain virtual/defaulted on a legacy,
+            # operator-owned DB until a deliberate production migration.
+            "scheduler_task_created_at": None,
+            "first_current_runtime_tick_at": None,
+            "last_current_runtime_tick_at": None,
+            "current_runtime_heartbeat_at": None,
+            "historical_runtime_owner_id": None,
+            "historical_last_tick_at": None,
+            "historical_last_heartbeat_at": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+
+    @staticmethod
+    def _scheduler_state_columns(connection: sqlite3.Connection) -> list[str]:
+        return [str(row["name"]) for row in connection.execute("PRAGMA table_info(commercial_scheduler_state)").fetchall()]
+
+    def _normalized_scheduler_state(self, row: sqlite3.Row | None) -> dict[str, Any]:
+        return {**self._scheduler_state_defaults(), **(dict(row) if row is not None else {})}
+
     def get_scheduler_state(self) -> dict[str, Any]:
         with self.connection() as connection:
             row = connection.execute("SELECT * FROM commercial_scheduler_state WHERE id = 'default'").fetchone()
             if row is not None:
-                return dict(row)
+                return self._normalized_scheduler_state(row)
             now = utc_now()
+            payload = {**self._scheduler_state_defaults(), "created_at": now, "updated_at": now}
+            columns = self._scheduler_state_columns(connection)
+            record = {column: payload.get(column) for column in columns}
+            names = ", ".join(record)
+            placeholders = ", ".join("?" for _ in record)
             connection.execute(
-                """
-                INSERT INTO commercial_scheduler_state (
-                    id, scheduler_status, round_robin_cursor, last_tick_at,
-                    last_started_at, last_stopped_at, current_tick_id,
-                    last_tick_results_json, created_at, updated_at
-                )
-                VALUES ('default', 'stopped', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
-                """,
-                (now, now),
+                f"INSERT INTO commercial_scheduler_state ({names}) VALUES ({placeholders})",
+                tuple(record.values()),
             )
             connection.commit()
-            return dict(connection.execute("SELECT * FROM commercial_scheduler_state WHERE id = 'default'").fetchone())
+            return self._normalized_scheduler_state(
+                connection.execute("SELECT * FROM commercial_scheduler_state WHERE id = 'default'").fetchone()
+            )
+
+    def get_scheduler_state_snapshot(self) -> dict[str, Any]:
+        """Read scheduler state without creating or updating it from a GET path."""
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM commercial_scheduler_state WHERE id = 'default'").fetchone()
+        return self._normalized_scheduler_state(row)
 
     def update_scheduler_state(self, updates: dict[str, Any]) -> dict[str, Any]:
         current = self.get_scheduler_state()
         payload = {**current, **updates, "updated_at": utc_now()}
         with self.connection() as connection:
+            columns = self._scheduler_state_columns(connection)
+            record = {column: payload.get(column) for column in columns}
+            record["id"] = "default"
+            if "tick_in_progress" in record:
+                record["tick_in_progress"] = int(bool(record.get("tick_in_progress")))
+            names = ", ".join(record)
+            placeholders = ", ".join("?" for _ in record)
+            updated_columns = [column for column in record if column != "id"]
+            assignments = ", ".join(f"{column} = excluded.{column}" for column in updated_columns)
             connection.execute(
-                """
-                INSERT INTO commercial_scheduler_state (
-                    id, scheduler_status, round_robin_cursor, last_tick_at,
-                    last_started_at, last_stopped_at, current_tick_id,
-                    last_tick_results_json, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    scheduler_status = excluded.scheduler_status,
-                    round_robin_cursor = excluded.round_robin_cursor,
-                    last_tick_at = excluded.last_tick_at,
-                    last_started_at = excluded.last_started_at,
-                    last_stopped_at = excluded.last_stopped_at,
-                    current_tick_id = excluded.current_tick_id,
-                    last_tick_results_json = excluded.last_tick_results_json,
-                    updated_at = excluded.updated_at
+                f"""
+                INSERT INTO commercial_scheduler_state ({names}) VALUES ({placeholders})
+                ON CONFLICT(id) DO UPDATE SET {assignments}
                 """,
-                (
-                    "default",
-                    payload["scheduler_status"],
-                    payload.get("round_robin_cursor"),
-                    payload.get("last_tick_at"),
-                    payload.get("last_started_at"),
-                    payload.get("last_stopped_at"),
-                    payload.get("current_tick_id"),
-                    payload.get("last_tick_results_json"),
-                    payload.get("created_at") or utc_now(),
-                    payload["updated_at"],
-                ),
+                tuple(record.values()),
             )
             connection.commit()
         return self.get_scheduler_state()
@@ -254,7 +416,9 @@ class CommercialQueueRepository:
             connection.execute(
                 """
                 INSERT INTO commercial_global_settings (
-                    id, max_concurrent_accounts, deliveries_per_account_round,
+                    id, max_concurrent_accounts, concurrency_mode,
+                    operator_defined_max_concurrent_accounts, browser_concurrency, worker_concurrency,
+                    deliveries_per_account_round,
                     delay_between_deliveries_seconds, round_cooldown_seconds,
                     default_daily_limit_per_account, default_source_channel_uid,
                     account_assignment_strategy, max_job_duration_seconds,
@@ -267,9 +431,13 @@ class CommercialQueueRepository:
                     automatic_retry_enabled, live_campaign_execution_enabled,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     max_concurrent_accounts = excluded.max_concurrent_accounts,
+                    concurrency_mode = excluded.concurrency_mode,
+                    operator_defined_max_concurrent_accounts = excluded.operator_defined_max_concurrent_accounts,
+                    browser_concurrency = excluded.browser_concurrency,
+                    worker_concurrency = excluded.worker_concurrency,
                     deliveries_per_account_round = excluded.deliveries_per_account_round,
                     delay_between_deliveries_seconds = excluded.delay_between_deliveries_seconds,
                     round_cooldown_seconds = excluded.round_cooldown_seconds,
@@ -297,6 +465,10 @@ class CommercialQueueRepository:
                 (
                     record["id"],
                     record["max_concurrent_accounts"],
+                    record.get("concurrency_mode", "operator_defined"),
+                    record.get("operator_defined_max_concurrent_accounts", record["max_concurrent_accounts"]),
+                    record.get("browser_concurrency", record["max_concurrent_accounts"]),
+                    record.get("worker_concurrency", record["max_concurrent_accounts"]),
                     record["deliveries_per_account_round"],
                     record["delay_between_deliveries_seconds"],
                     record["round_cooldown_seconds"],
@@ -436,6 +608,10 @@ class CommercialQueueRepository:
             "status": payload.get("status") or "draft",
             "source_channel_uid": payload.get("source_channel_uid"),
             "policy_overrides_json": json.dumps(payload.get("policy_overrides") or {}, ensure_ascii=False) if payload.get("policy_overrides") is not None else payload.get("policy_overrides_json"),
+            "lifecycle_stage": payload.get("lifecycle_stage") or "draft",
+            "queue_idempotency_key": payload.get("queue_idempotency_key"),
+            "queued_review_token": payload.get("queued_review_token"),
+            "queued_final_review_hash": payload.get("queued_final_review_hash"),
             "total_recipients": 0,
             "queued_count": 0,
             "running_count": 0,
@@ -453,15 +629,17 @@ class CommercialQueueRepository:
             connection.execute(
                 """
                 INSERT INTO commercial_campaigns (
-                    id, name, platform, status, source_channel_uid, policy_overrides_json, total_recipients,
+                    id, name, platform, status, source_channel_uid, policy_overrides_json, lifecycle_stage,
+                    queue_idempotency_key, queued_review_token, queued_final_review_hash, total_recipients,
                     queued_count, running_count, succeeded_count, failed_count,
                     skipped_count, cancelled_count, created_at, started_at,
                     paused_at, completed_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 tuple(record[key] for key in [
-                    "id", "name", "platform", "status", "source_channel_uid", "policy_overrides_json", "total_recipients",
+                    "id", "name", "platform", "status", "source_channel_uid", "policy_overrides_json", "lifecycle_stage",
+                    "queue_idempotency_key", "queued_review_token", "queued_final_review_hash", "total_recipients",
                     "queued_count", "running_count", "succeeded_count", "failed_count", "skipped_count",
                     "cancelled_count", "created_at", "started_at", "paused_at", "completed_at", "updated_at",
                 ]),
@@ -473,22 +651,40 @@ class CommercialQueueRepository:
         with self.connection() as connection:
             return row_to_dict(connection.execute("SELECT * FROM commercial_campaigns WHERE id = ?", (campaign_id,)).fetchone())
 
-    def list_campaigns(self, status: str | None, limit: int, offset: int) -> list[dict[str, Any]]:
+    def list_campaigns(
+        self,
+        status: str | None,
+        limit: int,
+        offset: int,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
         query = "SELECT * FROM commercial_campaigns"
         params: list[Any] = []
+        predicates = [] if include_deleted else ["deleted_at IS NULL"]
         if status:
-            query += " WHERE status = ?"
-            params.append(status)
+            if status == "archived":
+                predicates.append("archived_at IS NOT NULL")
+            else:
+                predicates.extend(["status = ?", "archived_at IS NULL"])
+                params.append(status)
+        if predicates:
+            query += " WHERE " + " AND ".join(predicates)
         query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         with self.connection() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
 
     def update_campaign(self, campaign_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-        allowed = {"name", "platform", "status", "source_channel_uid", "policy_overrides_json", "started_at", "paused_at", "completed_at"}
+        allowed = {
+            "name", "platform", "status", "source_channel_uid", "policy_overrides_json",
+            "lifecycle_stage", "queue_idempotency_key", "queued_review_token",
+            "queued_final_review_hash", "started_at", "paused_at", "completed_at",
+        }
         updates = {key: value for key, value in payload.items() if key in allowed}
         if "policy_overrides" in payload:
             updates["policy_overrides_json"] = json.dumps(payload.get("policy_overrides") or {}, ensure_ascii=False)
+        if any(key in updates for key in {"platform", "source_channel_uid", "policy_overrides_json"}):
+            updates.setdefault("lifecycle_stage", "draft")
         if not updates:
             return self.get_campaign(campaign_id)
         updates["updated_at"] = utc_now()
@@ -497,6 +693,209 @@ class CommercialQueueRepository:
             connection.execute(f"UPDATE commercial_campaigns SET {assignments} WHERE id = ?", (*updates.values(), campaign_id))
             connection.commit()
         return self.get_campaign(campaign_id)
+
+    # ============================================================
+    # BLOCK: CAMPAIGN_TRANSACTIONAL_DELETE
+    # PURPOSE:
+    # Deletes one campaign and all campaign-owned operational records.
+    # ACCOUNT_SCOPE:
+    # Does not modify account, authentication, or runtime state.
+    # DEPENDENCIES:
+    # Commercial campaign persistence tables
+    # LAYER:
+    # DATABASE
+    # ============================================================
+
+    def delete_campaign(self, campaign_id: str) -> dict[str, Any]:
+        """Soft-delete one campaign while retaining its complete history."""
+        with self.connection() as connection:
+            campaign = connection.execute(
+                "SELECT * FROM commercial_campaigns WHERE id = ?",
+                (campaign_id,),
+            ).fetchone()
+            if campaign is None:
+                return {"deleted": False, "reason": "not_found", "campaign_id": campaign_id}
+            now = utc_now()
+            cursor = connection.execute(
+                "UPDATE commercial_campaigns SET deleted_at=?, hidden=1, updated_at=? WHERE id=? AND deleted_at IS NULL",
+                (now, now, campaign_id),
+            )
+            connection.commit()
+        logger.info(
+            "[CAMPAIGN_DELETE] campaign_id=%s result=deleted deleted_counts=%s",
+            campaign_id,
+            {"soft_deleted": int(cursor.rowcount)},
+        )
+        return {
+            "deleted": True,
+            "campaign_id": campaign_id,
+            "soft_deleted": True,
+            "deleted_at": now,
+            "history_preserved": True,
+        }
+
+    # ============================================================
+    # END BLOCK: CAMPAIGN_TRANSACTIONAL_DELETE
+    # ============================================================
+
+    # ============================================================
+    # BLOCK: CAMPAIGN_CAPACITY_RESERVATION_PERSISTENCE
+    # PURPOSE:
+    # Persists one shared-pool reservation for each campaign.
+    # ACCOUNT_SCOPE:
+    # No account is owned or selected by a reservation.
+    # DEPENDENCIES:
+    # commercial_campaign_capacity_reservations
+    # LAYER:
+    # DATABASE
+    # ============================================================
+
+    # FUNCTION:
+    # upsert_campaign_capacity_reservation
+    # RESPONSIBILITY:
+    # Changes a campaign reservation without resetting consumed capacity.
+    # INPUT:
+    # campaign_id, requested capacity, total pool capacity
+    # OUTPUT:
+    # Persisted reservation
+    # SIDE EFFECTS:
+    # Reserves or releases shared pool capacity atomically.
+    def upsert_campaign_capacity_reservation(
+        self,
+        campaign_id: str,
+        capacity: int,
+        total_pool_capacity: int,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        requested_capacity = max(0, int(capacity))
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM commercial_campaign_capacity_reservations WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+            reserved_elsewhere = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(reservation.allocated_account_count), 0)
+                    FROM commercial_campaign_capacity_reservations AS reservation
+                    JOIN commercial_campaigns AS campaign ON campaign.id = reservation.campaign_id
+                    WHERE reservation.campaign_id != ?
+                      AND campaign.status IN ('draft','queued','running','paused')
+                      AND reservation.reservation_status = 'active'
+                    """,
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            free_capacity = max(0, int(total_pool_capacity) - reserved_elsewhere)
+            if requested_capacity > free_capacity:
+                connection.rollback()
+                raise ValueError("campaign_capacity_pool_insufficient")
+            connection.execute(
+                """
+                INSERT INTO commercial_campaign_capacity_reservations (
+                    campaign_id, capacity, used_capacity, remaining_capacity,
+                    requested_account_count, allocated_account_count, reservation_status,
+                    released_at, release_reason, created_at, updated_at
+                )
+                VALUES (?, ?, 0, ?, ?, ?, 'active', NULL, NULL, ?, ?)
+                ON CONFLICT(campaign_id) DO UPDATE SET
+                    capacity = excluded.capacity,
+                    remaining_capacity = excluded.remaining_capacity,
+                    requested_account_count = excluded.requested_account_count,
+                    allocated_account_count = excluded.allocated_account_count,
+                    reservation_status = 'active',
+                    released_at = NULL,
+                    release_reason = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    campaign_id,
+                    requested_capacity,
+                    requested_capacity,
+                    requested_capacity,
+                    requested_capacity,
+                    existing["created_at"] if existing else now,
+                    now,
+                ),
+            )
+            connection.commit()
+        logger.info(
+            "[CAMPAIGN_RESERVATION] campaign_id=%s capacity=%s used=%s remaining=%s",
+            campaign_id,
+            requested_capacity,
+            0,
+            requested_capacity,
+        )
+        return self.get_campaign_capacity_reservation(campaign_id) or {}
+
+    def get_campaign_capacity_reservation(self, campaign_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM commercial_campaign_capacity_reservations WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+        return row_to_dict(row)
+
+    def list_campaign_capacity_reservations(self, campaign_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Load list-card reservation summaries with one query."""
+        if not campaign_ids:
+            return {}
+        placeholders = ",".join("?" for _ in campaign_ids)
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM commercial_campaign_capacity_reservations WHERE campaign_id IN ({placeholders})",
+                tuple(campaign_ids),
+            ).fetchall()
+        return {str(row["campaign_id"]): dict(row) for row in rows}
+
+    def readiness_revision(self, campaign_id: str) -> str:
+        """Revision key for detailed readiness cache invalidation."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT
+                  (SELECT updated_at FROM commercial_campaigns WHERE id=?) AS campaign_revision,
+                  (SELECT updated_at FROM commercial_global_settings WHERE id='global') AS global_settings_revision,
+                  (SELECT MAX(updated_at) FROM commercial_account_settings) AS settings_revision,
+                  (SELECT MAX(updated_at) FROM commercial_account_health) AS eligibility_revision,
+                  (SELECT MAX(updated_at) FROM commercial_campaign_capacity_reservations WHERE campaign_id=?) AS reservation_revision,
+                  (SELECT MAX(heartbeat_at || ':' || expires_at) FROM commercial_account_worker_locks) AS lock_revision""",
+                (campaign_id, campaign_id),
+            ).fetchone()
+        return "|".join(str(value or "") for value in tuple(row or ()))
+
+    def release_campaign_capacity_reservation(self, campaign_id: str, reason: str) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE commercial_campaign_capacity_reservations
+                   SET reservation_status='released', allocated_account_count=0,
+                       released_at=?, release_reason=?, updated_at=?
+                   WHERE campaign_id=? AND reservation_status='active'""",
+                (now, str(reason), now, campaign_id),
+            )
+            connection.commit()
+        return self.get_campaign_capacity_reservation(campaign_id)
+
+    def reserved_campaign_capacity(self, exclude_campaign_id: str | None = None) -> int:
+        query = """
+            SELECT COALESCE(SUM(reservation.allocated_account_count), 0)
+            FROM commercial_campaign_capacity_reservations AS reservation
+            JOIN commercial_campaigns AS campaign ON campaign.id = reservation.campaign_id
+            WHERE campaign.status IN ('draft','queued','running','paused')
+              AND reservation.reservation_status = 'active'
+        """
+        params: tuple[Any, ...] = ()
+        if exclude_campaign_id:
+            query += " AND reservation.campaign_id != ?"
+            params = (exclude_campaign_id,)
+        with self.connection() as connection:
+            return int(connection.execute(query, params).fetchone()[0])
+
+    # ============================================================
+    # END BLOCK: CAMPAIGN_CAPACITY_RESERVATION_PERSISTENCE
+    # ============================================================
 
     def create_configuration_revision(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -634,6 +1033,125 @@ class CommercialQueueRepository:
                 (campaign_id,),
             ).fetchone())
 
+    def ensure_campaign_configuration_artifacts(
+        self,
+        campaign_id: str,
+        configuration: dict[str, Any],
+        configuration_hash: str,
+        approved_by: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        canonical_json = json.dumps(configuration, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        origin_json = json.dumps(
+            {"canonical_builder": "campaign_execution_v1", "approved_by": approved_by},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """
+                SELECT * FROM commercial_campaign_configuration_revisions
+                WHERE campaign_id = ? AND status IN ('approved','active')
+                ORDER BY revision_number DESC LIMIT 1
+                """,
+                (campaign_id,),
+            ).fetchone()
+            snapshot = None
+            if current is not None and str(current["resolved_configuration_hash"]) == configuration_hash:
+                snapshot = connection.execute(
+                    """
+                    SELECT * FROM commercial_execution_configuration_snapshots
+                    WHERE campaign_id = ? AND revision_id = ? AND configuration_hash = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (campaign_id, current["revision_id"], configuration_hash),
+                ).fetchone()
+            reused = current is not None and snapshot is not None
+            if not reused:
+                connection.execute(
+                    """
+                    UPDATE commercial_campaign_final_reviews
+                    SET approved = 0, updated_at = ?
+                    WHERE campaign_id = ? AND approved = 1
+                    """,
+                    (now, campaign_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE commercial_campaign_configuration_revisions
+                    SET status = 'superseded', superseded_at = ?
+                    WHERE campaign_id = ? AND status IN ('approved','active')
+                    """,
+                    (now, campaign_id),
+                )
+                revision_number = int(connection.execute(
+                    "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM commercial_campaign_configuration_revisions WHERE campaign_id = ?",
+                    (campaign_id,),
+                ).fetchone()[0])
+                revision_id = new_id("cfgrev")
+                connection.execute(
+                    """
+                    INSERT INTO commercial_campaign_configuration_revisions (
+                        revision_id, campaign_id, revision_number, status,
+                        configuration_json, configuration_hash,
+                        resolved_configuration_json, resolved_configuration_hash,
+                        origin_trace_json, change_summary, created_by, created_at,
+                        validated_at, approved_at, activated_at
+                    ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision_id, campaign_id, revision_number,
+                        canonical_json, configuration_hash, canonical_json, configuration_hash,
+                        origin_json, "canonical campaign execution lifecycle", approved_by,
+                        now, now, now, now,
+                    ),
+                )
+                snapshot_id = new_id("cfgsnap")
+                connection.execute(
+                    """
+                    INSERT INTO commercial_execution_configuration_snapshots (
+                        snapshot_id, campaign_id, revision_id, approval_id,
+                        configuration_json, configuration_hash, origin_trace_json,
+                        created_at, created_by, locked_at, consumed_at
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        snapshot_id, campaign_id, revision_id, canonical_json,
+                        configuration_hash, origin_json, now, approved_by, now,
+                    ),
+                )
+                current = connection.execute(
+                    "SELECT * FROM commercial_campaign_configuration_revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                snapshot = connection.execute(
+                    "SELECT * FROM commercial_execution_configuration_snapshots WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+            connection.execute(
+                """
+                UPDATE commercial_delivery_jobs SET
+                    configuration_revision_id = ?,
+                    execution_snapshot_id = ?,
+                    configuration_snapshot_hash = ?,
+                    updated_at = ?
+                WHERE campaign_id = ? AND status IN ('queued','assigned')
+                """,
+                (current["revision_id"], snapshot["snapshot_id"], configuration_hash, now, campaign_id),
+            )
+            connection.execute(
+                "UPDATE commercial_campaigns SET lifecycle_stage = 'configuration_ready', updated_at = ? WHERE id = ?",
+                (now, campaign_id),
+            )
+            connection.commit()
+            return {
+                "revision": dict(current),
+                "snapshot": dict(snapshot),
+                "reused": reused,
+            }
+
     def assign_snapshot_to_campaign_jobs(self, campaign_id: str, snapshot: dict[str, Any]) -> int:
         with self.connection() as connection:
             cursor = connection.execute(
@@ -663,6 +1181,23 @@ class CommercialQueueRepository:
                 (campaign_id,),
             ).fetchall()
             return {str(row["phone_normalized"]): str(row["id"]) for row in rows}
+
+    def get_campaign_phone_state_map(self, campaign_id: str) -> dict[str, dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT recipient.phone_normalized, recipient.id AS recipient_id, job.status AS job_status,
+                          job.last_error_code, job.live_execution_blocked, job.block_reason,
+                          recipient.input_provenance_status
+                   FROM commercial_recipients recipient
+                   LEFT JOIN commercial_delivery_jobs job ON job.recipient_id = recipient.id
+                   WHERE recipient.campaign_id = ?
+                   ORDER BY job.created_at DESC""",
+                (campaign_id,),
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            result.setdefault(str(row["phone_normalized"]), dict(row))
+        return result
 
     def get_or_create_global_contact(self, normalized_phone: str) -> dict[str, Any]:
         now = utc_now()
@@ -699,6 +1234,54 @@ class CommercialQueueRepository:
                 raise
             return self.get_global_contact(str(record["id"])) or record
 
+    def get_or_create_stable_contact_mapping(self, normalized_phone: str, preferred_display_name: str | None = None) -> dict[str, Any]:
+        """Atomically allocate the process-independent Bale-NNNNNN mapping."""
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM commercial_global_contacts WHERE normalized_phone = ?",
+                (normalized_phone,),
+            ).fetchone()
+            preferred = str(preferred_display_name or "").strip()
+            preferred_sequence = int(preferred.split("-")[-1]) if preferred.startswith("Bale-") and preferred.split("-")[-1].isdigit() else None
+            if preferred:
+                conflict = connection.execute(
+                    """SELECT normalized_phone FROM commercial_global_contacts
+                       WHERE (stable_display_name = ? OR sequence_number = ?)
+                         AND normalized_phone != ? LIMIT 1""",
+                    (preferred, preferred_sequence, normalized_phone),
+                ).fetchone()
+                if conflict is not None:
+                    # The JSON mirror can lag the authoritative database. Never copy
+                    # its stale name onto another phone; allocate a fresh sequence.
+                    preferred = ""
+                    preferred_sequence = None
+            if row is None:
+                sequence = preferred_sequence or int(connection.execute(
+                    "SELECT COALESCE(MAX(sequence_number), 0) + 1 AS next_sequence FROM commercial_global_contacts"
+                ).fetchone()["next_sequence"])
+                connection.execute(
+                    """INSERT INTO commercial_global_contacts
+                       (id, normalized_phone, stable_display_name, sequence_number, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (new_id("global_contact"), normalized_phone, preferred or f"Bale-{sequence:06d}", sequence, now, now),
+                )
+                row = connection.execute(
+                    "SELECT * FROM commercial_global_contacts WHERE normalized_phone = ?", (normalized_phone,)
+                ).fetchone()
+            elif not row["stable_display_name"]:
+                sequence = preferred_sequence or int(connection.execute(
+                    "SELECT COALESCE(MAX(sequence_number), 0) + 1 AS next_sequence FROM commercial_global_contacts"
+                ).fetchone()["next_sequence"])
+                connection.execute(
+                    "UPDATE commercial_global_contacts SET stable_display_name=?, sequence_number=?, updated_at=? WHERE id=?",
+                    (preferred or f"Bale-{sequence:06d}", sequence, now, row["id"]),
+                )
+                row = connection.execute("SELECT * FROM commercial_global_contacts WHERE id=?", (row["id"],)).fetchone()
+            connection.commit()
+        return dict(row)
+
     def get_global_contact_by_phone(self, normalized_phone: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             return row_to_dict(
@@ -727,6 +1310,53 @@ class CommercialQueueRepository:
     def get_global_contact(self, global_contact_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             return row_to_dict(connection.execute("SELECT * FROM commercial_global_contacts WHERE id = ?", (global_contact_id,)).fetchone())
+
+    def get_account_contact_proof(self, account_id: str, mapping_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            return row_to_dict(connection.execute(
+                "SELECT * FROM bale_account_contact_proofs WHERE account_id=? AND mapping_id=?",
+                (account_id, mapping_id),
+            ).fetchone())
+
+    def upsert_account_contact_proof(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        record = {
+            "id": payload.get("id") or new_id("contact_proof"),
+            "account_id": payload["account_id"], "mapping_id": payload["mapping_id"],
+            "binding_id": payload.get("binding_id"), "normalized_phone": payload.get("normalized_phone"),
+            "recipient_display_name": payload.get("recipient_display_name"),
+            "preparation_status": payload.get("preparation_status") or "not_prepared",
+            "verification_status": payload.get("verification_status") or "unverified",
+            "verification_method": payload.get("verification_method"),
+            "prepared_at": payload.get("prepared_at"), "verified_at": payload.get("verified_at"),
+            "profile_identity": payload.get("profile_identity"), "browser_pid": payload.get("browser_pid"),
+            "last_successful_step": payload.get("last_successful_step"),
+            "failure_evidence_json": json.dumps(payload.get("failure_evidence"), ensure_ascii=False) if payload.get("failure_evidence") is not None else None,
+            "created_at": payload.get("created_at") or now, "updated_at": now,
+        }
+        with self.connection() as connection:
+            connection.execute(
+                """INSERT INTO bale_account_contact_proofs
+                   (id,account_id,mapping_id,binding_id,normalized_phone,recipient_display_name,
+                    preparation_status,verification_status,verification_method,prepared_at,verified_at,
+                    profile_identity,browser_pid,last_successful_step,failure_evidence_json,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(account_id,mapping_id) DO UPDATE SET
+                    binding_id=excluded.binding_id, normalized_phone=excluded.normalized_phone,
+                    recipient_display_name=excluded.recipient_display_name,
+                    preparation_status=excluded.preparation_status, verification_status=excluded.verification_status,
+                    verification_method=excluded.verification_method, prepared_at=excluded.prepared_at,
+                    verified_at=excluded.verified_at, profile_identity=excluded.profile_identity,
+                    browser_pid=excluded.browser_pid, last_successful_step=excluded.last_successful_step,
+                    failure_evidence_json=excluded.failure_evidence_json, updated_at=excluded.updated_at""",
+                tuple(record[key] for key in (
+                    "id","account_id","mapping_id","binding_id","normalized_phone","recipient_display_name",
+                    "preparation_status","verification_status","verification_method","prepared_at","verified_at",
+                    "profile_identity","browser_pid","last_successful_step","failure_evidence_json","created_at","updated_at"
+                )),
+            )
+            connection.commit()
+        return self.get_account_contact_proof(str(record["account_id"]), str(record["mapping_id"])) or record
 
     def count_global_contacts(self) -> int:
         with self.connection() as connection:
@@ -1823,6 +2453,40 @@ class CommercialQueueRepository:
             connection.commit()
         return self.get_recipient(recipient_id)
 
+    def persist_recipient_display_name(self, recipient_id: str, display_name: str) -> dict[str, Any] | None:
+        """Persist the canonical contact name everywhere a delivery plan can read it."""
+        name = str(display_name or "").strip()
+        if not name:
+            raise ValueError("recipient_display_name_required")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            recipient = connection.execute(
+                "SELECT id, display_name, stable_display_name FROM commercial_recipients WHERE id = ?",
+                (recipient_id,),
+            ).fetchone()
+            if recipient is None:
+                connection.rollback()
+                return None
+            existing = str(recipient["stable_display_name"] or recipient["display_name"] or "").strip()
+            if existing and existing != name:
+                connection.rollback()
+                raise ValueError("recipient_display_name_mapping_conflict")
+            connection.execute(
+                "UPDATE commercial_recipients SET display_name = ?, stable_display_name = ?, updated_at = ? WHERE id = ?",
+                (name, name, now, recipient_id),
+            )
+            connection.execute(
+                "UPDATE commercial_delivery_jobs SET display_name = ? WHERE recipient_id = ? AND (display_name IS NULL OR TRIM(display_name) = '')",
+                (name, recipient_id),
+            )
+            connection.execute(
+                "UPDATE commercial_platform_runs SET stable_display_name = ?, updated_at = ? WHERE recipient_id = ? AND (stable_display_name IS NULL OR TRIM(stable_display_name) = '')",
+                (name, now, recipient_id),
+            )
+            connection.commit()
+        return self.get_recipient(recipient_id)
+
     def update_job_authorization_metadata(self, job_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
             "recipient_origin", "synthetic_test_data", "live_execution_authorized",
@@ -2068,6 +2732,64 @@ class CommercialQueueRepository:
                 (campaign_id, final_review_hash),
             ).fetchone())
 
+    def persist_campaign_final_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        review_token = str(payload.get("review_token") or new_id("review"))
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO commercial_campaign_final_reviews (
+                    review_token, campaign_id, campaign_version, validation_hash,
+                    final_review_hash, approved, blocking_errors_json, review_json,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, final_review_hash) DO UPDATE SET
+                    campaign_version = excluded.campaign_version,
+                    validation_hash = excluded.validation_hash,
+                    approved = excluded.approved,
+                    blocking_errors_json = excluded.blocking_errors_json,
+                    review_json = excluded.review_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    review_token,
+                    payload["campaign_id"],
+                    payload["campaign_version"],
+                    payload["validation_hash"],
+                    payload["final_review_hash"],
+                    int(bool(payload.get("approved"))),
+                    json.dumps(payload.get("blocking_errors") or [], ensure_ascii=False),
+                    json.dumps(payload.get("review") or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            if bool(payload.get("approved")):
+                connection.execute(
+                    "UPDATE commercial_campaigns SET lifecycle_stage = 'reviewed', updated_at = ? WHERE id = ? AND status = 'draft'",
+                    (now, payload["campaign_id"]),
+                )
+            connection.commit()
+            row = connection.execute(
+                """
+                SELECT * FROM commercial_campaign_final_reviews
+                WHERE campaign_id = ? AND final_review_hash = ?
+                """,
+                (payload["campaign_id"], payload["final_review_hash"]),
+            ).fetchone()
+        return row_to_dict(row) or {}
+
+    def get_campaign_final_review(self, campaign_id: str, review_token: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            return row_to_dict(connection.execute(
+                """
+                SELECT * FROM commercial_campaign_final_reviews
+                WHERE campaign_id = ? AND review_token = ?
+                """,
+                (campaign_id, review_token),
+            ).fetchone())
+
     def create_execution_authorization(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = payload.get("created_at") or utc_now()
         record = {
@@ -2203,6 +2925,45 @@ class CommercialQueueRepository:
                 (campaign_id,),
             ).fetchall()
             return {str(row["validation_status"]): int(row["count"]) for row in rows}
+
+    def campaign_recipient_delivery_audit(self, campaign_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            recipient_rows = connection.execute(
+                """
+                SELECT recipient.*, job.id AS existing_job_id,
+                       job.status AS existing_job_status,
+                       job.live_execution_blocked AS job_live_execution_blocked,
+                       job.block_reason AS job_block_reason
+                FROM commercial_recipients AS recipient
+                LEFT JOIN commercial_delivery_jobs AS job
+                  ON job.campaign_id = recipient.campaign_id
+                 AND job.recipient_id = recipient.id
+                WHERE recipient.campaign_id = ?
+                ORDER BY recipient.created_at, recipient.id
+                """,
+                (campaign_id,),
+            ).fetchall()
+            import_row = connection.execute(
+                """
+                SELECT
+                    COALESCE(SUM(submitted_count), 0) AS uploaded_row_count,
+                    COALESCE(SUM(invalid_count), 0) AS invalid_count,
+                    COALESCE(SUM(duplicate_count), 0) AS duplicate_count,
+                    COALESCE(SUM(blocked_count), 0) AS blocked_count,
+                    COALESCE(SUM(opted_out_count), 0) AS opted_out_count
+                FROM commercial_recipient_import_batches
+                WHERE campaign_id = ?
+                """,
+                (campaign_id,),
+            ).fetchone()
+        return {
+            "recipients": [dict(row) for row in recipient_rows],
+            "uploaded_row_count": int(import_row["uploaded_row_count"] or 0),
+            "invalid_count": int(import_row["invalid_count"] or 0),
+            "duplicate_count": int(import_row["duplicate_count"] or 0),
+            "blocked_count": int(import_row["blocked_count"] or 0),
+            "opted_out_count": int(import_row["opted_out_count"] or 0),
+        }
 
     def campaign_has_importing_batch(self, campaign_id: str) -> bool:
         with self.connection() as connection:
@@ -2430,7 +3191,7 @@ class CommercialQueueRepository:
                     "attempt_number": attempt_number,
                     "previous_job_id": previous_job_id,
                     "adapter_mode": payload.get("mode") or "mock_only",
-                    "dry_run": False,
+                    "execution_mode": payload.get("mode") or "mock_only",
                     "timeout_policy": payload.get("timeout_policy") or {},
                 }
                 connection.execute(
@@ -2640,7 +3401,9 @@ class CommercialQueueRepository:
         active = sum(int(counts.get(status, 0)) for status in ["queued", "assigned", "running"])
         terminal = sum(int(counts.get(status, 0)) for status in ["succeeded", "failed", "skipped", "cancelled"])
         if active == 0 and terminal > 0:
-            return self.update_campaign(campaign_id, {"status": "completed", "completed_at": utc_now()})
+            failed_only = int(counts.get("failed", 0)) > 0 and int(counts.get("succeeded", 0)) == 0
+            terminal_status = "failed" if failed_only else "completed"
+            return self.update_campaign(campaign_id, {"status": terminal_status, "lifecycle_stage": terminal_status, "completed_at": utc_now()})
         return campaign
 
     def get_job_with_recipient(self, job_id: str) -> dict[str, Any] | None:
@@ -2652,6 +3415,7 @@ class CommercialQueueRepository:
                     recipient.phone_raw AS recipient_phone_raw,
                     recipient.phone_normalized AS recipient_phone_normalized,
                     recipient.display_name AS recipient_display_name,
+                    recipient.stable_display_name AS recipient_stable_display_name,
                     recipient.recipient_origin AS recipient_recipient_origin,
                     recipient.synthetic_test_data AS recipient_synthetic_test_data,
                     recipient.live_execution_authorized AS recipient_live_execution_authorized,
@@ -2690,6 +3454,16 @@ class CommercialQueueRepository:
                 ).fetchone()
             )
 
+    def active_job_counts_by_account(self) -> dict[str, int]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT account_id, COUNT(*) AS count
+                   FROM commercial_delivery_jobs
+                   WHERE account_id IS NOT NULL AND status IN ('assigned','running')
+                   GROUP BY account_id"""
+            ).fetchall()
+        return {str(row["account_id"]): int(row["count"]) for row in rows}
+
     def assign_queued_jobs_atomic(
         self,
         account_id: str,
@@ -2699,13 +3473,26 @@ class CommercialQueueRepository:
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
+        # Concurrency is account concurrency.  A worker may never reserve a
+        # batch behind one account; the database transaction below owns the
+        # single active slot for that account.
+        limit = 1
         now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            reservation = None
+            if campaign_id:
+                reservation = connection.execute(
+                    """
+                    SELECT * FROM commercial_campaign_capacity_reservations
+                    WHERE campaign_id = ?
+                    """,
+                    (campaign_id,),
+                ).fetchone()
             active = connection.execute(
                 """
                 SELECT id FROM commercial_delivery_jobs
-                WHERE account_id = ? AND status = 'running'
+                WHERE account_id = ? AND status IN ('assigned', 'running')
                 LIMIT 1
                 """,
                 (account_id,),
@@ -2753,6 +3540,14 @@ class CommercialQueueRepository:
                 f"SELECT * FROM commercial_delivery_jobs WHERE id IN ({placeholders}) ORDER BY priority DESC, scheduled_at IS NOT NULL ASC, scheduled_at ASC, created_at ASC",
                 tuple(job_ids),
             ).fetchall()
+            if reservation is not None:
+                consumed = len(assigned)
+                logger.info(
+                    "[ACCOUNT_ASSIGNMENT] campaign_id=%s account_id=%s assigned_count=%s reservation_is_planning_only=true",
+                    campaign_id,
+                    account_id,
+                    consumed,
+                )
             for assigned_row in assigned:
                 if assigned_row["status"] != "assigned" or not assigned_row["platform_run_id"]:
                     continue
@@ -2803,6 +3598,51 @@ class CommercialQueueRepository:
             )
             self.refresh_campaign_counts(job["campaign_id"])
         return assigned_jobs
+
+    def claim_exact_campaign_round_atomic(
+        self, campaign_id: str, account_ids: list[str], source_channel_uid: str
+    ) -> list[dict[str, Any]]:
+        """Bind one queued job to every distinct account, or commit nothing."""
+        distinct_accounts = list(dict.fromkeys(str(value) for value in account_ids if str(value)))
+        if len(distinct_accounts) != len(account_ids) or not distinct_accounts:
+            raise ValueError("exact_round_accounts_not_distinct")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            placeholders = ",".join("?" for _ in distinct_accounts)
+            active = connection.execute(
+                f"SELECT account_id FROM commercial_delivery_jobs WHERE account_id IN ({placeholders}) AND status IN ('assigned','running')",
+                tuple(distinct_accounts),
+            ).fetchall()
+            if active:
+                connection.rollback()
+                raise ValueError("exact_round_account_already_active")
+            jobs = connection.execute(
+                f"""SELECT job.* FROM commercial_delivery_jobs AS job
+                    JOIN commercial_recipients AS recipient ON recipient.id=job.recipient_id
+                    JOIN commercial_recipient_input_manifests AS manifest ON manifest.manifest_id=recipient.input_manifest_id
+                    WHERE job.campaign_id=? AND job.status='queued' AND {queue_claim_eligibility_where()}
+                    ORDER BY job.priority DESC, job.scheduled_at IS NOT NULL ASC,
+                             job.scheduled_at ASC, job.created_at ASC LIMIT ?""",
+                (campaign_id, len(distinct_accounts)),
+            ).fetchall()
+            if len(jobs) != len(distinct_accounts):
+                connection.rollback()
+                raise ValueError("exact_round_insufficient_claimable_jobs")
+            claimed: list[dict[str, Any]] = []
+            for account_id, job in zip(distinct_accounts, jobs, strict=True):
+                cursor = connection.execute(
+                    """UPDATE commercial_delivery_jobs SET account_id=?, status='assigned',
+                              claimed_at=?, source_channel_uid=COALESCE(source_channel_uid,?), updated_at=?
+                       WHERE id=? AND status='queued'""",
+                    (account_id, now, source_channel_uid, now, job["id"]),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    raise ValueError("exact_round_claim_conflict")
+                claimed.append({**dict(job), "account_id": account_id, "status": "assigned", "claimed_at": now})
+            connection.commit()
+        return claimed
 
     def quarantine_ineligible_queued_jobs(self, campaign_id: str | None = None) -> int:
         now = utc_now()
@@ -3133,8 +3973,73 @@ class CommercialQueueRepository:
                 }
             platform_run = connection.execute("SELECT * FROM commercial_platform_runs WHERE id = ?", (job_dict.get("platform_run_id"),)).fetchone()
             if platform_run is None:
-                connection.rollback()
-                return {"applied": False, "reason": "platform_run_not_found", "job": job_dict}
+                # Legacy campaign jobs predate controlled execution batches and
+                # therefore have no platform-run projection.  Keep their
+                # ordinary worker results on the old path, but allow the same
+                # tightly-scoped verified reconciliation for a persisted
+                # `confirm_uncertain` manual-review job.
+                legacy_uncertain_reconciliation = (
+                    outcome == "sent"
+                    and str(job_dict.get("status") or "") == "failed"
+                    and str(job_dict.get("last_error_code") or "") == "confirm_uncertain"
+                    and bool(job_dict.get("manual_review_required"))
+                    and not job_dict.get("result_applied_at")
+                    and result.get("reconciliation_verified") is True
+                )
+                if not legacy_uncertain_reconciliation:
+                    connection.rollback()
+                    return {"applied": False, "reason": "platform_run_not_found", "job": job_dict}
+                connection.execute(
+                    """
+                    UPDATE commercial_delivery_jobs SET
+                        status = 'succeeded', completed_at = ?,
+                        last_error_code = NULL, last_error_message = NULL,
+                        result_success = 1,
+                        verified_forwarded_recipient_count = ?, forward_verified = 1,
+                        diagnostics_consistent = 1, retryable = 0,
+                        manual_review_required = 0, safe_to_requeue = 0,
+                        failed_component = 'delivery_reconciliation',
+                        failed_step = ?, trusted_result_key = ?, result_applied_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'failed' AND last_error_code = 'confirm_uncertain'
+                    """,
+                    (
+                        now,
+                        int(result.get("verified_forwarded_recipient_count") or 1),
+                        result.get("failed_step") or "reconcile_uncertain_delivery_result",
+                        trusted_result_key,
+                        now,
+                        now,
+                        job_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE commercial_execution_attempts SET
+                        status = 'succeeded', trusted_result_key = ?, outcome = 'sent',
+                        error_code = NULL, error_category = NULL, retryable = 0,
+                        finished_at = ?, diagnostics_json = ?, updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        trusted_result_key,
+                        now,
+                        json.dumps(result.get("diagnostics") or {}, ensure_ascii=False),
+                        now,
+                        job_id,
+                    ),
+                )
+                connection.commit()
+                updated_legacy_job = self.get_job(job_id) or {}
+                if updated_legacy_job:
+                    self.refresh_campaign_counts(str(updated_legacy_job["campaign_id"]))
+                return {
+                    "applied": True,
+                    "idempotent": False,
+                    "outcome": "sent",
+                    "reconciled_uncertain_delivery": True,
+                    "job": updated_legacy_job,
+                }
             platform_dict = dict(platform_run)
             if platform_dict.get("delivery_job_id") != job_id:
                 connection.execute(
@@ -3166,7 +4071,26 @@ class CommercialQueueRepository:
                 connection.commit()
                 return {"applied": False, "reason": "stale_attempt_result", "job": job_dict}
             previous_outcome = str(platform_dict["outcome"])
-            if previous_outcome in TERMINAL_PLATFORM_OUTCOMES and previous_outcome != outcome:
+            # `confirm_uncertain` is deliberately terminal for scheduling: it
+            # cannot be retried or reassigned until an external delivery
+            # reconciliation has supplied a durable proof.  It is not,
+            # however, terminal for that one reconciliation result.  Permit
+            # only a verified transition to `sent`; every other terminal
+            # platform outcome remains immutable.
+            reconciles_uncertain_delivery = (
+                previous_outcome == "failed_terminal"
+                and outcome == "sent"
+                and str(job_dict.get("status") or "") == "failed"
+                and str(job_dict.get("last_error_code") or "") == "confirm_uncertain"
+                and bool(job_dict.get("manual_review_required"))
+                and not job_dict.get("result_applied_at")
+                and result.get("reconciliation_verified") is True
+            )
+            if (
+                previous_outcome in TERMINAL_PLATFORM_OUTCOMES
+                and previous_outcome != outcome
+                and not reconciles_uncertain_delivery
+            ):
                 connection.rollback()
                 return {"applied": False, "reason": "terminal_platform_outcome_immutable", "job": job_dict}
             job_status = "succeeded" if outcome == "sent" else ("cancelled" if outcome == "cancelled" else "failed")
@@ -3184,6 +4108,8 @@ class CommercialQueueRepository:
                     forward_verified = ?,
                     diagnostics_consistent = 1,
                     retryable = ?,
+                    manual_review_required = CASE WHEN ? = 1 THEN 0 ELSE manual_review_required END,
+                    safe_to_requeue = CASE WHEN ? = 1 THEN 0 ELSE safe_to_requeue END,
                     failed_component = 'worker',
                     failed_step = ?,
                     trusted_result_key = ?,
@@ -3200,6 +4126,8 @@ class CommercialQueueRepository:
                     int(result.get("verified_forwarded_recipient_count") or (1 if success else 0)),
                     int(success),
                     int(retryable),
+                    int(success),
+                    int(success),
                     result.get("failed_step") or "apply_trusted_adapter_result",
                     trusted_result_key,
                     now,
@@ -3231,11 +4159,11 @@ class CommercialQueueRepository:
                 platform_run=platform_run,
                 previous_status=previous_outcome,
                 new_status=outcome,
-                event_type="trusted_worker_result_applied",
+                event_type="uncertain_delivery_reconciled" if reconciles_uncertain_delivery else "trusted_worker_result_applied",
                 job_id=job_id,
                 actor="worker",
-                source="controlled_execution",
-                reason="adapter_result_received",
+                source=str(result.get("reconciliation_source") or "controlled_execution"),
+                reason="external_delivery_reconciliation" if reconciles_uncertain_delivery else "adapter_result_received",
                 error_code=result.get("error_code"),
                 error_message=result.get("error_message"),
                 metadata={
@@ -3244,6 +4172,7 @@ class CommercialQueueRepository:
                     "error_category": result.get("error_category"),
                     "retryable": retryable,
                     "remote_message_id": result.get("remote_message_id"),
+                    "reconciles_uncertain_delivery": reconciles_uncertain_delivery,
                     "diagnostics": result.get("diagnostics") or {},
                 },
             )
@@ -3408,6 +4337,317 @@ class CommercialQueueRepository:
                 self.refresh_campaign_counts(row["campaign_id"])
         return requeued
 
+    def defer_assigned_jobs_at_safe_test_boundary(self, account_id: str, job_ids: list[str]) -> list[dict[str, Any]]:
+        """Return claimed test jobs to the queue before any contact/browser activity.
+
+        This is deliberately narrow and is called only by the double-gated
+        isolated worker boundary in the service.  It does not classify a
+        delivery failure: no recipient selection, contact creation, browser
+        launch, or send attempt has occurred.  The durable event recorded
+        below is the test evidence; the job itself remains normally retryable.
+        """
+        requested_ids = list(dict.fromkeys(str(job_id) for job_id in job_ids if str(job_id)))
+        if not requested_ids:
+            return []
+        now = utc_now()
+        placeholders = ",".join("?" for _ in requested_ids)
+        deferred: list[dict[str, Any]] = []
+        with self.connection() as connection:
+            rows = [dict(row) for row in connection.execute(
+                f"""
+                SELECT * FROM commercial_delivery_jobs
+                WHERE account_id = ? AND status = 'assigned' AND id IN ({placeholders})
+                """,
+                (account_id, *requested_ids),
+            ).fetchall()]
+            for row in rows:
+                connection.execute(
+                    """
+                    UPDATE commercial_delivery_jobs SET
+                        status = 'queued', account_id = NULL, claimed_at = NULL,
+                        started_at = NULL, completed_at = NULL,
+                        last_error_code = NULL, last_error_message = NULL,
+                        result_success = NULL, verified_forwarded_recipient_count = NULL,
+                        forward_verified = NULL, diagnostics_consistent = NULL,
+                        error_domain = NULL, severity = NULL, retryable = 1,
+                        account_blocking = NULL, campaign_blocking = NULL,
+                        manual_review_required = 0, failed_component = NULL,
+                        failed_step = NULL, safe_to_continue_round = 1,
+                        safe_to_requeue = 1, updated_at = ?
+                    WHERE id = ? AND account_id = ? AND status = 'assigned'
+                    """,
+                    (now, row["id"], account_id),
+                )
+                if row.get("platform_run_id"):
+                    platform_row = connection.execute(
+                        "SELECT * FROM commercial_platform_runs WHERE id = ?",
+                        (row["platform_run_id"],),
+                    ).fetchone()
+                    if platform_row is not None and str(platform_row["outcome"]) not in TERMINAL_PLATFORM_OUTCOMES:
+                        connection.execute(
+                            """
+                            UPDATE commercial_platform_runs SET
+                                outcome = 'queued', last_error_code = NULL,
+                                last_error_message = NULL, started_at = NULL,
+                                completed_at = NULL, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, row["platform_run_id"]),
+                        )
+                        self._create_platform_run_event(
+                            connection,
+                            platform_run=platform_row,
+                            previous_status=str(platform_row["outcome"]),
+                            new_status="queued",
+                            event_type="test_worker_boundary_requeued",
+                            job_id=str(row["id"]),
+                            actor="test_runtime",
+                            source="commercial_queue",
+                            reason="test_delivery_boundary_reached_before_contact_or_browser",
+                        )
+                        self._refresh_campaign_recipient_run_aggregate(connection, str(platform_row["campaign_recipient_run_id"]))
+                if row.get("execution_batch_id"):
+                    connection.execute(
+                        """
+                        UPDATE commercial_execution_attempts SET
+                            status = 'queued', started_at = NULL, finished_at = NULL,
+                            outcome = NULL, error_code = NULL, error_category = NULL,
+                            retryable = NULL, diagnostics_json = NULL, updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (now, row["id"]),
+                    )
+                    self._refresh_execution_batch_aggregate(connection, str(row["execution_batch_id"]))
+                deferred.append(row)
+            connection.commit()
+        for row in deferred:
+            self.create_job_event(
+                {
+                    "job_id": row["id"],
+                    "campaign_id": row["campaign_id"],
+                    "account_id": account_id,
+                    "recipient_id": row["recipient_id"],
+                    "event_type": "test_safe_worker_boundary_reached",
+                    "component": "worker",
+                    "step_name": "test_safe_worker_boundary",
+                    "status": "queued",
+                    "message": "Isolated test stopped before contact preparation, browser launch, or delivery",
+                    "error_code": "test_delivery_boundary_reached",
+                    "retryable": True,
+                    "diagnostics": {
+                        "test_safe_boundary": True,
+                        "contact_created": False,
+                        "browser_launched": False,
+                        "browser_launch_count": 0,
+                        "adapter_called": False,
+                        "recipient_click_count": 0,
+                        "confirm_click_count": 0,
+                        "final_send_invoked": False,
+                        "safe_to_requeue": True,
+                    },
+                }
+            )
+        for campaign_id in sorted({str(row["campaign_id"]) for row in deferred}):
+            self.refresh_campaign_counts(campaign_id)
+        return deferred
+
+    def requeue_pre_browser_runtime_context_failures(self, campaign_id: str | None = None) -> dict[str, Any]:
+        """Requeue only proven no-browser/no-send context-validation failures."""
+        filters = ["status = 'failed'", "last_error_code = 'missing_runtime_context'", "COALESCE(verified_forwarded_recipient_count, 0) = 0", "COALESCE(forward_verified, 0) = 0"]
+        params: list[Any] = []
+        if campaign_id:
+            filters.append("campaign_id = ?")
+            params.append(campaign_id)
+        with self.connection() as connection:
+            candidates = [dict(row) for row in connection.execute(
+                f"SELECT * FROM commercial_delivery_jobs WHERE {' AND '.join(filters)}",
+                tuple(params),
+            ).fetchall()]
+            safe_ids: list[str] = []
+            for job in candidates:
+                events = [dict(row) for row in connection.execute(
+                    "SELECT event_type, diagnostics_json FROM commercial_job_events WHERE job_id = ? ORDER BY created_at",
+                    (job["id"],),
+                ).fetchall()]
+                if any("browser" in str(event.get("event_type") or "").lower() for event in events):
+                    continue
+                failure_evidence = None
+                for event in events:
+                    if event.get("event_type") != "forward_failed" or not event.get("diagnostics_json"):
+                        continue
+                    try:
+                        diagnostics = json.loads(str(event["diagnostics_json"]))
+                    except (TypeError, ValueError):
+                        continue
+                    result = diagnostics.get("orchestrator_result") or {}
+                    scenario_result = result.get("scenario_result") or {}
+                    final_send_invoked = result.get("final_send_invoked")
+                    if final_send_invoked is None:
+                        final_send_invoked = scenario_result.get("final_send_invoked")
+                    if (
+                        result.get("error_code") == "missing_runtime_context"
+                        and result.get("failed_step") == "validate_context"
+                        and final_send_invoked is False
+                        and int(result.get("confirm_click_count") or 0) == 0
+                        and result.get("source_timeline_detected") is False
+                        and result.get("recipient_resolved") is False
+                    ):
+                        failure_evidence = diagnostics
+                if failure_evidence is not None:
+                    safe_ids.append(str(job["id"]))
+
+            now = utc_now()
+            recovery_events: list[dict[str, Any]] = []
+            for job_id in safe_ids:
+                row = connection.execute(
+                    "SELECT campaign_id, recipient_id, account_id, platform_run_id, execution_batch_id FROM commercial_delivery_jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                connection.execute(
+                    """
+                    UPDATE commercial_delivery_jobs SET
+                        status = 'queued', account_id = NULL, claimed_at = NULL, started_at = NULL,
+                        completed_at = NULL, last_error_code = NULL, last_error_message = NULL,
+                        result_success = NULL, forward_verified = NULL, diagnostics_consistent = NULL,
+                        error_domain = NULL, severity = NULL, retryable = NULL, account_blocking = NULL,
+                        campaign_blocking = NULL, manual_review_required = NULL, failed_component = NULL,
+                        failed_step = NULL, safe_to_continue_round = NULL, safe_to_requeue = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, job_id),
+                )
+                if row and row["platform_run_id"]:
+                    connection.execute(
+                        "UPDATE commercial_platform_runs SET outcome = 'queued', last_error_code = NULL, last_error_message = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
+                        (now, row["platform_run_id"]),
+                    )
+                if row and row["execution_batch_id"]:
+                    connection.execute(
+                        "UPDATE commercial_execution_attempts SET status = 'queued', started_at = NULL, finished_at = NULL, outcome = NULL, error_code = NULL, error_category = NULL, retryable = NULL, diagnostics_json = NULL, updated_at = ? WHERE job_id = ?",
+                        (now, job_id),
+                    )
+                if row:
+                    recovery_events.append({
+                        "job_id": job_id,
+                        "campaign_id": row["campaign_id"],
+                        "account_id": row["account_id"],
+                        "recipient_id": row["recipient_id"],
+                        "event_type": "pre_browser_context_failure_requeued",
+                        "component": "recovery",
+                        "step_name": "safe_requeue",
+                        "status": "queued",
+                        "message": "Requeued after proof that runtime context validation failed before browser/send",
+                        "diagnostics": {"browser_launched": False, "final_send_invoked": False},
+                    })
+            connection.commit()
+        for event in recovery_events:
+            self.create_job_event(event)
+        for affected_campaign_id in sorted({str(job["campaign_id"]) for job in candidates if str(job["id"]) in safe_ids}):
+            self.refresh_campaign_counts(affected_campaign_id)
+        return {"candidate_count": len(candidates), "requeued_count": len(safe_ids), "requeued_job_ids": safe_ids}
+
+    def recover_failed_jobs_without_send(self, campaign_id: str, job_ids: list[str]) -> dict[str, Any]:
+        """Requeue existing failed jobs only when persisted evidence proves no send attempt."""
+        requested_ids = list(dict.fromkeys(str(value) for value in job_ids if str(value)))
+        classifications: list[dict[str, Any]] = []
+        requeued_ids: list[str] = []
+        requeued_jobs: dict[str, dict[str, Any]] = {}
+        now = utc_now()
+        with self.connection() as connection:
+            for job_id in requested_ids:
+                row = connection.execute(
+                    "SELECT * FROM commercial_delivery_jobs WHERE id = ? AND campaign_id = ?",
+                    (job_id, campaign_id),
+                ).fetchone()
+                if row is None:
+                    classifications.append({"job_id": job_id, "classification": "not_found", "safe_to_requeue": False})
+                    continue
+                job = dict(row)
+                if job["status"] == "queued":
+                    classifications.append({"job_id": job_id, "classification": "already_requeued", "safe_to_requeue": True})
+                    continue
+                event = connection.execute(
+                    "SELECT diagnostics_json FROM commercial_job_events WHERE job_id = ? AND event_type = 'forward_failed' ORDER BY created_at DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                try:
+                    diagnostics = json.loads(str(event["diagnostics_json"] or "{}")) if event else {}
+                except (TypeError, ValueError):
+                    diagnostics = {}
+                platform = connection.execute(
+                    "SELECT outcome FROM commercial_platform_runs WHERE id = ?",
+                    (job.get("platform_run_id"),),
+                ).fetchone() if job.get("platform_run_id") else None
+                attempts = [
+                    str(item["status"])
+                    for item in connection.execute(
+                        "SELECT status FROM commercial_execution_attempts WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchall()
+                ]
+                evidence = classify_failed_delivery_recovery_evidence(
+                    job,
+                    diagnostics,
+                    platform_outcome=str(platform["outcome"]) if platform else None,
+                    attempt_statuses=attempts,
+                )
+                classifications.append({"job_id": job_id, **evidence})
+                if not evidence["safe_to_requeue"]:
+                    continue
+                cursor = connection.execute(
+                    """
+                    UPDATE commercial_delivery_jobs SET
+                        status = 'queued', account_id = NULL, claimed_at = NULL, started_at = NULL,
+                        completed_at = NULL, last_error_code = NULL, last_error_message = NULL,
+                        -- A durable pre-send proof means this worker attempt
+                        -- consumed no delivery opportunity.  Restore exactly
+                        -- that claim so a max_attempts=1 job can be retried by
+                        -- a replacement account without masking an actual
+                        -- prior delivery attempt.
+                        attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+                        result_success = NULL, verified_forwarded_recipient_count = NULL,
+                        forward_verified = NULL, diagnostics_consistent = NULL,
+                        error_domain = NULL, severity = NULL, retryable = NULL,
+                        account_blocking = NULL, campaign_blocking = NULL,
+                        manual_review_required = NULL, failed_component = NULL, failed_step = NULL,
+                        safe_to_continue_round = NULL, safe_to_requeue = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'failed'
+                    """,
+                    (now, job_id),
+                )
+                if int(cursor.rowcount or 0) == 1:
+                    requeued_ids.append(job_id)
+                    requeued_jobs[job_id] = job
+                    connection.execute(
+                        "UPDATE commercial_platform_runs SET outcome = 'queued', last_error_code = NULL, last_error_message = NULL, started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
+                        (now, job.get("platform_run_id")),
+                    ) if job.get("platform_run_id") else None
+                    connection.execute(
+                        "UPDATE commercial_execution_attempts SET status = 'queued', started_at = NULL, finished_at = NULL, outcome = NULL, error_code = NULL, error_category = NULL, retryable = NULL, diagnostics_json = NULL, updated_at = ? WHERE job_id = ?",
+                        (now, job_id),
+                    )
+            connection.commit()
+        for job_id in requeued_ids:
+            recovered_job = requeued_jobs[job_id]
+            self.create_job_event({
+                "job_id": job_id, "campaign_id": campaign_id,
+                "recipient_id": recovered_job["recipient_id"], "account_id": recovered_job.get("account_id"),
+                "platform": recovered_job.get("platform"), "event_type": "failed_no_send_job_requeued",
+                "component": "recovery", "step_name": "classify_delivery_uncertainty", "status": "queued",
+                "message": "Requeued after persisted evidence proved no recipient selection or send attempt",
+                "diagnostics": next(item for item in classifications if item["job_id"] == job_id),
+            })
+        if requeued_ids:
+            self.refresh_campaign_counts(campaign_id)
+        return {
+            "requested_count": len(requested_ids),
+            "requeued_count": len(requeued_ids),
+            "requeued_job_ids": requeued_ids,
+            "classifications": classifications,
+        }
+
     def update_account_runtime(self, account_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         current = self.get_account_settings(account_id)
         payload = dict(current or {})
@@ -3457,7 +4697,31 @@ class CommercialQueueRepository:
             row = connection.execute("SELECT COUNT(*) AS count FROM commercial_campaigns WHERE status = ?", (status,)).fetchone()
             return int(row["count"] if row else 0)
 
-    def acquire_worker_lock(self, account_id: str, owner: str, ttl_seconds: int) -> dict[str, Any] | None:
+    def dashboard_aggregates(self) -> dict[str, Any]:
+        """Return dashboard data using three aggregate queries on one connection."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        with self.connection() as connection:
+            job_rows = connection.execute(
+                """SELECT status, COUNT(*) AS count,
+                   SUM(CASE WHEN completed_at >= ? THEN 1 ELSE 0 END) AS today_count
+                   FROM commercial_delivery_jobs GROUP BY status""",
+                (today,),
+            ).fetchall()
+            campaign_rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM commercial_campaigns WHERE deleted_at IS NULL GROUP BY status"
+            ).fetchall()
+            account_row = connection.execute(
+                "SELECT COUNT(*) AS total, SUM(CASE WHEN worker_status='running' THEN 1 ELSE 0 END) AS active FROM commercial_account_settings"
+            ).fetchone()
+        return {
+            "jobs": {str(row["status"]): int(row["count"]) for row in job_rows},
+            "jobs_today": {str(row["status"]): int(row["today_count"] or 0) for row in job_rows},
+            "campaigns": {str(row["status"]): int(row["count"]) for row in campaign_rows},
+            "total_accounts": int(account_row["total"] or 0) if account_row else 0,
+            "active_workers": int(account_row["active"] or 0) if account_row else 0,
+        }
+
+    def acquire_worker_lock(self, account_id: str, owner: str, ttl_seconds: int, *, runtime_owner_id: str | None = None, worker_round_id: str | None = None, process_id: int | None = None) -> dict[str, Any] | None:
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(seconds=max(1, ttl_seconds))).isoformat()
@@ -3474,12 +4738,12 @@ class CommercialQueueRepository:
             connection.execute(
                 """
                 INSERT INTO commercial_account_worker_locks (
-                    account_id, lock_owner, lock_token, active_job_id,
+                    account_id, lock_owner, lock_token, runtime_owner_id, worker_round_id, process_id, active_job_id,
                     acquired_at, heartbeat_at, expires_at
                 )
-                VALUES (?, ?, ?, NULL, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
-                (account_id, owner, token, now, now, expires_at),
+                (account_id, owner, token, runtime_owner_id, worker_round_id, process_id, now, now, expires_at),
             )
             connection.commit()
         return self.get_worker_lock(account_id)
@@ -3641,6 +4905,7 @@ class CommercialQueueRepository:
                 ]),
             )
             for item in items:
+                batch_metadata = metadata or {}
                 record = {
                     "id": item.get("id") or new_id("import_item"),
                     "batch_id": batch_id,
@@ -3648,6 +4913,11 @@ class CommercialQueueRepository:
                     "phone_raw": item["phone_raw"],
                     "phone_normalized": item.get("phone_normalized"),
                     "display_name": item.get("display_name"),
+                    "classification": item.get("classification"),
+                    "source_filename": original_filename,
+                    "source_sheet": batch_metadata.get("selected_sheet"),
+                    "source_row_number": item.get("row_number"),
+                    "original_value": item.get("original_value", item.get("phone_raw")),
                     "validation_status": item["validation_status"],
                     "duplicate_reason": item.get("duplicate_reason"),
                     "duplicate_recipient_id": item.get("duplicate_recipient_id"),
@@ -3662,16 +4932,18 @@ class CommercialQueueRepository:
                     """
                     INSERT INTO commercial_recipient_import_items (
                         id, batch_id, row_number, phone_raw, phone_normalized,
-                        display_name, validation_status, duplicate_reason,
+                        display_name, classification, source_filename, source_sheet,
+                        source_row_number, original_value, validation_status, duplicate_reason,
                         duplicate_recipient_id, error_code, error_message,
                         selected_for_import, created_recipient_id, created_job_id,
                         created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     tuple(record[key] for key in [
                         "id", "batch_id", "row_number", "phone_raw", "phone_normalized",
-                        "display_name", "validation_status", "duplicate_reason",
+                        "display_name", "classification", "source_filename", "source_sheet",
+                        "source_row_number", "original_value", "validation_status", "duplicate_reason",
                         "duplicate_recipient_id", "error_code", "error_message",
                         "selected_for_import", "created_recipient_id", "created_job_id",
                         "created_at",
@@ -3705,6 +4977,14 @@ class CommercialQueueRepository:
         params.extend([limit, offset])
         with self.connection() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+    def set_import_item_stable_mapping(self, item_id: str, display_name: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE commercial_recipient_import_items SET display_name = ? WHERE id = ? AND validation_status = 'valid'",
+                (display_name, item_id),
+            )
+            connection.commit()
 
     def create_recipient_input_manifest(
         self,
@@ -3771,6 +5051,13 @@ class CommercialQueueRepository:
                 """,
                 (campaign_id,),
             ).fetchone())
+
+    def list_active_jobs_by_account(self) -> dict[str, dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM commercial_delivery_jobs WHERE account_id IS NOT NULL AND status IN ('assigned','running')"
+            ).fetchall()
+        return {str(row["account_id"]): dict(row) for row in rows}
 
     def list_recipient_input_manifests(self, campaign_id: str) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -4151,7 +5438,10 @@ class CommercialQueueRepository:
                     skipped_count = ?,
                     cancelled_count = ?,
                     updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND (
+                    total_recipients != ? OR queued_count != ? OR running_count != ? OR
+                    succeeded_count != ? OR failed_count != ? OR skipped_count != ? OR cancelled_count != ?
+                )
                 """,
                 (
                     int(recipient_count),
@@ -4163,6 +5453,13 @@ class CommercialQueueRepository:
                     int(counts.get("cancelled", 0)),
                     utc_now(),
                     campaign_id,
+                    int(recipient_count),
+                    int(counts.get("queued", 0) + counts.get("assigned", 0)),
+                    int(counts.get("running", 0)),
+                    int(counts.get("succeeded", 0)),
+                    int(counts.get("failed", 0)),
+                    int(counts.get("skipped", 0)),
+                    int(counts.get("cancelled", 0)),
                 ),
             )
             connection.commit()

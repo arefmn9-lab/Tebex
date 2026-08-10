@@ -146,7 +146,7 @@ def parse_csv_bytes(
     phone_index, name_index, has_header, headers = _detect_columns(rows, phone_column, display_name_column)
     data_rows = rows[1:] if has_header else rows
     parsed = [
-        ParsedRow(index + 1, row[phone_index].strip() if phone_index < len(row) else "", row[name_index].strip() if name_index is not None and name_index < len(row) else None)
+        ParsedRow(index + (2 if has_header else 1), row[phone_index].strip() if phone_index < len(row) else "", row[name_index].strip() if name_index is not None and name_index < len(row) else None)
         for index, row in enumerate(data_rows[:max_rows])
     ]
     return parsed, {"filename": safe_filename(filename), "columns": headers, "phone_column": headers[phone_index], "display_name_column": headers[name_index] if name_index is not None else None, "header_detected": has_header}
@@ -241,7 +241,7 @@ def parse_xlsx_bytes(
     phone_index, name_index, has_header, headers = _detect_columns(rows, phone_column, display_name_column)
     data_rows = rows[1:] if has_header else rows
     parsed = [
-        ParsedRow(index + 1, row[phone_index].strip() if phone_index < len(row) else "", row[name_index].strip() if name_index is not None and name_index < len(row) else None)
+        ParsedRow(index + (2 if has_header else 1), row[phone_index].strip() if phone_index < len(row) else "", row[name_index].strip() if name_index is not None and name_index < len(row) else None)
         for index, row in enumerate(data_rows[:max_rows])
     ]
     return parsed, {"filename": safe_filename(filename), "sheets": [sheet[0] for sheet in sheets], "selected_sheet": selected[0], "columns": headers, "phone_column": headers[phone_index], "display_name_column": headers[name_index] if name_index is not None else None, "header_detected": has_header}
@@ -252,19 +252,33 @@ def build_preview_items(rows: list[ParsedRow], existing_by_phone: dict[str, str]
     items: list[dict[str, Any]] = []
     for row in rows:
         raw = str(row.phone_raw or "").strip()
-        base = {"row_number": row.row_number, "phone_raw": raw, "display_name": row.display_name or None}
+        base = {"row_number": row.row_number, "phone_raw": raw, "original_value": raw, "display_name": row.display_name or None}
         try:
             normalized = normalize_bale_phone(raw)
         except BaleContactError as exc:
-            items.append({**base, "phone_normalized": None, "validation_status": "invalid", "error_code": exc.error_code, "error_message": str(exc), "selected_for_import": False})
+            items.append({**base, "phone_normalized": None, "validation_status": "invalid", "classification": "invalid_phone", "error_code": exc.error_code, "error_message": str(exc), "selected_for_import": False})
             continue
         if normalized in seen:
-            items.append({**base, "phone_normalized": normalized, "validation_status": "duplicate", "duplicate_reason": "input", "error_code": "duplicate_in_input", "error_message": "Duplicate phone in uploaded input", "selected_for_import": False})
+            items.append({**base, "phone_normalized": normalized, "validation_status": "duplicate", "classification": "duplicate_in_file", "duplicate_reason": "input", "error_code": "duplicate_in_file", "error_message": "Duplicate phone in uploaded input", "selected_for_import": False})
             continue
         if normalized in existing_by_phone:
-            items.append({**base, "phone_normalized": normalized, "validation_status": "duplicate", "duplicate_reason": "campaign", "duplicate_recipient_id": existing_by_phone[normalized], "error_code": "duplicate_in_campaign", "error_message": "Duplicate phone already exists in campaign", "selected_for_import": False})
+            existing = existing_by_phone[normalized]
+            existing_state = existing if isinstance(existing, dict) else {"recipient_id": existing}
+            classification = (
+                "recipient_provenance_unknown"
+                if existing_state.get("input_provenance_status") not in {None, "confirmed_manifest"}
+                or existing_state.get("last_error_code") in {"recipient_provenance_unknown", "recipient_input_manifest_required"}
+                else "blocked"
+                if bool(existing_state.get("live_execution_blocked")) or existing_state.get("job_status") == "skipped"
+                else "already_succeeded"
+                if existing_state.get("job_status") == "succeeded"
+                else "already_queued"
+                if existing_state.get("job_status") in {"queued", "assigned", "running"}
+                else "duplicate_in_campaign"
+            )
+            items.append({**base, "phone_normalized": normalized, "validation_status": "duplicate", "classification": classification, "duplicate_reason": "campaign", "duplicate_recipient_id": existing_state.get("recipient_id"), "error_code": classification, "error_message": "Phone already exists in campaign", "selected_for_import": False})
             seen[normalized] = row.row_number
             continue
         seen[normalized] = row.row_number
-        items.append({**base, "phone_normalized": normalized, "validation_status": "valid", "selected_for_import": True})
+        items.append({**base, "phone_normalized": normalized, "validation_status": "valid", "classification": "valid_ready", "selected_for_import": True})
     return items

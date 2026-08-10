@@ -2,23 +2,21 @@ import fs from "node:fs";
 
 const page = fs.readFileSync(new URL("../src/pages/BaleAccounts.jsx", import.meta.url), "utf8");
 const api = fs.readFileSync(new URL("../src/api/baleOnboarding.js", import.meta.url), "utf8");
+const presentation = fs.readFileSync(new URL("../src/baleAuthPresentation.js", import.meta.url), "utf8");
 
 const checks = [
-  ["dynamic rendering", page.includes("visible.map((account)")],
-  ["search", page.includes('aria-label=\"جستجوی اکانت\"')],
-  ["filter", page.includes('aria-label=\"فیلتر وضعیت\"')],
-  ["pagination", page.includes("pageSize")],
-  ["direct account creation", page.includes("validateAndProvision") && page.includes("provisionBaleAccount")],
-  ["no batch prerequisite", !page.includes("createBaleOnboardingBatch") && !page.includes("listBaleOnboardingBatches") && !page.includes("batch_id")],
-  ["per-account login actions", page.includes("openLogin(account") && page.includes("confirmLogin(account)") && page.includes("closeBrowser(account)")],
-  ["permanent profile result", page.includes("canonical_profile_path") && page.includes("بازکردن Chrome برای ورود")],
-  ["no OTP input", !/<input[^>]+(?:name|id)=[\"'][^\"']*otp/i.test(page) && !/<input[^>]+type=[\"']password/i.test(page)],
-  ["duplicate-click protection", page.includes("disabled={Boolean(busy)}")],
-  ["login polling cleanup", page.includes("window.clearInterval")],
-  ["refresh resume", page.includes("localStorage.getItem") && page.includes("draftStorageKey") && page.includes("sessionStorageKey")],
-  ["disable confirmation", page.includes("window.confirm") && page.includes("disableBaleAccount")],
-  ["backend authoritative refresh", page.includes("await refresh()")],
-  ["controlled authentication API", api.includes("/authentication/open") && !api.includes("open-login")],
+  ["dynamic account rendering", page.includes("visible.map((account)")],
+  ["search and filter", page.includes('aria-label="جستجوی اکانت"') && page.includes('aria-label="فیلتر وضعیت"')],
+  ["account creation remains available", page.includes("validateAndProvision") && page.includes("provisionBaleAccount")],
+  ["normal actions are present on every row", page.includes('className="row-actions account-actions account-primary-actions"') && page.includes('openLogin(account, "login")') && page.includes('openLogin(account, "session_recheck")') && page.includes('runAccountAction(account, "delete_account")')],
+  ["reset is secondary", page.includes("account-more-actions") && page.includes('runAccountAction(account, "reset_profile")')],
+  ["raw runtime details are absent from rows", !page.includes("account.canonical_profile_path") && !page.includes("account.browser_provider") && !page.includes("account.profile_id")],
+  ["internal maintenance controls are not rendered", page.includes("{/*") && page.includes("*/}")],
+  ["compact human statuses", ["checking_session", "session_problem", "busy", "login_required", "ready", "error"].every((name) => presentation.includes(`${name}:`))],
+  ["account errors are operator-facing", page.includes("formatBaleAccountActionError(status") && page.includes("formatBaleAccountActionError(account.last_error)") && presentation.includes("formatBaleAccountActionError")],
+  ["session recheck uses its own endpoint", page.includes('purpose === "session_recheck" ? "/automation/platforms/bale/authentication/session-recheck"') && api.includes("/authentication/session-recheck")],
+  ["per-action polling refreshes canonical state", page.includes("startPolling(account.account_id, result.operation_id, action)") && page.includes("await refresh()")],
+  ["no OTP input", !/<input[^>]+(?:name|id)=["'][^"']*otp/i.test(page) && !/<input[^>]+type=["']password/i.test(page)],
   ["no fixed account slots", !/account_[1-8]\b/.test(page)],
 ];
 

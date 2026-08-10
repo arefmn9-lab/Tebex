@@ -133,6 +133,52 @@ class BaleContactStore:
     def bulk_add_bale_contacts(self, account_id: str, phones: list[str]) -> dict[str, Any]:
         return self.bulk_add_platform_contacts("bale", phones, account_id=account_id, prefix="Bale")
 
+    def ensure_stable_mapping(self, phone: str, display_name: str, account_id: str | None = None) -> dict[str, Any]:
+        """Mirror the database-allocated canonical mapping without renumbering it."""
+        normalized = normalize_bale_phone(phone)
+        expected = str(display_name or "").strip()
+        match = re.fullmatch(r"Bale-(\d{6,})", expected)
+        if not match:
+            raise BaleContactError("invalid_stable_display_name", "Canonical Bale display name is invalid")
+        with self._lock:
+            records = [self._normalize_record(item) for item in self._read_json([])]
+            # The SQLite global-contact mapping is authoritative. Remove only
+            # stale mirror rows that claim its exact canonical name for a
+            # different phone; never move or renumber the database mapping.
+            records = [
+                record for record in records
+                if not (record["platform"] == "bale" and record["display_name"] == expected and record["phone_normalized"] != normalized)
+            ]
+            for index, record in enumerate(records):
+                if record["platform"] == "bale" and record["phone_normalized"] == normalized:
+                    if record["display_name"] != expected:
+                        record["display_name"] = expected
+                        record["stable_name"] = expected
+                        record["sequence_number"] = int(match.group(1))
+                        record["stable_sequence"] = int(match.group(1))
+                        record["updated_at"] = _now()
+                        records[index] = record
+                        self._assert_unique(records, "bale")
+                        self._write_json(records)
+                    if self._ensure_account_binding(record, str(account_id or "")):
+                        records[index] = record
+                        self._write_json(records)
+                    return self._record_for_account(record, str(account_id)) if account_id else record
+            now = _now()
+            sequence = int(match.group(1))
+            record = {
+                "id": f"bale_contact_{uuid4().hex[:12]}", "platform": "bale",
+                "account_id": str(account_id or ""), "phone_normalized": normalized,
+                "display_name": expected, "sequence_number": sequence,
+                "stable_name": expected, "stable_sequence": sequence, "status": "active",
+                "account_bindings": [self._new_account_binding(str(account_id), now)] if account_id else [],
+                "created_at": now, "updated_at": now,
+            }
+            records.append(record)
+            self._assert_unique(records, "bale")
+            self._write_json(records)
+            return self._record_for_account(record, str(account_id)) if account_id else record
+
     def bulk_add_platform_contacts(
         self,
         platform: str,
@@ -413,6 +459,9 @@ class BaleContactStore:
             "input_provenance_status", "contact_preparation_allowed",
             "live_execution_blocked", "block_reason", "manual_review_required",
             "creation_trace", "failure_code", "failure_message",
+            "verification_method", "prepared_at", "verified_at",
+            "profile_identity", "browser_pid", "last_successful_step",
+            "failure_evidence",
         ]
 
     def _normalize_platform(self, platform: str) -> str:

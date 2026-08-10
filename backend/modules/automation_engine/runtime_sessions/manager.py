@@ -116,9 +116,7 @@ class AccountRuntimeSessionManager:
         started = time.perf_counter()
         try:
             self._assert_live(session)
-            page = session.page
-            if page is None or self._is_closed(page):
-                raise RuntimeSessionError("session_page_closed", "Runtime page is closed")
+            page = self.resolve_live_page(session)
             try:
                 title = getattr(page, "title", None)
                 if callable(title):
@@ -130,6 +128,75 @@ class AccountRuntimeSessionManager:
             return {"ok": True, "session_id": session.session_id}
         finally:
             session.last_health_check_duration_ms = int((time.perf_counter() - started) * 1000)
+
+    def resolve_live_page(self, session: RuntimeSession) -> Any:
+        """Resolve the newest live Bale tab and replace a stale cached Page handle."""
+        current = session.page
+        context = session.context
+        pages: list[Any] = []
+        try:
+            pages = list(getattr(context, "pages", []) or []) if context is not None else []
+        except Exception:
+            pages = []
+        if current is not None and not self._is_closed(current) and current not in pages:
+            pages.append(current)
+        live = [page for page in pages if page is not None and not self._is_closed(page)]
+        preferred = [page for page in live if "bale.ai" in str(getattr(page, "url", "") or "").lower()]
+        replacement = (preferred or live)[-1] if (preferred or live) else None
+        metadata = session.metadata
+        metadata.setdefault("original_page_id", self._page_id(current))
+        metadata["current_page_count"] = len(live)
+        if current is not None and self._is_closed(current):
+            metadata.setdefault("page_close_event_at", utc_now())
+            metadata.setdefault("page_close_initiator", "external_navigation_or_browser")
+        if replacement is None:
+            # Bale occasionally replaces/closes its initial tab while the
+            # persistent Chromium context is still alive.  A page handle is
+            # not the profile/session itself, so recover a fresh tab before
+            # declaring the account runtime unusable.  This is account-local
+            # and never opens another profile or changes persisted auth state.
+            if context is not None and not self._is_closed(context):
+                try:
+                    replacement = context.new_page()
+                except Exception:
+                    replacement = None
+                if replacement is not None and not self._is_closed(replacement):
+                    session.page = replacement
+                    metadata["page_replacement_count"] = int(metadata.get("page_replacement_count") or 0) + 1
+                    metadata["page_recovered_at"] = utc_now()
+                    metadata["page_recovery_required_navigation"] = True
+                    metadata["current_page_count"] = 1
+                    metadata["current_page_id"] = self._page_id(replacement)
+                    metadata["current_page_url"] = str(getattr(replacement, "url", "") or "")
+                    return replacement
+            details = {
+                "close_initiator": metadata.get("page_close_initiator") or "unknown",
+                "browser_open": bool(session.browser is not None and not self._is_closed(session.browser)),
+                "context_open": bool(context is not None and not self._is_closed(context)),
+                "page_open": False,
+                "another_live_page_existed": False,
+                "remaining_context_page_count": 0,
+                "last_page_url": str(getattr(current, "url", "") or "") if current is not None else "",
+                "last_successful_step": metadata.get("last_successful_step"),
+            }
+            metadata["last_page_resolution_error"] = details
+            raise RuntimeSessionError("session_page_closed", "Runtime page is closed", details)
+        if replacement is not current:
+            session.page = replacement
+            metadata["page_replacement_count"] = int(metadata.get("page_replacement_count") or 0) + 1
+        metadata["current_page_id"] = self._page_id(replacement)
+        metadata["current_page_url"] = str(getattr(replacement, "url", "") or "")
+        return replacement
+
+    @staticmethod
+    def _page_id(page: Any) -> str | None:
+        if page is None:
+            return None
+        for name in ("guid", "_guid", "page_id"):
+            value = getattr(page, name, None)
+            if value:
+                return str(value)
+        return f"page_{id(page)}"
 
     def prepare_for_job(self, session: RuntimeSession, execution_plan: Any) -> dict[str, Any]:
         started = time.perf_counter()

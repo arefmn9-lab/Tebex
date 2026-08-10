@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import threading
+import asyncio
+import logging
+import os
+import time
 import sqlite3
 import json
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -46,6 +51,7 @@ from modules.automation_engine.plugins.bale import bale_plugin
 from modules.automation_engine.plugins.bale.account_store import bale_account_store, canonical_source_channel_url, normalize_source_channel_uid
 from modules.automation_engine.plugins.bale.contact_store import bale_contact_store
 from modules.automation_engine.plugins.bale.governance import can_account_run_scenario
+from modules.automation_engine.runtime_sessions.bale_account_executor import bale_account_executor_registry
 from modules.automation_engine.queue import TaskQueue, TaskRecord
 from modules.automation_engine.scenario_library import (
     ScenarioExecutorStub,
@@ -67,6 +73,7 @@ def _set_dashboard_cors_headers(response: Response) -> None:
 
 
 router = APIRouter(prefix="/automation", tags=["automation"])
+logger = logging.getLogger(__name__)
 
 _BACKEND_ROOT = Path(__file__).resolve().parents[2]
 DIAGNOSTICS_ROOT = _BACKEND_ROOT / "runtime" / "diagnostics"
@@ -90,6 +97,7 @@ _DIAGNOSTIC_BLOCKED_EXTENSIONS = {".db", ".sqlite", ".sqlite3", ".pem", ".key", 
 _DIAGNOSTIC_MAX_PREVIEW_BYTES = 512_000
 _DIAGNOSTIC_MAX_RUNS = 250
 _DIAGNOSTIC_MAX_FILES = 600
+_client_diagnostic_lock = threading.RLock()
 
 queue = TaskQueue()
 scheduler = Scheduler(queue)
@@ -227,6 +235,42 @@ def _bale_bulk_error(exc: Exception) -> HTTPException:
 
 class RunTaskRequest(BaseModel):
     task_id: str
+
+
+@router.post("/diagnostics/client-events", status_code=202)
+def persist_client_diagnostic_event(event: dict[str, Any], response: Response) -> dict[str, Any]:
+    """Persist scrubbed frontend action evidence so exports survive navigation/restart."""
+    _set_dashboard_cors_headers(response)
+    allowed = {
+        "timestamp", "event_id", "action", "module", "account_id", "campaign_id", "success", "status",
+        "error_code", "error_message", "endpoint", "duration_ms", "related_files", "source_revision",
+        "clicked_action", "handler_reached", "button_disabled", "disabled_reason", "pending_state",
+        "operation_id", "http_method", "stage", "result",
+    }
+    payload = {key: event.get(key) for key in allowed if key in event}
+    payload["received_at"] = datetime.now(timezone.utc).isoformat()
+    target = _diagnostics_root() / "frontend_client_events.jsonl"
+    with _client_diagnostic_lock:
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    return {"accepted": True, "event_id": payload.get("event_id"), "source_revision": payload.get("source_revision")}
+
+
+@router.get("/diagnostics/client-events")
+def list_client_diagnostic_events(response: Response, limit: int = Query(250, ge=1, le=1000)) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    target = _diagnostics_root() / "frontend_client_events.jsonl"
+    if not target.exists():
+        return {"items": [], "persisted": True}
+    with _client_diagnostic_lock:
+        lines = target.read_text(encoding="utf-8").splitlines()[-limit:]
+    items = []
+    for line in reversed(lines):
+        try:
+            items.append(json.loads(line))
+        except (TypeError, ValueError):
+            continue
+    return {"items": items, "persisted": True}
 
 
 @router.get("/diagnostics/runs")
@@ -585,9 +629,9 @@ class BaleProfileGroupRequest(BaseModel):
     profile_group_id: str | None = None
     device_group_id: str | None = None
     name: str = "گروه ۱"
-    max_accounts: int = 30
+    max_accounts: int = 0
     group_size_limit: int | None = None
-    max_concurrent_accounts: int = 10
+    max_concurrent_accounts: int = 0
     browser_provider: str = "adspower"
     adspower_group_id: str = ""
     account_ids: list[str] = []
@@ -754,12 +798,19 @@ class BaleSchedulingRequest(BaseModel):
 class BaleRetireRequest(BaseModel):
     reason: str = "retired_by_operator"
 
+class BaleProfileResetRequest(BaseModel):
+    confirmation: str
+
 class BaleOperationalConfigurationRequest(BaseModel):
     configuration: dict[str, Any]
     actor: str = "operator-ui"
 
 
 class GlobalSettingsRequest(BaseModel):
+    concurrency_mode: str | None = None
+    operator_defined_max_concurrent_accounts: int | None = None
+    browser_concurrency: int | None = None
+    worker_concurrency: int | None = None
     max_concurrent_accounts: int | None = None
     deliveries_per_account_round: int | None = None
     delay_between_deliveries_seconds: int | None = None
@@ -803,12 +854,26 @@ class AccountSettingsRequest(BaseModel):
     last_error_message: str | None = None
 
 
+# ============================================================
+# BLOCK: CAMPAIGN_CAPACITY_RESERVATION_API_CONTRACT
+# PURPOSE:
+# Accepts one shared-pool capacity reservation in the existing campaign API.
+# ACCOUNT_SCOPE:
+# No account is selected or owned by this contract.
+# DEPENDENCIES:
+# CommercialQueueService
+# LAYER:
+# API
+# ============================================================
+
+
 class CommercialCampaignRequest(BaseModel):
     name: str
     platform: str = "bale"
     status: str = "draft"
     source_channel_uid: str | None = None
     policy_overrides: dict[str, Any] | None = None
+    capacity_reservation: int | None = Field(default=None, ge=0)
 
 
 class CommercialCampaignPatchRequest(BaseModel):
@@ -818,9 +883,19 @@ class CommercialCampaignPatchRequest(BaseModel):
     source_channel_uid: str | None = None
     policy_overrides: dict[str, Any] | None = None
     policy_overrides_json: str | None = None
+    capacity_reservation: int | None = Field(default=None, ge=0)
     started_at: str | None = None
     paused_at: str | None = None
     completed_at: str | None = None
+
+
+class CampaignCapacityRequest(BaseModel):
+    requested_account_count: int = Field(ge=1)
+
+
+# ============================================================
+# END BLOCK: CAMPAIGN_CAPACITY_RESERVATION_API_CONTRACT
+# ============================================================
 
 
 class CampaignConfigurationDraftRequest(BaseModel):
@@ -856,14 +931,18 @@ class CampaignSendApprovalRequest(BaseModel):
 class CampaignQueueRequest(BaseModel):
     validation_hash: str | None = None
     validation_id: str | None = None
-    dry_run_id: str | None = None
-    check_id: str | None = None
     final_review_hash: str | None = None
+    review_token: str | None = None
     manifest_hash: str | None = None
     approval_id: str | None = None
     idempotency_key: str | None = None
     explicit_operator_confirmation: bool = False
     expected_campaign_status: str = "draft"
+
+
+class CampaignFinalReviewRequest(BaseModel):
+    explicit_operator_confirmation: bool = False
+    approved_by: str = "campaign_operator"
 
 
 class CampaignLivePreflightRequest(BaseModel):
@@ -1000,12 +1079,20 @@ class WorkerAssignRequest(BaseModel):
 class WorkerRunRoundRequest(BaseModel):
     campaign_id: str | None = None
     max_jobs: int | None = None
-    dry_run: bool = False
 
 
 class SchedulerRunOnceRequest(BaseModel):
     campaign_id: str | None = None
-    dry_run: bool = True
+
+
+class TestWorkerFaultRequest(BaseModel):
+    fault_mode: str | None = None
+    account_id: str | None = None
+    run_replacement_tick: bool = True
+
+
+class TestUncertainDeliveryReconciliationRequest(BaseModel):
+    job_id: str
 
 
 class BrowserIdentityUpdateRequest(BaseModel):
@@ -1334,13 +1421,24 @@ def apply_global_account_settings(response: Response) -> dict[str, Any]:
 @router.post("/campaigns")
 def create_commercial_campaign(request: CommercialCampaignRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return commercial_queue_service.create_campaign(request.model_dump())
+    return commercial_queue_service.create_campaign(request.model_dump(exclude_none=True))
 
 
 @router.get("/campaigns")
-def list_commercial_campaigns(response: Response, status: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+def list_commercial_campaigns(
+    response: Response,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    include_internal: bool = False,
+) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return commercial_queue_service.list_campaigns(status=status, limit=limit, offset=offset)
+    return commercial_queue_service.list_campaigns(
+        status=status,
+        limit=limit,
+        offset=offset,
+        include_internal=include_internal,
+    )
 
 
 @router.get("/campaigns/{campaign_id}")
@@ -1352,6 +1450,24 @@ def get_commercial_campaign(campaign_id: str, response: Response) -> dict[str, A
     return campaign
 
 
+@router.get("/campaigns/{campaign_id}/capacity")
+def get_commercial_campaign_capacity(campaign_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.campaign_capacity_state(campaign_id)
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
+@router.put("/campaigns/{campaign_id}/capacity")
+def allocate_commercial_campaign_capacity(campaign_id: str, request: CampaignCapacityRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.allocate_campaign_capacity(campaign_id, request.model_dump())
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
+
+
 @router.patch("/campaigns/{campaign_id}")
 def update_commercial_campaign(campaign_id: str, request: CommercialCampaignPatchRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
@@ -1359,6 +1475,17 @@ def update_commercial_campaign(campaign_id: str, request: CommercialCampaignPatc
     if campaign is None:
         raise HTTPException(status_code=404, detail=f"Campaign not found: {campaign_id}")
     return campaign
+
+
+@router.delete("/campaigns/{campaign_id}")
+def delete_commercial_campaign(campaign_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    try:
+        return commercial_queue_service.delete_campaign(campaign_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail={"error_code": "campaign_not_found", "error_message": f"Campaign not found: {campaign_id}"}) from None
+    except Exception as exc:
+        raise _campaign_lifecycle_error(exc) from exc
 
 
 @router.get("/campaigns/{campaign_id}/configuration")
@@ -1487,13 +1614,16 @@ def check_campaign_configuration_drift(campaign_id: str, response: Response) -> 
 def _campaign_lifecycle_error(exc: Exception) -> HTTPException:
     error_code = getattr(exc, "error_code", None) or "invalid_campaign_transition"
     status = 404 if error_code == "campaign_not_found" else 409
+    validation = getattr(exc, "summary", {})
     return HTTPException(
         status_code=status,
         detail={
             "error_code": error_code,
             "error_message": str(exc),
-            "validation": getattr(exc, "summary", {}),
+            "validation": validation,
+            "accounts": validation.get("accounts", []),
         },
+        headers={"Access-Control-Allow-Origin": "*"},
     )
 
 
@@ -1547,15 +1677,6 @@ def cancel_commercial_campaign(campaign_id: str, response: Response) -> dict[str
     _set_dashboard_cors_headers(response)
     try:
         return commercial_queue_service.cancel_campaign(campaign_id)
-    except Exception as exc:
-        raise _campaign_lifecycle_error(exc) from exc
-
-
-@router.post("/campaigns/{campaign_id}/run-dry-round")
-def run_commercial_campaign_dry_round(campaign_id: str, response: Response) -> dict[str, Any]:
-    _set_dashboard_cors_headers(response)
-    try:
-        return commercial_queue_service.run_campaign_dry_round(campaign_id)
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 
@@ -1746,20 +1867,19 @@ def prepare_campaign_contacts(campaign_id: str, response: Response) -> dict[str,
     return commercial_queue_service.prepare_campaign_contacts_explicit(campaign_id)
 
 
-@router.post("/campaigns/{campaign_id}/check-without-sending")
-def check_campaign_without_sending(campaign_id: str, response: Response) -> dict[str, Any]:
-    _set_dashboard_cors_headers(response)
-    try:
-        return commercial_queue_service.check_campaign_without_sending(campaign_id)
-    except Exception as exc:
-        raise _campaign_lifecycle_error(exc) from exc
-
-
 @router.post("/campaigns/{campaign_id}/final-review")
-def final_review_campaign(campaign_id: str, response: Response) -> dict[str, Any]:
+def final_review_campaign(
+    campaign_id: str,
+    response: Response,
+    request: CampaignFinalReviewRequest = CampaignFinalReviewRequest(),
+) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        return commercial_queue_service.final_review(campaign_id)
+        return commercial_queue_service.final_review(
+            campaign_id,
+            explicit_operator_confirmation=request.explicit_operator_confirmation,
+            approved_by=request.approved_by,
+        )
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 
@@ -1875,20 +1995,23 @@ def revoke_commercial_live_approval(approval_id: str, request: LiveApprovalRevok
 
 
 @router.post("/live-approvals/{approval_id}/execute")
-def execute_commercial_live_approval_disabled(approval_id: str, response: Response) -> dict[str, Any]:
+def execute_commercial_live_approval(approval_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        validation = commercial_queue_service.validate_live_approval_for_execution(approval_id)
+        result = commercial_queue_service.execute_approved_live_campaign(approval_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Approval not found: {approval_id}") from None
-    raise HTTPException(
-        status_code=403,
-        detail={
-            "error_code": "live_execution_feature_disabled",
-            "error_message": "Live execution is intentionally disabled in Phase 5E.",
-            "validation": validation,
-        },
-    )
+    if not result.get("executed"):
+        validation = result.get("validation") or {}
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "live_execution_gate_blocked",
+                "error_message": "Approved live execution did not pass the current safety gate.",
+                "validation": validation,
+            },
+        )
+    return result
 
 
 def _commercial_import_error(exc: Exception) -> HTTPException:
@@ -2103,7 +2226,6 @@ def run_commercial_worker_round(account_id: str, request: WorkerRunRoundRequest,
         account_id=account_id,
         campaign_id=request.campaign_id,
         max_jobs=request.max_jobs,
-        dry_run=request.dry_run,
     )
 
 
@@ -2152,13 +2274,148 @@ def resume_commercial_scheduler(response: Response) -> dict[str, Any]:
 @router.post("/scheduler/run-once")
 def run_commercial_scheduler_once(request: SchedulerRunOnceRequest, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return commercial_queue_service.scheduler_run_once(campaign_id=request.campaign_id, dry_run=request.dry_run)
+    return commercial_queue_service.scheduler_run_once(campaign_id=request.campaign_id)
+
+
+def _require_isolated_test_worker_faults() -> None:
+    """Reject synthetic worker outcomes outside the disposable UI runtime."""
+    enabled = (
+        os.environ.get("CLINICOS_TEST_MODE") == "1"
+        and os.environ.get("CLINICOS_ENABLE_TEST_EXECUTION_MODES") == "1"
+        and os.environ.get("CLINICOS_SAFE_TEST_WORKER_BOUNDARY") == "1"
+        and os.environ.get("CLINICOS_TEST_FAKE_WORKER_FAULTS") == "1"
+    )
+    production = (_BACKEND_ROOT / "clinicos.db").resolve()
+    resolved = commercial_queue_service.repository.database_path.resolve()
+    if not enabled or resolved == production or resolved.name.casefold() == "clinicos.db":
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "isolated_test_worker_faults_unavailable"},
+        )
+
+
+@router.post("/test-resilience/campaigns/{campaign_id}/inject-worker-fault")
+def inject_isolated_worker_fault(
+    campaign_id: str,
+    request: TestWorkerFaultRequest,
+    response: Response,
+) -> dict[str, Any]:
+    """Exercise real scheduler/worker recovery without Bale I/O.
+
+    This endpoint has no normal-UI consumer and is deliberately absent from
+    production operation.  The rendered UI creates, allocates, queues, and
+    starts the campaign; this hook supplies only a deterministic account-local
+    worker outcome after that operator-visible transition.
+    """
+    _set_dashboard_cors_headers(response)
+    _require_isolated_test_worker_faults()
+    campaign = commercial_queue_service.get_campaign(campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail={"error_code": "campaign_not_found"})
+    fault_mode = str(request.fault_mode or "").strip()
+    target_account_id = str(request.account_id or "").strip()
+    if fault_mode:
+        eligible, _ = commercial_queue_service._ordered_eligible_accounts(campaign_id)
+        eligible_ids = [str(item.get("account_id") or "") for item in eligible]
+        if not target_account_id:
+            target_account_id = next((value for value in eligible_ids if value), "")
+        if not target_account_id or target_account_id not in eligible_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "test_fault_target_not_eligible",
+                    "eligible_account_count": len(eligible_ids),
+                },
+            )
+        try:
+            commercial_queue_service.configure_test_worker_fault(target_account_id, fault_mode)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail={"error_code": getattr(exc, "error_code", str(exc))}) from exc
+    primary_tick = commercial_queue_service.scheduler_run_once(campaign_id=campaign_id)
+    replacement_tick = (
+        commercial_queue_service.scheduler_run_once(campaign_id=campaign_id)
+        if request.run_replacement_tick
+        else None
+    )
+    reconciliation = None
+    if fault_mode == "uncertain_after_send":
+        failed_jobs = commercial_queue_service.list_jobs(campaign_id=campaign_id, limit=500).get("items", [])
+        uncertain_ids = [
+            str(job["id"])
+            for job in failed_jobs
+            if str(job.get("last_error_code") or "") == "confirm_uncertain"
+        ]
+        # This is the same durable-evidence reconciliation path used by
+        # normal recovery.  It must retain an ambiguous post-confirmation job
+        # for manual review instead of assigning it to a replacement account.
+        reconciliation = commercial_queue_service.repository.recover_failed_jobs_without_send(
+            campaign_id,
+            uncertain_ids,
+        )
+    refreshed_campaign = commercial_queue_service.get_campaign(campaign_id)
+    jobs = commercial_queue_service.list_jobs(campaign_id=campaign_id, limit=500).get("items", [])
+    return {
+        "test_only": True,
+        "fault_mode": fault_mode or None,
+        "fault_account_id": target_account_id or None,
+        "primary_tick": primary_tick,
+        "replacement_tick": replacement_tick,
+        "reconciliation": reconciliation,
+        "campaign": refreshed_campaign,
+        "scheduler": commercial_queue_service.scheduler_status_snapshot(),
+        "account_health": commercial_queue_service.get_account_health(target_account_id) if target_account_id else None,
+        "jobs": jobs,
+        "worker_lock": commercial_queue_service.repository.get_worker_lock(target_account_id) if target_account_id else None,
+    }
+
+
+@router.post("/test-resilience/campaigns/{campaign_id}/reconcile-uncertain-delivery")
+def reconcile_isolated_uncertain_delivery(
+    campaign_id: str,
+    request: TestUncertainDeliveryReconciliationRequest,
+    response: Response,
+) -> dict[str, Any]:
+    """Inject a fake *verified* provider reconciliation into the real durable path.
+
+    The surrounding endpoint is isolated-test-only.  The service method is
+    production-safe reconciliation logic: it requires a durable proof key and
+    can transition only `confirm_uncertain` manual-review work to verified
+    success, never to a blind retry.
+    """
+    _set_dashboard_cors_headers(response)
+    _require_isolated_test_worker_faults()
+    campaign = commercial_queue_service.get_campaign(campaign_id)
+    job = commercial_queue_service.repository.get_job(request.job_id)
+    if campaign is None or job is None or str(job.get("campaign_id") or "") != campaign_id:
+        raise HTTPException(status_code=404, detail={"error_code": "campaign_or_job_not_found"})
+    applied = commercial_queue_service.reconcile_uncertain_delivery_result(
+        str(job["id"]),
+        {
+            "outcome": "sent",
+            "success": True,
+            "delivery_verified": True,
+            "verified_forwarded_recipient_count": 1,
+            "remote_message_id": f"isolated-fake-reconciliation:{job['id']}",
+            "trusted_result_key": f"isolated-fake-reconciliation:{job['id']}",
+            "reconciliation_source": "isolated_fake_delivery_boundary",
+            "failed_step": "fake_external_delivery_reconciliation",
+            "diagnostics": {"fake_delivery_boundary": True, "no_provider_send": True},
+        },
+    )
+    refreshed = commercial_queue_service.get_campaign(campaign_id)
+    return {
+        "test_only": True,
+        "reconciliation": applied,
+        "campaign": refreshed,
+        "scheduler": commercial_queue_service.scheduler_status_snapshot(),
+        "jobs": commercial_queue_service.list_jobs(campaign_id=campaign_id, limit=500).get("items", []),
+    }
 
 
 @router.get("/scheduler/status")
 def get_commercial_scheduler_status(response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return commercial_queue_service.scheduler_status()
+    return commercial_queue_service.scheduler_status_snapshot()
 
 
 @router.get("/accounts/runtime-status")
@@ -2518,9 +2775,14 @@ def update_platform_account(
 
 
 @router.delete("/platforms/{platform_id}/accounts/{account_id}")
-def delete_platform_account(platform_id: str, account_id: str, response: Response) -> dict[str, Any]:
+async def delete_platform_account(platform_id: str, account_id: str, response: Response, delete_profile: bool = Query(True)) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     _ensure_platform(platform_id)
+    # This generic route is registered before the Bale-specific delete route
+    # below, so FastAPI resolves Bale deletes here.  Delegate to the durable
+    # Bale operation rather than deleting only the legacy registry mirror.
+    if platform_id == "bale":
+        return await delete_bale_account(account_id, response, delete_profile=delete_profile)
     try:
         return account_registry_service.delete_platform_account(platform_id, account_id)
     except KeyError:
@@ -2598,52 +2860,786 @@ def audit_bale_authentication_profile(account_id: str, response: Response) -> di
         raise _campaign_lifecycle_error(exc) from exc
 
 
-@router.post("/platforms/bale/authentication/open")
-def open_bale_authentication(request: BaleAuthenticationOpenRequest, response: Response) -> dict[str, Any]:
-    _set_dashboard_cors_headers(response)
-    launch_lock = None
+# ============================================================
+# BLOCK: BALE_AUTHENTICATION_ACCOUNT_EXECUTOR_BOUNDARY
+# PURPOSE:
+# Dispatches persistent authentication lifecycle calls to account-owned threads.
+# ACCOUNT_SCOPE:
+# One account executor per active Bale authentication session.
+# DEPENDENCIES:
+# BaleAccountExecutorRegistry, CommercialQueueService
+# LAYER:
+# API
+# ============================================================
+
+_bale_action_operations: dict[str, dict[str, Any]] = {}
+_bale_action_tasks: set[asyncio.Task[Any]] = set()
+_bale_action_guard = threading.RLock()
+_ASYNC_BALE_ACCOUNT_ACTIONS = {"open_login", "session_recheck", "delete_account", "reset_profile"}
+_BALE_ACCOUNT_OPERATION_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "interrupted", "timed_out"}
+# Hot-reload marker: account-operation watchdog/recovery code is restart-safe (final acceptance).
+# The deadline covers navigation, DOM classification, identity extraction,
+# persistence, and cleanup as one operation.  Heartbeats never extend it.
+BALE_ACCOUNT_OPERATION_DEADLINE_SECONDS = max(
+    15,
+    int(os.environ.get("CLINICOS_BALE_ACCOUNT_OPERATION_DEADLINE_SECONDS", "90")),
+)
+
+
+class BaleAccountOperationTimeout(BaleOnboardingError):
+    """Absolute operation deadline elapsed before decisive auth evidence."""
+
+    def __init__(self, stage: str, message: str = "Bale account authentication exceeded its absolute deadline") -> None:
+        super().__init__("authentication_operation_timeout", message, {
+            "terminal_reason": "bale_bootstrap_unresolved",
+            "failed_step": stage,
+        })
+        self.stage = stage
+
+
+def _persist_bale_action_operation(operation: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    operation.setdefault("owner_runtime_id", getattr(bale_onboarding_service, "backend_instance_id", "unknown_runtime"))
+    operation.setdefault("owner_pid", os.getpid())
+    operation["heartbeat_at"] = now
+    with bale_onboarding_service.connection() as connection:
+        generation = connection.execute(
+            "SELECT profile_generation_id FROM bale_operational_accounts WHERE account_id=?",
+            (operation["account_id"],),
+        ).fetchone()
+        if not operation.get("profile_generation_id"):
+            operation["profile_generation_id"] = str(generation["profile_generation_id"] or "") if generation else None
+        connection.execute(
+            """INSERT INTO bale_onboarding_operations
+            (operation_id,idempotency_key,request_hash,operation_type,account_id,onboarding_batch_id,status,current_step,progress_json,error_code,safe_error_message,created_at,updated_at,
+             owner_runtime_id,owner_pid,profile_generation_id,heartbeat_at,lease_released_at,deadline_at,terminal_reason)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(operation_id) DO UPDATE SET status=excluded.status,current_step=excluded.current_step,
+            progress_json=excluded.progress_json,error_code=excluded.error_code,safe_error_message=excluded.safe_error_message,updated_at=excluded.updated_at,
+            owner_runtime_id=excluded.owner_runtime_id,owner_pid=excluded.owner_pid,
+            profile_generation_id=excluded.profile_generation_id,heartbeat_at=excluded.heartbeat_at,
+            lease_released_at=excluded.lease_released_at,deadline_at=excluded.deadline_at,
+            terminal_reason=excluded.terminal_reason""",
+            (
+                operation["operation_id"], operation["operation_id"], operation["correlation_id"], operation["action"],
+                operation["account_id"], None, operation["status"], operation["stage"], json.dumps(operation, ensure_ascii=False, default=str),
+                operation.get("error_code"), operation.get("error_message"), operation["started_at"], now,
+                operation.get("owner_runtime_id"), operation.get("owner_pid"), operation.get("profile_generation_id"),
+                operation.get("heartbeat_at"), operation.get("lease_released_at"), operation.get("deadline_at"),
+                operation.get("terminal_reason"),
+            ),
+        )
+        connection.commit()
+
+
+def _load_persisted_bale_action_operation(operation_id: str) -> dict[str, Any] | None:
+    with bale_onboarding_service.connection() as connection:
+        row = connection.execute("SELECT progress_json FROM bale_onboarding_operations WHERE operation_id=?", (operation_id,)).fetchone()
+    if not row:
+        return None
     try:
-        launch_lock = bale_onboarding_service.acquire_profile_launch_lock(request.account_id)
-        result = commercial_queue_service.open_bale_authentication(request.account_id)
-        bale_onboarding_service.record_authentication_open(request.account_id, result, purpose=request.purpose)
-        return result
+        payload = json.loads(row["progress_json"] or "{}")
+        return payload if isinstance(payload, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def reconcile_orphaned_bale_account_action_operations() -> dict[str, Any]:
+    """Recover queued/running account actions at backend startup.
+
+    Recovery is deterministic and metadata-only: an expired operation is
+    timed out even when its owner still heartbeats, while an operation whose
+    owner process disappeared is cancelled.  Durable account identity/session
+    evidence is intentionally untouched.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    terminalized: list[str] = []
+    timed_out: list[str] = []
+    interrupted: list[str] = []
+    leases_released: list[str] = []
+    with _bale_action_guard:
+        active_operation_ids = {
+            operation_id
+            for operation_id, operation in _bale_action_operations.items()
+            if operation.get("status") in {"queued", "running"}
+        }
+        with bale_onboarding_service.connection() as connection:
+            placeholders = ",".join("?" for _ in _ASYNC_BALE_ACCOUNT_ACTIONS)
+            rows = connection.execute(
+                f"""SELECT operation_id, operation_type, account_id, current_step, progress_json,
+                    status, created_at, updated_at, deadline_at, owner_pid
+                FROM bale_onboarding_operations
+                WHERE operation_id LIKE 'baleop_%'
+                  AND operation_type IN ({placeholders})
+                  AND status IN ('queued', 'running')""",
+                tuple(sorted(_ASYNC_BALE_ACCOUNT_ACTIONS)),
+            ).fetchall()
+            for row in rows:
+                operation_id = str(row["operation_id"])
+                try:
+                    operation = json.loads(row["progress_json"] or "{}")
+                except (TypeError, ValueError):
+                    operation = {}
+                if not isinstance(operation, dict):
+                    operation = {}
+                previous_stage = str(operation.get("stage") or row["current_step"] or "queued")
+                deadline_at = str(operation.get("deadline_at") or row["deadline_at"] or "").strip()
+                try:
+                    deadline = datetime.fromisoformat(deadline_at.replace("Z", "+00:00"))
+                    if deadline.tzinfo is None:
+                        deadline = deadline.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    try:
+                        started = datetime.fromisoformat(str(operation.get("started_at") or row["created_at"]).replace("Z", "+00:00"))
+                        if started.tzinfo is None:
+                            started = started.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        started = datetime.now(timezone.utc)
+                    deadline = started + timedelta(seconds=BALE_ACCOUNT_OPERATION_DEADLINE_SECONDS)
+                    deadline_at = deadline.isoformat()
+                owner_alive = False
+                try:
+                    owner_alive = bool(bale_onboarding_service._owner_process_alive(row["owner_pid"]))
+                except Exception:
+                    owner_alive = False
+                # The process-local task registry is the authoritative proof
+                # that this backend is actively executing the operation.  A
+                # live PID alone is insufficient (it may be a reused PID or a
+                # task that already died), so an operation absent from the
+                # registry is recoverable on startup.
+                if deadline > datetime.now(timezone.utc) and operation_id in active_operation_ids:
+                    # Persist a deadline for legacy rows, but do not interrupt a
+                    # genuinely live operation merely because the server is
+                    # starting.  Its absolute deadline remains authoritative.
+                    if not row["deadline_at"]:
+                        operation["deadline_at"] = deadline_at
+                        connection.execute(
+                            "UPDATE bale_onboarding_operations SET deadline_at=?, progress_json=?, updated_at=? WHERE operation_id=?",
+                            (deadline_at, json.dumps(operation, ensure_ascii=False, default=str), now, operation_id),
+                        )
+                    continue
+                terminal_status = "timed_out" if deadline <= datetime.now(timezone.utc) else "cancelled"
+                terminal_reason = "bale_bootstrap_unresolved" if terminal_status == "timed_out" else "account_operation_interrupted_by_restart"
+                if terminal_status == "timed_out":
+                    timed_out.append(operation_id)
+                else:
+                    interrupted.append(operation_id)
+                operation.update({
+                    "operation_id": operation_id,
+                    "action": str(operation.get("action") or row["operation_type"]),
+                    "account_id": str(operation.get("account_id") or row["account_id"] or ""),
+                    "status": terminal_status,
+                    "stage": terminal_status,
+                    "previous_stage": previous_stage,
+                    "success": False,
+                    "completed_at": now,
+                    "error_code": "authentication_operation_timeout" if terminal_status == "timed_out" else "account_operation_interrupted_by_restart",
+                    "error_message": "Bale bootstrap/authentication exceeded its absolute deadline." if terminal_status == "timed_out" else "The previous server process stopped before this account operation completed.",
+                    "terminal_reason": terminal_reason,
+                    "deadline_at": deadline_at,
+                    "failed_step": previous_stage,
+                    "cleanup_result": {
+                        "restart_reconciliation": "operation_terminalized_without_resuming_browser_or_delete",
+                        "resources_released": False,
+                    },
+                    "lock_release_result": {
+                        "release_attempted": False,
+                        "reason": "startup_releases_only_proven_stale_resources",
+                    },
+                    "restart_reconciliation": {
+                        "reconciled_at": now,
+                        "reason": "in_memory_operation_owner_missing" if terminal_status == "cancelled" else terminal_reason,
+                    },
+                })
+                connection.execute(
+                    """UPDATE bale_onboarding_operations
+                    SET status=?, current_step=?, progress_json=?, error_code=?,
+                        safe_error_message=?, updated_at=?, deadline_at=?, terminal_reason=?, lease_released_at=? WHERE operation_id=?""",
+                    (
+                        terminal_status,
+                        terminal_status,
+                        json.dumps(operation, ensure_ascii=False, default=str),
+                        operation["error_code"],
+                        operation["error_message"],
+                        now,
+                        deadline_at,
+                        terminal_reason,
+                        now,
+                        operation_id,
+                    ),
+                )
+                if operation_id in _bale_action_operations:
+                    _bale_action_operations[operation_id].update(operation)
+                terminalized.append(operation_id)
+            connection.commit()
+        for operation_id in terminalized:
+            operation = _bale_action_operations.get(operation_id) or {}
+            account_id = str(operation.get("account_id") or "")
+            if not account_id:
+                with bale_onboarding_service.connection() as lookup:
+                    row = lookup.execute("SELECT account_id FROM bale_onboarding_operations WHERE operation_id=?", (operation_id,)).fetchone()
+                    account_id = str(row["account_id"] or "") if row else ""
+            release = getattr(bale_onboarding_service, "release_profile_launch_lock_for_operation", None)
+            if account_id and callable(release):
+                try:
+                    if release(account_id, operation_id):
+                        leases_released.append(operation_id)
+                except Exception:
+                    logger.exception("[BALE_AUTH_RECOVERY] exact lease release failed operation_id=%s", operation_id)
+    return {
+        "checked_count": len(rows),
+        "cancelled_count": len(interrupted),
+        "cancelled_operation_ids": interrupted,
+        "timed_out_count": len(timed_out),
+        "timed_out_operation_ids": timed_out,
+        "terminalized_operation_ids": terminalized,
+        "resumed_operations": 0,
+        "resources_released": len(leases_released),
+        "released_operation_ids": leases_released,
+    }
+
+
+def _new_bale_action_operation(account_id: str, action: str, endpoint: str, method: str) -> tuple[dict[str, Any], bool]:
+    with _bale_action_guard:
+        # A browser profile is account-scoped.  Coalesce *all* live account
+        # actions, rather than just repeated copies of the same action, so a
+        # Session Recheck/Delete click cannot race an in-flight Open/Login on
+        # the same profile generation.  Returning the active operation lets
+        # the caller poll one deterministic terminal result.
+        existing = next((item for item in _bale_action_operations.values() if item["account_id"] == account_id and item["status"] in {"queued", "running"}), None)
+        if existing:
+            coalesced_request = {
+                "action": action,
+                "endpoint": endpoint,
+                "http_method": method,
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+            }
+            existing["coalesced_requests"] = [
+                *(existing.get("coalesced_requests") or []),
+                coalesced_request,
+            ]
+            existing["last_coalesced_request"] = coalesced_request
+            _persist_bale_action_operation(existing)
+            return dict(existing), False
+        now = datetime.now(timezone.utc).isoformat()
+        deadline_at = (datetime.now(timezone.utc) + timedelta(seconds=BALE_ACCOUNT_OPERATION_DEADLINE_SECONDS)).isoformat()
+        operation = {
+            "operation_id": f"baleop_{uuid4().hex}", "correlation_id": f"corr_{uuid4().hex}",
+            "entity_type": "bale_account", "entity_id": account_id, "account_id": account_id,
+            "campaign_id": None, "action": action, "endpoint": endpoint, "http_method": method,
+            "stage": "queued", "previous_stage": None, "started_at": now, "completed_at": None,
+            "duration_ms": None, "http_status": 202, "success": None, "status": "queued",
+            "error_code": None, "error_message": None, "last_successful_step": "operation_created",
+            "failed_step": None, "nested_error": None, "cleanup_result": None,
+            "lock_release_result": None, "result": None,
+            "coalesced_requests": [], "last_coalesced_request": None,
+            "owner_runtime_id": getattr(bale_onboarding_service, "backend_instance_id", "unknown_runtime"),
+            "owner_pid": os.getpid(), "profile_generation_id": None, "heartbeat_at": now,
+            "lease_released_at": None, "deadline_at": deadline_at, "terminal_reason": None,
+        }
+        _bale_action_operations[operation["operation_id"]] = operation
+        _persist_bale_action_operation(operation)
+        return dict(operation), True
+
+
+def _update_bale_action_operation(operation_id: str, **changes: Any) -> dict[str, Any]:
+    with _bale_action_guard:
+        operation = _bale_action_operations[operation_id]
+        # A watchdog may terminalize an operation while its browser thread is
+        # unwinding.  Late progress/success from that stale worker must never
+        # overwrite the durable terminal state.
+        if operation.get("status") in _BALE_ACCOUNT_OPERATION_TERMINAL_STATES:
+            requested_status = changes.get("status")
+            if requested_status is None or requested_status != operation.get("status"):
+                return dict(operation)
+            if requested_status in _BALE_ACCOUNT_OPERATION_TERMINAL_STATES:
+                return dict(operation)
+        if "stage" in changes:
+            changes.setdefault("previous_stage", operation.get("stage"))
+        operation.update(changes)
+        _persist_bale_action_operation(operation)
+        return dict(operation)
+
+
+def _account_operation_exception_payload(exc: Exception) -> dict[str, Any]:
+    """Return a diagnostic-safe account-operation exception description.
+
+    Account authentication is an onboarding concern.  It must not depend on the
+    campaign lifecycle exception type (and, importantly, must not lose the
+    originating error when terminal state is persisted).
+    """
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        details = getattr(exc, "summary", None)
+    if not isinstance(details, dict):
+        details = {}
+    frames = traceback.extract_tb(exc.__traceback__)[-8:] if exc.__traceback__ else []
+    return {
+        "exception_type": type(exc).__name__,
+        "details": details,
+        "traceback": [
+            {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+            for frame in frames
+        ],
+    }
+
+
+def _operation_deadline(operation: dict[str, Any]) -> tuple[str, float]:
+    """Return the durable ISO deadline and its monotonic remaining clock."""
+    raw = str(operation.get("deadline_at") or "").strip()
+    try:
+        deadline = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=BALE_ACCOUNT_OPERATION_DEADLINE_SECONDS)
+        raw = deadline.isoformat()
+    return raw, max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+
+
+def _consume_background_task(task: asyncio.Task[Any]) -> None:
+    """Consume late browser-task exceptions after watchdog terminalization."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("[BALE_AUTH_WATCHDOG] late account browser task failed")
+
+
+def _terminalize_bale_auth_timeout(
+    operation_id: str,
+    account_id: str,
+    *,
+    started: float,
+    failed_step: str,
+    result: dict[str, Any] | None = None,
+    reason: str = "bale_bootstrap_unresolved",
+) -> None:
+    """Persist a deterministic timeout and fence only this operation's lease."""
+    now = datetime.now(timezone.utc).isoformat()
+    operation = _bale_action_operations.get(operation_id)
+    if operation is None:
+        operation = _load_persisted_bale_action_operation(operation_id)
+        if operation is None:
+            return
+        with _bale_action_guard:
+            _bale_action_operations[operation_id] = operation
+    if operation.get("status") in _BALE_ACCOUNT_OPERATION_TERMINAL_STATES:
+        return
+    lease_released = False
+    try:
+        release = getattr(bale_onboarding_service, "release_profile_launch_lock_for_operation", None)
+        if callable(release):
+            lease_released = bool(release(account_id, operation_id))
+    except Exception:
+        logger.exception("[BALE_AUTH_WATCHDOG] exact lease release failed operation_id=%s", operation_id)
+    _update_bale_action_operation(
+        operation_id,
+        status="timed_out",
+        stage="timed_out",
+        success=False,
+        http_status=409,
+        completed_at=now,
+        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        error_code="authentication_operation_timeout",
+        error_message="Bale bootstrap/authentication did not reach decisive evidence before the absolute deadline.",
+        terminal_reason=reason,
+        failed_step=failed_step,
+        result={"last_authentication_result": result or {}},
+        cleanup_result={"browser_close_attempted": False, "timeout_watchdog": True},
+        lock_release_result={"released": lease_released, "operation_id_fenced": True},
+        lease_released_at=now if lease_released else None,
+    )
+
+
+async def _await_bale_browser_call(awaitable: Any, deadline_at: str, stage: str) -> Any:
+    """Await account-thread work without allowing a stuck Playwright call to
+    consume the entire event loop operation forever.
+
+    The underlying thread future is deliberately shielded: Python cannot
+    safely kill a thread running Playwright.  The caller receives a timeout,
+    terminalizes the durable operation, and the late task is fenced from
+    overwriting that terminal result.
+    """
+    _, remaining = _operation_deadline({"deadline_at": deadline_at})
+    if remaining <= 0:
+        raise BaleAccountOperationTimeout(stage)
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        task.add_done_callback(_consume_background_task)
+        raise BaleAccountOperationTimeout(stage) from exc
+
+
+async def _run_auth_action_body(operation_id: str, account_id: str, purpose: str, deadline_at: str, started: float) -> None:
+    session_id = ""
+    lease_owner_id = ""
+    before_state: dict[str, Any] | None = None
+    result: dict[str, Any] = {}
+    failed_step = "load_before_persisted_account_state"
+    try:
+        before_state = next((row for row in commercial_queue_service.canonical_bale_account_states(include_soft_deleted=True) if row["account_id"] == account_id), None)
+        _update_bale_action_operation(operation_id, status="running", stage="opening_profile", before=before_state)
+        failed_step = "open_canonical_profile"
+        _, remaining = _operation_deadline({"deadline_at": deadline_at})
+        if remaining <= 0:
+            raise BaleAccountOperationTimeout(failed_step)
+        opened = await _await_bale_browser_call(
+            bale_account_executor_registry.execute_open(
+                account_id,
+                _open_bale_authentication_sync,
+                account_id,
+                purpose,
+                operation_id,
+            ),
+            deadline_at,
+            failed_step,
+        )
+        session_id = str(opened.get("maintenance_session_id") or "")
+        lease_owner_id = str(opened.get("profile_lease_owner_id") or "")
+        result = opened
+        failed_step = "wait_for_authenticated_identity"
+        while not result.get("verified"):
+            _, remaining = _operation_deadline({"deadline_at": deadline_at})
+            if remaining <= 0:
+                raise BaleAccountOperationTimeout(failed_step)
+            auth = result.get("auth") or {}
+            auth_state = str(auth.get("auth_state") or result.get("state") or "")
+            if purpose == "session_recheck" and auth_state in {"unauthenticated", "login_required", "verification_code_required", "otp_required"}:
+                raise BaleOnboardingError("authentication_required", "Current Bale Login/OTP screen is visible", {"auth_state": auth_state})
+            if result.get("terminal") and not result.get("verified"):
+                raise BaleOnboardingError(str(result.get("error_code") or auth_state or "authentication_failed"), str(result.get("error_message") or "Authentication operation failed"), result)
+            await asyncio.sleep(min(1.0, remaining))
+            _, remaining = _operation_deadline({"deadline_at": deadline_at})
+            if remaining <= 0:
+                raise BaleAccountOperationTimeout(failed_step)
+            if lease_owner_id:
+                renew_lease = getattr(bale_onboarding_service, "renew_profile_launch_lock", None)
+                if callable(renew_lease):
+                    renew_lease(account_id, lease_owner_id, operation_id=operation_id)
+            result = await _await_bale_browser_call(
+                bale_account_executor_registry.execute_session_operation(session_id, "status", _get_bale_authentication_status_sync, session_id),
+                deadline_at,
+                failed_step,
+            )
+            _update_bale_action_operation(operation_id, stage="waiting_for_authenticated_identity", last_successful_step="authentication_status_checked", result=result)
+        if not result.get("verified"):
+            raise BaleOnboardingError("authentication_operation_timeout", "Authentication did not reach a terminal verified state", result)
+        if session_id and not result.get("maintenance_released"):
+            closed = await _await_bale_browser_call(
+                bale_account_executor_registry.execute_session_operation(
+                    session_id,
+                    "close",
+                    _close_bale_authentication_sync,
+                    session_id,
+                ),
+                deadline_at,
+                "close_authentication_session",
+            )
+            result = {**result, "maintenance_released": bool(closed.get("closed") or closed.get("already_closed"))}
+        failed_step = "load_after_persisted_account_state"
+        final_state = next((row for row in commercial_queue_service.canonical_bale_account_states(include_soft_deleted=True) if row["account_id"] == account_id), None)
+        _update_bale_action_operation(
+            operation_id, status="succeeded", stage="succeeded", success=True, http_status=200,
+            completed_at=datetime.now(timezone.utc).isoformat(), duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            last_successful_step="final_persisted_account_loaded", result={**result, "before_persisted_account_state": before_state, "after_persisted_account_state": final_state, "final_persisted_account_state": final_state},
+            cleanup_result={"browser_closed": bool(result.get("maintenance_released"))}, lock_release_result={"released": True},
+            lease_released_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except BaleAccountOperationTimeout as exc:
+        _terminalize_bale_auth_timeout(
+            operation_id,
+            account_id,
+            started=started,
+            failed_step=getattr(exc, "stage", failed_step),
+            result=result,
+        )
     except Exception as exc:
-        if launch_lock:
-            bale_onboarding_service.release_profile_launch_lock(request.account_id, launch_lock["owner_id"])
-        raise _campaign_lifecycle_error(exc) from exc
+        exception_payload = _account_operation_exception_payload(exc)
+        if session_id:
+            try:
+                await bale_account_executor_registry.execute_session_operation(session_id, "close", _close_bale_authentication_sync, session_id)
+            except Exception as cleanup_exc:
+                exception_payload["cleanup_error"] = _account_operation_exception_payload(cleanup_exc)
+        _update_bale_action_operation(
+            operation_id, status="failed", stage="failed", success=False, http_status=409,
+            completed_at=datetime.now(timezone.utc).isoformat(), duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            error_code=str(getattr(exc, "error_code", type(exc).__name__)), error_message=str(exc),
+            failed_step=failed_step, nested_error=exception_payload,
+            result={"last_authentication_result": result, "before_persisted_account_state": before_state},
+            cleanup_result={"browser_close_attempted": bool(session_id), "cleanup_error": exception_payload.get("cleanup_error")},
+            lock_release_result={"release_attempted": True},
+            lease_released_at=datetime.now(timezone.utc).isoformat() if session_id else None,
+        )
+
+
+async def _run_auth_action(operation_id: str, account_id: str, purpose: str) -> None:
+    """Run one account action with an independent absolute watchdog."""
+    started = time.perf_counter()
+    operation = _bale_action_operations.get(operation_id) or _load_persisted_bale_action_operation(operation_id) or {}
+    deadline_at, remaining = _operation_deadline(operation)
+    if not operation.get("deadline_at"):
+        _update_bale_action_operation(operation_id, deadline_at=deadline_at)
+    browser_task = asyncio.create_task(
+        _run_auth_action_body(operation_id, account_id, purpose, deadline_at, started),
+        name=f"bale-auth-body-{operation_id}",
+    )
+    # Let the body enter its bounded executor call before arming the watchdog;
+    # otherwise a coroutine object could be created and cancelled before it is
+    # scheduled, producing an un-awaited warning during rapid timeout tests.
+    await asyncio.sleep(0)
+    watchdog_task = asyncio.create_task(asyncio.sleep(remaining), name=f"bale-auth-watchdog-{operation_id}")
+    done, _ = await asyncio.wait({browser_task, watchdog_task}, return_when=asyncio.FIRST_COMPLETED)
+    if watchdog_task in done and not browser_task.done():
+        _terminalize_bale_auth_timeout(
+            operation_id,
+            account_id,
+            started=started,
+            failed_step="absolute_operation_deadline",
+        )
+        browser_task.add_done_callback(_consume_background_task)
+        return
+    watchdog_task.cancel()
+    try:
+        await browser_task
+    except asyncio.CancelledError:
+        raise
+
+
+async def _run_non_browser_account_action(operation_id: str, account_id: str, action: str, confirmation: str | None = None) -> None:
+    started = time.perf_counter()
+    try:
+        _update_bale_action_operation(operation_id, status="running", stage="validating")
+        if action == "reset_profile" and confirmation != account_id:
+            raise BaleOnboardingError("account_confirmation_required", "Exact account_id confirmation is required")
+        if action == "delete_account":
+            result = await asyncio.to_thread(commercial_queue_service.delete_bale_account_and_profile, account_id, operation_id)
+        elif action == "reset_profile":
+            result = await asyncio.to_thread(bale_onboarding_service.reset_profile, account_id, confirmation)
+        else:
+            raise BaleOnboardingError("unknown_account_action", action)
+        _update_bale_action_operation(operation_id, status="succeeded", stage="succeeded", success=True, http_status=200, result=result,
+            completed_at=datetime.now(timezone.utc).isoformat(), duration_ms=round((time.perf_counter() - started) * 1000, 3), last_successful_step="final_persisted_account_loaded")
+    except Exception as exc:
+        exception_payload = _account_operation_exception_payload(exc)
+        _update_bale_action_operation(operation_id, status="failed", stage="failed", success=False, http_status=409,
+            completed_at=datetime.now(timezone.utc).isoformat(), duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            error_code=str(getattr(exc, "error_code", type(exc).__name__)), error_message=str(exc), failed_step="account_action",
+            nested_error=exception_payload)
+
+
+def _schedule_bale_action(coroutine: Any) -> None:
+    task = asyncio.create_task(coroutine)
+    _bale_action_tasks.add(task)
+    task.add_done_callback(_bale_action_tasks.discard)
+
+
+# FUNCTION:
+# open_bale_authentication
+# RESPONSIBILITY:
+# Dispatches authentication open to the requested account executor.
+# INPUT:
+# BaleAuthenticationOpenRequest
+# OUTPUT:
+# Authentication maintenance session payload
+# SIDE EFFECTS:
+# Creates an account executor and persistent browser session.
+@router.post("/platforms/bale/authentication/open")
+async def open_bale_authentication(request: BaleAuthenticationOpenRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    action = "session_recheck" if request.purpose == "session_recheck" else "open_login"
+    operation, created = _new_bale_action_operation(
+        request.account_id, action, "/automation/platforms/bale/authentication/open", "POST"
+    )
+    if created:
+        _schedule_bale_action(_run_auth_action(operation["operation_id"], request.account_id, request.purpose))
+    response.status_code = 202
+    return operation
+
+
+@router.post("/platforms/bale/authentication/session-recheck")
+async def recheck_bale_authentication(request: BaleAuthenticationOpenRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    operation, created = _new_bale_action_operation(
+        request.account_id, "session_recheck", "/automation/platforms/bale/authentication/session-recheck", "POST"
+    )
+    if created:
+        _schedule_bale_action(_run_auth_action(operation["operation_id"], request.account_id, "session_recheck"))
+    response.status_code = 202
+    return operation
+
+
+@router.get("/platforms/bale/account-operations/{operation_id}")
+def get_bale_account_action(operation_id: str, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    with _bale_action_guard:
+        operation = _bale_action_operations.get(operation_id)
+        if operation is None:
+            operation = _load_persisted_bale_action_operation(operation_id)
+        if operation is None:
+            raise HTTPException(status_code=404, detail={"error_code": "account_operation_not_found", "operation_id": operation_id})
+        return dict(operation)
 
 
 @router.get("/platforms/bale/authentication/status/{maintenance_session_id}")
-def get_bale_authentication_status(maintenance_session_id: str, response: Response) -> dict[str, Any]:
+async def get_bale_authentication_status(maintenance_session_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        result = commercial_queue_service.get_bale_authentication_status(maintenance_session_id)
-        bale_onboarding_service.record_authentication_status(maintenance_session_id, result)
-        return result
+        return await bale_account_executor_registry.execute_session_operation(
+            maintenance_session_id,
+            "status",
+            _get_bale_authentication_status_sync,
+            maintenance_session_id,
+        )
     except Exception as exc:
+        persisted = bale_onboarding_service.persisted_authentication_status(maintenance_session_id)
+        if persisted is not None:
+            return persisted
         raise _campaign_lifecycle_error(exc) from exc
 
 
 @router.post("/platforms/bale/authentication/verify/{maintenance_session_id}")
-def verify_bale_authentication(maintenance_session_id: str, response: Response) -> dict[str, Any]:
+async def verify_bale_authentication(maintenance_session_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        result = commercial_queue_service.verify_bale_authentication(maintenance_session_id)
-        result["account"] = bale_onboarding_service.record_authentication_verified(maintenance_session_id, result)
-        return result
+        return await bale_account_executor_registry.execute_session_operation(
+            maintenance_session_id,
+            "verify",
+            _verify_bale_authentication_sync,
+            maintenance_session_id,
+        )
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
 
 
 @router.post("/platforms/bale/authentication/close/{maintenance_session_id}")
-def close_bale_authentication(maintenance_session_id: str, response: Response) -> dict[str, Any]:
+async def close_bale_authentication(maintenance_session_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     try:
-        result = commercial_queue_service.close_bale_authentication(maintenance_session_id)
-        result["account"] = bale_onboarding_service.record_authentication_closed(maintenance_session_id, result)
-        return result
+        return await bale_account_executor_registry.execute_session_operation(
+            maintenance_session_id,
+            "close",
+            _close_bale_authentication_sync,
+            maintenance_session_id,
+        )
     except Exception as exc:
         raise _campaign_lifecycle_error(exc) from exc
+
+
+def _open_bale_authentication_sync(account_id: str, purpose: str, operation_id: str | None = None) -> dict[str, Any]:
+    launch_lock = None
+    try:
+        prepare = getattr(commercial_queue_service, "prepare_bale_authentication_open", None)
+        prepared = prepare(account_id) if callable(prepare) else {"action": "new"}
+        if prepared.get("action") == "reuse":
+            return dict(prepared["session"])
+
+        recover = getattr(bale_onboarding_service, "recover_stale_authentication_open", None)
+        if callable(recover):
+            recover(account_id, force=prepared.get("action") == "recovered")
+
+        try:
+            launch_lock = bale_onboarding_service.acquire_profile_launch_lock(account_id, operation_id=operation_id)
+        except TypeError as exc:
+            # Keep third-party/test onboarding implementations compatible while
+            # the canonical store receives operation ownership metadata.
+            if "operation_id" not in str(exc):
+                raise
+            launch_lock = bale_onboarding_service.acquire_profile_launch_lock(account_id)
+        result = commercial_queue_service.open_bale_authentication(account_id)
+        result = {
+            **result,
+            "operation_id": operation_id,
+            "profile_generation_id": launch_lock.get("profile_generation_id"),
+            "owner_pid": launch_lock.get("owner_pid"),
+            "profile_lease_owner_id": launch_lock.get("owner_id"),
+        }
+        account = bale_onboarding_service.record_authentication_open(account_id, result, purpose=purpose)
+        auth = result.get("auth") or {}
+        if auth.get("auth_state") == "authenticated" and bool(auth.get("authenticated")):
+            # Login completion always flows directly into the same own-profile
+            # identity probe used by polling. Shell visibility alone is insufficient.
+            try:
+                verified = _verify_bale_authentication_sync(str(result["maintenance_session_id"]), close_after=True)
+                return {**result, **verified, "automatic_post_login_verification": True}
+            except Exception as exc:
+                code = str(getattr(exc, "error_code", "auth_probe_inconclusive"))
+                bale_onboarding_service.record_session_health_probe(account_id, result="temporarily_inconclusive")
+                return {
+                    **result,
+                    "state": "temporarily_inconclusive",
+                    "terminal": False,
+                    "retryable": True,
+                    "error_code": code,
+                    "error_message": str(exc),
+                    "automatic_post_login_verification": True,
+                }
+        return result
+    except Exception:
+        if launch_lock:
+            bale_onboarding_service.release_profile_launch_lock(account_id, launch_lock["owner_id"])
+        raise
+
+
+def _bale_authentication_open_error(exc: Exception) -> HTTPException:
+    error_code = getattr(exc, "error_code", None) or "bale_authentication_open_failed"
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_code": error_code,
+            "error_message": str(exc),
+            "validation": getattr(exc, "details", None) or getattr(exc, "summary", {}),
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+def _get_bale_authentication_status_sync(maintenance_session_id: str) -> dict[str, Any]:
+    result = commercial_queue_service.get_bale_authentication_status(maintenance_session_id)
+    recorded = bale_onboarding_service.record_authentication_status(maintenance_session_id, result)
+    auth = recorded.get("auth") or {}
+    if auth.get("auth_state") == "authenticated" and auth.get("authenticated") and auth.get("chat_shell_visible"):
+        return _verify_bale_authentication_sync(maintenance_session_id, close_after=True)
+    return recorded
+
+
+def _verify_bale_authentication_sync(maintenance_session_id: str, close_after: bool = True) -> dict[str, Any]:
+    result = commercial_queue_service.verify_bale_authentication(maintenance_session_id)
+    result["account"] = bale_onboarding_service.record_authentication_verified(maintenance_session_id, result)
+    if result.get("verified"):
+        activate = getattr(commercial_queue_service, "activate_verified_account_eligibility", None)
+        if callable(activate):
+            activation = activate(str(result.get("account_id") or ""), previously_eligible=False)
+            result["worker_eligibility"] = activation
+            result["readiness"] = activation.get("readiness")
+            result["scheduler_woken"] = activation.get("scheduler_woken", False)
+        else:
+            refresh = getattr(commercial_queue_service, "refresh_authenticated_bale_worker_eligibility", None)
+            if callable(refresh):
+                result["worker_eligibility"] = refresh()
+        result["state"] = "ready"
+        result["terminal"] = True
+        result["retryable"] = False
+        if close_after:
+            close_result = commercial_queue_service.close_bale_authentication(maintenance_session_id)
+            bale_onboarding_service.record_authentication_closed(maintenance_session_id, close_result)
+            result["maintenance_released"] = bool(close_result.get("closed") or close_result.get("already_closed"))
+        else:
+            result["maintenance_released"] = False
+    return result
+
+
+def _close_bale_authentication_sync(maintenance_session_id: str) -> dict[str, Any]:
+    result = commercial_queue_service.close_bale_authentication(maintenance_session_id)
+    result["account"] = bale_onboarding_service.record_authentication_closed(maintenance_session_id, result)
+    return result
+
+
+# ============================================================
+# END BLOCK: BALE_AUTHENTICATION_ACCOUNT_EXECUTOR_BOUNDARY
+# ============================================================
 
 
 def _onboarding_error(exc: Exception) -> HTTPException:
@@ -2660,13 +3656,34 @@ def _onboarding_error(exc: Exception) -> HTTPException:
 @router.get("/platforms/bale/onboarding/accounts")
 def list_bale_onboarding_accounts(response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    return bale_onboarding_service.list_accounts()
+    from app.performance import span
+    with span("onboarding_bulk_database"):
+        items = commercial_queue_service.canonical_bale_account_states()
+        configuration = bale_onboarding_service.configuration()
+    return {"items": items, "configuration": configuration, "summary": {
+        "registered_accounts": sum(bool(item.get("registered")) for item in items),
+        "authenticated_accounts": sum(item.get("session_state") == "authenticated" for item in items),
+        "login_required_accounts": sum(item.get("session_state") == "login_required" for item in items),
+        "verification_fresh": sum(bool(item.get("session_healthy_recent")) for item in items),
+        "verification_expired": sum(bool(item.get("verification_expired")) for item in items),
+        "identity_verified": sum(bool(item.get("durable_identity_verified")) for item in items),
+        "session_healthy": sum(bool(item.get("session_health_acceptable")) for item in items),
+        "probe_due": sum("session_revalidation_required" in item.get("eligibility_reasons", []) for item in items),
+        "in_grace": sum(bool(item.get("session_in_grace")) for item in items),
+        "otp_required": sum(item.get("session_state") == "otp_required" for item in items),
+        "disabled": sum(not item.get("enabled") for item in items),
+        "cooling_down": 0,
+        "eligible": sum(bool(item.get("worker_eligible")) for item in items),
+        "active": sum(item.get("worker_status") != "idle" for item in items),
+        "daily_limited": 0,
+        "error": sum(bool(item.get("last_error")) for item in items),
+    }}
 
 
 @router.get("/platforms/bale/onboarding/accounts/{account_id}")
 def get_bale_onboarding_account(account_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
-    account = bale_onboarding_service.get_account(account_id)
+    account = next((item for item in commercial_queue_service.canonical_bale_account_states(include_soft_deleted=True) if item["account_id"] == account_id), None)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     return account
@@ -2676,6 +3693,31 @@ def get_bale_onboarding_account(account_id: str, response: Response) -> dict[str
 def reconcile_bale_onboarding_account(account_id: str, response: Response) -> dict[str, Any]:
     _set_dashboard_cors_headers(response)
     return bale_onboarding_service.reconcile(account_id)
+
+@router.delete("/platforms/bale/accounts/{account_id}")
+async def delete_bale_account(account_id: str, response: Response, delete_profile: bool = Query(True)) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    if not delete_profile:
+        raise HTTPException(status_code=400, detail={"error_code": "delete_profile_confirmation_required"})
+    operation, created = _new_bale_action_operation(
+        account_id, "delete_account", f"/automation/platforms/bale/accounts/{account_id}", "DELETE"
+    )
+    if created:
+        _schedule_bale_action(_run_non_browser_account_action(operation["operation_id"], account_id, "delete_account"))
+    response.status_code = 202
+    return operation
+
+
+@router.post("/platforms/bale/onboarding/accounts/{account_id}/reset-profile")
+async def reset_bale_account_profile(account_id: str, request: BaleProfileResetRequest, response: Response) -> dict[str, Any]:
+    _set_dashboard_cors_headers(response)
+    operation, created = _new_bale_action_operation(
+        account_id, "reset_profile", f"/automation/platforms/bale/onboarding/accounts/{account_id}/reset-profile", "POST"
+    )
+    if created:
+        _schedule_bale_action(_run_non_browser_account_action(operation["operation_id"], account_id, "reset_profile", request.confirmation))
+    response.status_code = 202
+    return operation
 
 
 @router.post("/platforms/bale/onboarding/preflight")
@@ -3020,15 +4062,6 @@ def update_bale_account(
     payload = {key: value for key, value in request.model_dump().items() if value is not None}
     try:
         return bale_account_store.update_account(account_id, payload)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Account not found: {account_id}") from None
-
-
-@router.delete("/platforms/bale/accounts/{account_id}")
-def delete_bale_account(account_id: str, response: Response) -> dict[str, Any]:
-    _set_dashboard_cors_headers(response)
-    try:
-        return bale_account_store.delete_account(account_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Account not found: {account_id}") from None
 

@@ -23,6 +23,7 @@ def _approved_flow(phones: list[str], platforms: list[str]):
     service = _service(Path(tmp.name) / "controlled.db", Path(tmp.name) / "contacts.json")
     service.account_auth_checker = lambda account_id: True
     campaign = service.create_campaign({"name": "Controlled", "platform": "multi"})
+    service.repository.upsert_campaign_capacity_reservation(campaign["id"], len(phones), 1000)
     service.confirm_recipient_manifest(campaign["id"], phones, confirmation_checked=True, submitted_by="test")
     service.materialize_campaign_recipients(
         campaign["id"],
@@ -77,6 +78,7 @@ def _authorized_no_send_flow(phones: list[str] | None = None):
     service.account_auth_checker = lambda account_id: True
     campaign = service.create_campaign({"name": "Controlled No Send", "platform": "bale"})
     selected_phones = phones or ["09304073331"]
+    service.repository.upsert_campaign_capacity_reservation(campaign["id"], len(selected_phones), 1000)
     service.confirm_recipient_manifest(campaign["id"], selected_phones, confirmation_checked=True, submitted_by="test")
     service.materialize_campaign_recipients(
         campaign["id"],

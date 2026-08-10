@@ -43,7 +43,7 @@ def resolve_system_browser_executable() -> str | None:
 class BrowserManager:
     def __init__(self, session_manager: SessionManager | None = None) -> None:
         self.session_manager = session_manager or SessionManager()
-        self._playwright: Any = None
+        self.playwright_runtime: Any = None
         self._browser: Any = None
         self._contexts: dict[str, Any] = {}
         self._pages: dict[str, Any] = {}
@@ -69,7 +69,7 @@ class BrowserManager:
         except Exception as exc:
             raise RuntimeError("Playwright is not installed or not importable") from exc
 
-        self._playwright = sync_playwright().start()
+        self.playwright_runtime = sync_playwright().start()
         self._headless = headless
         browser_path = resolve_system_browser_executable()
         self.last_browser_path = browser_path
@@ -83,7 +83,7 @@ class BrowserManager:
 
         print("[BrowserManager] FORCED system browser:", browser_path)
         launch_headless = False if platform.system() == "Windows" or os.name == "nt" else headless
-        self._browser = self._playwright.chromium.launch(
+        self._browser = self.playwright_runtime.chromium.launch(
             executable_path=browser_path,
             headless=launch_headless,
             args=[],
@@ -184,9 +184,9 @@ class BrowserManager:
             self._browser.close()
             self._browser = None
 
-        if self._playwright is not None:
-            self._playwright.stop()
-            self._playwright = None
+        if self.playwright_runtime is not None:
+            self.playwright_runtime.stop()
+            self.playwright_runtime = None
 
     def _profile_for_account(
         self,
@@ -222,12 +222,12 @@ class BrowserManager:
         headless: bool = True,
         profile_metadata: dict[str, Any] | None = None,
     ) -> Any:
-        if self._playwright is None:
+        if self.playwright_runtime is None:
             try:
                 from playwright.sync_api import sync_playwright
             except Exception as exc:
                 raise RuntimeError("Playwright is not installed or not importable") from exc
-            self._playwright = sync_playwright().start()
+            self.playwright_runtime = sync_playwright().start()
 
         record = resolve_profile_record(account_id, profile_metadata or {})
         if str(user_data_dir) and str(user_data_dir) != record.user_data_dir:
@@ -254,7 +254,7 @@ class BrowserManager:
         print("[BrowserManager] FORCED system browser:", browser_path)
         launch_headless = False if platform.system() == "Windows" or os.name == "nt" else headless
         try:
-            context = self._playwright.chromium.launch_persistent_context(
+            context = self.playwright_runtime.chromium.launch_persistent_context(
                 user_data_dir=record.user_data_dir,
                 executable_path=browser_path,
                 headless=launch_headless,

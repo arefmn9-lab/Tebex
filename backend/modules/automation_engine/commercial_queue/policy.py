@@ -14,9 +14,15 @@ class EffectiveExecutionPolicy:
     source_channel_uid: str = ""
     source_channel_candidates: list[str] = field(default_factory=list)
     operation_order: list[str] = field(default_factory=lambda: ["save_contact", "forward_message"])
-    max_concurrent_accounts: int = 3
+    concurrency_mode: str = "unrestricted"
+    operator_defined_max_concurrent_accounts: int = 1
+    browser_concurrency: int = 1
+    worker_concurrency: int = 1
+    max_concurrent_accounts: int = 1
+    accounts_per_round: int = 1
     deliveries_per_round: int = 10
     daily_limit_per_account: int = 50
+    max_successful_sends_per_account: int = 50
     delay_between_deliveries_seconds: int = 60
     link_open_delay_seconds: int = 0
     round_cooldown_seconds: int = 900
@@ -58,6 +64,13 @@ ACCOUNT_ALIASES = {
     "priority": "priority",
 }
 
+CAMPAIGN_ALIASES = {
+    # Both legacy fields were already stored in seconds. These aliases are a
+    # lossless rename: the exact operator integer is preserved.
+    "operation_delay_seconds": "delay_between_deliveries_seconds",
+    "round_delay_seconds": "round_cooldown_seconds",
+}
+
 BOOLEAN_FIELDS = {
     "session_reuse_enabled",
     "resource_guard_enabled",
@@ -70,8 +83,13 @@ BOOLEAN_FIELDS = {
 
 INTEGER_FIELDS = {
     "max_concurrent_accounts",
+    "operator_defined_max_concurrent_accounts",
+    "browser_concurrency",
+    "worker_concurrency",
+    "accounts_per_round",
     "deliveries_per_round",
     "daily_limit_per_account",
+    "max_successful_sends_per_account",
     "delay_between_deliveries_seconds",
     "link_open_delay_seconds",
     "round_cooldown_seconds",
@@ -150,7 +168,7 @@ class EffectivePolicyResolver:
         if (campaign or {}).get("source_channel_uid") is not None:
             campaign_overrides.setdefault("source_channel_uid", (campaign or {}).get("source_channel_uid"))
         campaign_overrides.setdefault("platform", (campaign or {}).get("platform") or platform)
-        campaign_overrides = _normalize_scope(campaign_overrides)
+        campaign_overrides = _normalize_scope(campaign_overrides, CAMPAIGN_ALIASES)
         account_overrides = _normalize_scope(account, ACCOUNT_ALIASES)
 
         effective = EffectiveExecutionPolicy().__dict__.copy()

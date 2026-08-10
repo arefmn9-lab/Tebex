@@ -87,7 +87,7 @@ class FakeAdapter:
         return self.execute_plan(plan, runtime_session=session)
 
     def execute_plan(self, plan: object, runtime_session: object | None = None) -> dict:
-        return {"success": True, "forward_verified": False if plan.dry_run else True, "diagnostics_consistent": True, "confirm_click_count": 0 if plan.dry_run else 1, "verified_forwarded_recipient_count": 0 if plan.dry_run else 1}
+        return {"success": True, "forward_verified": True, "diagnostics_consistent": True, "confirm_click_count": 1, "verified_forwarded_recipient_count": 1}
 
     def reset_session_after_job(self, session: object, plan: object, result: dict) -> dict:
         self.reset_calls.append(plan.job_id)
@@ -115,7 +115,7 @@ class Recorder:
         self.calls.append(dict(payload))
         if self.results:
             return dict(self.results.pop(0))
-        return {"success": True, "forward_verified": False if payload.get("dry_run") else True, "diagnostics_consistent": True, "confirm_click_count": 0, "verified_forwarded_recipient_count": 0}
+        return {"success": True, "forward_verified": True, "diagnostics_consistent": True, "confirm_click_count": 1, "verified_forwarded_recipient_count": 1}
 
 
 def _service(path: Path, recorder: Recorder | None = None, adapter: FakeAdapter | None = None) -> CommercialQueueService:
@@ -146,7 +146,7 @@ def _service(path: Path, recorder: Recorder | None = None, adapter: FakeAdapter 
 
 def _seed(service: CommercialQueueService, account_id: str = "acct_a", count: int = 3) -> dict:
     service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": count, "round_cooldown_override": 0, "delay_between_deliveries_override": 0})
-    campaign = service.create_campaign({"name": "Reuse", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
+    campaign = service.create_campaign({"name": "Reuse", "platform": "bale", "status": "running", "source_channel_uid": "5613544284", "capacity_reservation": count})
     service.import_recipients(campaign["id"], [f"0930407333{index}" for index in range(1, count + 1)])
     _authorize_campaign_recipients(service, campaign["id"])
     return campaign
@@ -176,7 +176,7 @@ def test_feature_flag_false_preserves_legacy_lifecycle_and_standalone_supported(
         adapter = FakeAdapter()
         service = _service(Path(tmp_dir) / "reuse.db", recorder, adapter)
         campaign = _seed(service, count=2)
-        result = service.run_account_round("acct_a", campaign["id"], max_jobs=2, dry_run=True)
+        result = service.run_account_round("acct_a", campaign["id"], max_jobs=2)
 
     assert result["processed_count"] == 2
     assert adapter.create_calls == []
@@ -221,14 +221,14 @@ def test_health_prepare_blocks_closed_stale_and_mismatched_state() -> None:
         assert exc.error_code == "session_page_closed"
 
 
-def test_worker_round_reuses_one_session_for_three_dry_run_jobs() -> None:
+def test_worker_round_reuses_one_session_for_three_real_send_jobs() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         recorder = Recorder()
         adapter = FakeAdapter()
         service = _service(Path(tmp_dir) / "reuse.db", recorder, adapter)
         service.update_global_settings({"session_reuse_enabled": True})
         campaign = _seed(service, count=3)
-        result = service.run_account_round("acct_a", campaign["id"], max_jobs=3, dry_run=True)
+        result = service.run_account_round("acct_a", campaign["id"], max_jobs=3)
         settings = service.resolve_account_settings("acct_a")
         active = service.runtime_session_manager.list_active_sessions()
 
@@ -242,9 +242,9 @@ def test_worker_round_reuses_one_session_for_three_dry_run_jobs() -> None:
     assert result["results"][1]["session_reused"] is True
     assert adapter.close_calls and len(adapter.close_calls) == 1
     assert len(adapter.reset_calls) == 3
-    assert all(item["result"]["confirm_click_count"] == 0 for item in result["results"])
-    assert settings["current_daily_sent_count"] == 0
-    assert settings["current_round_sent_count"] == 0
+    assert all(item["result"]["confirm_click_count"] == 1 for item in result["results"])
+    assert settings["current_daily_sent_count"] == 3
+    assert settings["current_round_sent_count"] == 3
     assert active == []
 
 
@@ -259,7 +259,7 @@ def test_unsafe_failures_invalidate_stop_and_requeue() -> None:
             service = _service(Path(tmp_dir) / "reuse.db", recorder)
             service.update_global_settings({"session_reuse_enabled": True})
             campaign = _seed(service, count=3)
-            result = service.run_account_round("acct_a", campaign["id"], max_jobs=3, dry_run=False)
+            result = service.run_account_round("acct_a", campaign["id"], max_jobs=3)
             queued = service.list_jobs(campaign_id=campaign["id"], status="queued", limit=10)["items"]
         assert result["stopped_early"] is True
         assert result["processed_count"] == 1
@@ -276,7 +276,7 @@ def test_ordinary_recipient_failure_can_continue_when_safe() -> None:
         service = _service(Path(tmp_dir) / "reuse.db", recorder)
         service.update_global_settings({"session_reuse_enabled": True})
         campaign = _seed(service, count=2)
-        result = service.run_account_round("acct_a", campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round("acct_a", campaign["id"], max_jobs=2)
     assert result["processed_count"] == 2
     assert result["stopped_early"] is False
 
@@ -288,7 +288,7 @@ def test_capacity_denial_prevents_browser_creation_and_leaves_unclaimed() -> Non
         service.update_global_settings({"session_reuse_enabled": True, "resource_guard_enabled": True, "max_system_cpu_percent": 50})
         service.resource_provider = ResourceCapacityProvider(service.repository, cpu_percent=99)
         campaign = _seed(service, count=1)
-        result = service.run_account_round("acct_a", campaign["id"], max_jobs=1, dry_run=True)
+        result = service.run_account_round("acct_a", campaign["id"], max_jobs=1)
         jobs = service.list_jobs(campaign_id=campaign["id"], limit=10)["items"]
     assert adapter.create_calls == []
     assert result["processed_count"] == 0
@@ -302,16 +302,16 @@ def test_scheduler_batching_zero_stagger_20_account_isolation_and_failure_isolat
         sleeps: list[float] = []
         service.sleeper = lambda seconds: sleeps.append(seconds)
         service.update_global_settings({"session_reuse_enabled": True, "max_concurrent_accounts": 20, "browser_start_batch_size": 5, "browser_start_stagger_ms": 0, "deliveries_per_account_round": 1})
-        campaign = service.create_campaign({"name": "Many", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
         phones: list[str] = []
         for index in range(20):
             account_id = f"acct_{index:02d}"
             service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": 1, "round_cooldown_override": 0})
             phones.append(f"09304073{index:03d}")
+        campaign = service.create_campaign({"name": "Many", "platform": "bale", "status": "running", "source_channel_uid": "5613544284", "capacity_reservation": 20})
         service.import_recipients(campaign["id"], phones)
         _authorize_campaign_recipients(service, campaign["id"], "mock 20-account scheduler recipient")
         service.scheduler_start()
-        result = service.scheduler_run_once(campaign["id"], dry_run=True)
+        result = service.scheduler_run_once(campaign["id"])
     assert sleeps == []
     assert len(result["started_accounts"]) == 20
     assert len(set(adapter.close_calls)) == 19

@@ -3,11 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-TEST_ROOT = Path(__file__).resolve().parent.parent / ".fastapi_isolated"
-os.environ["CLINICOS_AUTOMATION_DATABASE_PATH"] = str(TEST_ROOT / "state.db")
-os.environ["CLINICOS_BALE_PROFILE_ROOT"] = str(TEST_ROOT / "profiles")
-os.environ["CLINICOS_BALE_RUNTIME_DIR"] = str(TEST_ROOT / "registry")
-
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -19,9 +14,19 @@ from modules.automation_engine.plugins.bale.account_store import BaleAccountStor
 class FakeAuthentication:
     def __init__(self) -> None:
         self.sessions = {}
+        self.onboarding = None
+
+    def canonical_bale_account_states(self):
+        return self.onboarding.list_accounts()["items"] if self.onboarding is not None else []
 
     def audit_bale_authentication_profile(self, account_id):
         return {"account_id": account_id, "all_paths_match_expected": True, "secrets_exposed": False}
+
+    def prepare_bale_authentication_open(self, account_id):
+        session = self.sessions.get(f"fake-{account_id}")
+        if session and not session.get("closed"):
+            return {"action": "reuse", "account_id": account_id, "session": {**session, "reused": True}}
+        return {"action": "new", "account_id": account_id}
 
     def open_bale_authentication(self, account_id):
         session_id = f"fake-{account_id}"
@@ -38,6 +43,8 @@ class FakeAuthentication:
         return result
 
     def close_bale_authentication(self, session_id):
+        if session_id in self.sessions:
+            self.sessions[session_id]["closed"] = True
         return {"maintenance_session_id": session_id, "closed": True, "ok": True}
 
 
@@ -46,6 +53,7 @@ def test_actual_http_onboarding_flow_is_dependency_isolated(tmp_path, monkeypatc
     store._write_json(store.accounts_path, [])
     service = BaleOnboardingService(tmp_path / "state.db", store, tmp_path / "profiles", lambda _record: [])
     fake = FakeAuthentication()
+    fake.onboarding = service
     monkeypatch.setattr(automation, "bale_onboarding_service", service)
     monkeypatch.setattr(automation, "commercial_queue_service", fake)
     client = TestClient(app)
@@ -58,27 +66,15 @@ def test_actual_http_onboarding_flow_is_dependency_isolated(tmp_path, monkeypatc
     assert client.get(f"/automation/platforms/bale/onboarding/accounts/{account_id}/reconcile").json()["safe_to_preserve"]
     batch = client.post("/automation/platforms/bale/onboarding/batches", json={"name": "test", "target_count": 7, "account_ids": [account_id]}).json()
     assert batch["current_batch_size"] == 1
-    opened = client.post("/automation/platforms/bale/authentication/open", json={"account_id": account_id, "purpose": "login"}).json()
-    session_id = opened["maintenance_session_id"]
-    assert client.get(f"/automation/platforms/bale/authentication/status/{session_id}").status_code == 200
-    verified = client.post(f"/automation/platforms/bale/authentication/verify/{session_id}").json()
-    assert verified["account"]["lifecycle_status"] == "persistence_check_required"
-    assert client.post(f"/automation/platforms/bale/authentication/close/{session_id}").status_code == 200
-
-    persistence = client.post("/automation/platforms/bale/authentication/open", json={"account_id": account_id, "purpose": "persistence"}).json()
-    verified = client.post(f"/automation/platforms/bale/authentication/verify/{persistence['maintenance_session_id']}").json()
-    assert verified["account"]["lifecycle_status"] == "ready"
-    client.post(f"/automation/platforms/bale/authentication/close/{persistence['maintenance_session_id']}")
-    enabled_response = client.put(f"/automation/platforms/bale/onboarding/accounts/{account_id}/scheduling", json={"enabled": True})
-    assert enabled_response.status_code == 200, enabled_response.json()
-    enabled = enabled_response.json()
-    assert enabled["scheduling_enabled"]
+    opened_response = client.post("/automation/platforms/bale/authentication/open", json={"account_id": account_id, "purpose": "login"})
+    assert opened_response.status_code == 202
+    opened = opened_response.json()
+    assert opened["operation_id"].startswith("baleop_")
+    assert client.get(f"/automation/platforms/bale/account-operations/{opened['operation_id']}").status_code == 200
     settings = client.put("/automation/platforms/bale/onboarding/configuration", json={"configuration": {"max_login_concurrency": 2}}).json()
     assert settings["max_login_concurrency"] == 2
     assert client.get("/automation/platforms/bale/onboarding/configuration").json()["max_login_concurrency"] == 2
     assert client.post("/automation/platforms/bale/onboarding/recover-stale-sessions").status_code == 200
-    retired = client.post(f"/automation/platforms/bale/onboarding/accounts/{account_id}/retire", json={"reason": "test"}).json()
-    assert retired["retired"]
     assert (tmp_path / "profiles" / account_id).exists()
 
 
@@ -86,3 +82,57 @@ def test_legacy_login_routes_are_contained(monkeypatch):
     client = TestClient(app)
     assert client.post("/automation/platforms/bale/accounts/anything/open-login").status_code == 410
     assert client.post("/automation/platforms/bale/accounts/anything/check-login").status_code == 410
+
+
+def test_account_operation_result_survives_in_memory_registry_restart(tmp_path, monkeypatch):
+    store = BaleAccountStore(tmp_path / "registry-operation")
+    store._write_json(store.accounts_path, [])
+    onboarding = BaleOnboardingService(tmp_path / "operations.db", store, tmp_path / "profiles-operation", lambda _record: [])
+    account = onboarding.provision({"identifier": "09211690534", "idempotency_key": "operation", "created_by": "test"})["account"]
+    monkeypatch.setattr(automation, "bale_onboarding_service", onboarding)
+    operation, _ = automation._new_bale_action_operation(account["account_id"], "session_recheck", "/test", "POST")
+    automation._update_bale_action_operation(operation["operation_id"], status="completed", stage="completed", success=True, result={"persisted": True})
+    automation._bale_action_operations.pop(operation["operation_id"], None)
+
+    response = TestClient(app).get(f"/automation/platforms/bale/account-operations/{operation['operation_id']}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["result"] == {"persisted": True}
+
+
+def test_existing_bale_account_authentication_open_is_mounted_and_cors_safe(tmp_path, monkeypatch):
+    account_id = "bale_09211690533"
+    fake = FakeAuthentication()
+    store = BaleAccountStore(tmp_path / "registry")
+    store._write_json(store.accounts_path, [])
+    onboarding = BaleOnboardingService(tmp_path / "state.db", store, tmp_path / "profiles", lambda _record: [])
+    onboarding.provision({"identifier": "09211690533", "idempotency_key": "existing", "created_by": "test"})
+    fake.onboarding = onboarding
+    monkeypatch.setattr(automation, "bale_onboarding_service", onboarding)
+    monkeypatch.setattr(automation, "commercial_queue_service", fake)
+    client = TestClient(app)
+
+    response = client.post(
+        "/automation/platforms/bale/authentication/open",
+        headers={"Origin": "http://127.0.0.1:5173"},
+        json={"account_id": account_id, "purpose": "login"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["account_id"] == account_id
+    assert response.json()["operation_id"].startswith("baleop_")
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+
+    repeated = client.post(
+        "/automation/platforms/bale/authentication/open",
+        headers={"Origin": "http://127.0.0.1:5173"},
+        json={"account_id": account_id, "purpose": "login"},
+    )
+    assert repeated.status_code == 202
+    first_status = client.get(f"/automation/platforms/bale/account-operations/{response.json()['operation_id']}").json()["status"]
+    if first_status in {"queued", "running"}:
+        assert repeated.json()["operation_id"] == response.json()["operation_id"]
+    else:
+        assert repeated.json()["operation_id"].startswith("baleop_")
+
+    automation.bale_account_executor_registry.shutdown_all()

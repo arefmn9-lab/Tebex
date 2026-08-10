@@ -131,6 +131,9 @@ def _controlled_campaign(service: CommercialQueueService) -> tuple[dict[str, Any
         "platform": "bale",
         "status": "running",
         "source_channel_uid": SOURCE_UID,
+        # Two recipient jobs are intentionally exercised through one
+        # account/session; this fixture has no requested account demand.
+        "capacity_reservation": 0,
         "policy_overrides": {
             "session_reuse_enabled": True,
             "resource_guard_enabled": True,
@@ -196,7 +199,7 @@ def test_one_browser_session_two_jobs_second_reuses_session_counters_increment()
         service, recorder, adapter = _service(Path(tmp) / "live.db")
         campaign, _, _ = _controlled_campaign(service)
         before = service.resolve_account_settings(ACCOUNT_ID)
-        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2)
         after = service.resolve_account_settings(ACCOUNT_ID)
         jobs = service.repository.list_campaign_jobs_all(campaign["id"])
     assert result["processed_count"] == 2
@@ -218,7 +221,7 @@ def test_reset_failure_blocks_second_job_without_retry() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         service, recorder, _ = _service(Path(tmp) / "live.db", adapter=FakeAdapter(reset_ok=False))
         campaign, _, _ = _controlled_campaign(service)
-        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2)
         jobs = service.repository.list_campaign_jobs_all(campaign["id"])
     assert result["processed_count"] == 1
     assert result["stopped_early"] is True
@@ -236,7 +239,7 @@ def test_confirm_uncertainty_stops_round_no_retry_no_counter_increment_for_failu
         service, recorder, _ = _service(Path(tmp) / "live.db", recorder=recorder)
         campaign, _, _ = _controlled_campaign(service)
         before = service.resolve_account_settings(ACCOUNT_ID)
-        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2)
         after = service.resolve_account_settings(ACCOUNT_ID)
         jobs = service.repository.list_campaign_jobs_all(campaign["id"])
     assert result["processed_count"] == 1
@@ -262,7 +265,7 @@ def test_exact_recipient_selection_mismatch_stops_before_second_job() -> None:
         }])
         service, recorder, _ = _service(Path(tmp) / "live.db", recorder=recorder)
         campaign, _, _ = _controlled_campaign(service)
-        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2)
         jobs = service.repository.list_campaign_jobs_all(campaign["id"])
     assert result["processed_count"] == 1
     assert result["stopped_early"] is True
@@ -280,7 +283,7 @@ def test_synthetic_or_unverified_recipient_rejected_before_adapter() -> None:
         campaign, recipients, _ = _controlled_campaign(service)
         service.repository.update_recipient_authorization(recipients[0]["id"], {"synthetic_test_data": True, "live_execution_authorized": False, "authorization_status": "dry_run_only"})
         service.repository.update_jobs_authorization_by_recipient(recipients[0]["id"], {"synthetic_test_data": True, "live_execution_authorized": False, "authorization_status": "dry_run_only"})
-        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=2)
     assert result["processed_count"] >= 1
     assert recorder.calls and recorder.calls[0]["display_name"] == "Bale-000009"
 

@@ -5053,7 +5053,7 @@ def _with_temp_bale_account_store(tmp_dir: str, account_id: str = "bale_orchestr
     store.create_account(
         {
             "account_id": account_id,
-            "phone": "09214032167",
+            "phone": "09350000001",
             "status": "active",
             "browser_provider": "native_chrome",
         }

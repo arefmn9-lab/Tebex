@@ -103,7 +103,7 @@ def _service(path: Path) -> CommercialQueueService:
 
 
 def _campaign(service: CommercialQueueService, name: str, uid: str) -> dict[str, Any]:
-    return service.create_campaign({"name": name, "platform": "bale", "status": "draft", "source_channel_uid": uid})
+    return service.create_campaign({"name": name, "platform": "bale", "status": "draft", "source_channel_uid": uid, "capacity_reservation": 1})
 
 
 def _approve_snapshot(service: CommercialQueueService, campaign_id: str, uid: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -267,7 +267,7 @@ def test_worker_rejects_snapshot_mismatch_before_browser_or_adapter() -> None:
             "execution_snapshot_id": "wrong",
             "configuration_snapshot_hash": "wrong",
         })
-        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=1, dry_run=False)
+        result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=1)
         stored = service.repository.get_job(job["id"])
     assert result["processed_count"] == 1
     assert stored["last_error_code"] == "execution_snapshot_missing"

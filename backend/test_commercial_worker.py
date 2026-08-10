@@ -3,11 +3,12 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
 from app.main import app
 from app.routes import automation as automation_routes
 from fastapi.testclient import TestClient
 from modules.automation_engine.commercial_queue.repository import CommercialQueueRepository, commercial_send_completed, utc_now
-from modules.automation_engine.commercial_queue.service import CommercialQueueService
+from modules.automation_engine.commercial_queue.service import CampaignLifecycleError, CommercialQueueService
 
 
 class OrchestratorStub:
@@ -23,20 +24,62 @@ class OrchestratorStub:
             result = {"success": True, "forward_verified": True, "diagnostics_consistent": True}
         return {
             "action": "forward_latest_channel_message",
-            "verified_forwarded_recipient_count": 1 if result.get("success") and not payload.get("dry_run") else 0,
-            "confirm_click_count": 0 if payload.get("dry_run") else 1,
+            "verified_forwarded_recipient_count": 1 if result.get("success") and payload.get("execution_mode") == "real_send" else 0,
+            "confirm_click_count": 0 if payload.get("execution_mode") != "real_send" else 1,
             "error_code": None,
             "error_message": None,
             **result,
         }
 
 
+class IsolatedContactStoreStub:
+    """Provide a durable local contact proof without an external Bale call."""
+
+    def __init__(self, repository: CommercialQueueRepository) -> None:
+        self.repository = repository
+
+    @staticmethod
+    def _display_name(phone: str) -> str:
+        return f"Fixture-{phone[-4:]}"
+
+    def get_platform_contact(self, _platform: str, phone: str) -> dict[str, str]:
+        return {"display_name": self._display_name(phone)}
+
+    def ensure_stable_mapping(self, phone: str, display_name: str, account_id: str) -> dict[str, str]:
+        mapping = self.repository.get_or_create_stable_contact_mapping(phone, display_name)
+        verified_at = utc_now()
+        binding_id = f"fixture-binding:{account_id}:{mapping['id']}"
+        self.repository.upsert_account_contact_proof(
+            {
+                "account_id": account_id,
+                "mapping_id": mapping["id"],
+                "binding_id": binding_id,
+                "normalized_phone": phone,
+                "recipient_display_name": display_name,
+                "preparation_status": "prepared",
+                "verification_status": "verified",
+                "verification_method": "isolated_fixture",
+                "prepared_at": verified_at,
+                "verified_at": verified_at,
+                "profile_identity": account_id,
+                "last_successful_step": "fixture_contact_proof",
+            }
+        )
+        return {"account_binding_id": binding_id}
+
+    def get_or_create_bale_contact(self, _account_id: str, phone: str) -> tuple[dict[str, str], bool]:
+        display_name = self._display_name(phone)
+        return {"stable_name": display_name, "display_name": display_name}, False
+
+
 def _service(path: Path, orchestrator: OrchestratorStub | None = None) -> CommercialQueueService:
+    repository = CommercialQueueRepository(path)
     service = CommercialQueueService(
-        repository=CommercialQueueRepository(path),
+        repository=repository,
         orchestrator=orchestrator or OrchestratorStub(),
         account_auth_checker=lambda account_id: True,
         sleeper=lambda seconds: None,
+        contact_store=IsolatedContactStoreStub(repository),
     )
     service.update_global_settings(
         {
@@ -49,11 +92,30 @@ def _service(path: Path, orchestrator: OrchestratorStub | None = None) -> Commer
             "job_timeout_seconds": 30,
         }
     )
+    for account_id in ("bale_a", "bale_b", "bale_c"):
+        service.update_account_settings(
+            account_id,
+            {
+                "enabled": True,
+                "worker_status": "idle",
+                "source_channel_uid_override": "5613544284",
+                "daily_limit_override": 10,
+                "deliveries_per_round_override": 2,
+            },
+        )
     return service
 
 
 def _campaign_with_jobs(service: CommercialQueueService, count: int = 3) -> dict:
-    campaign = service.create_campaign({"name": "Worker Campaign", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
+    campaign = service.create_campaign(
+        {
+            "name": "Worker Campaign",
+            "platform": "bale",
+            "status": "running",
+            "source_channel_uid": "5613544284",
+            "capacity_reservation": count,
+        }
+    )
     phones = [f"0930407333{index}" for index in range(1, count + 1)]
     service.import_recipients(campaign["id"], phones)
     for recipient in service.list_recipients(campaign["id"], limit=100)["items"]:
@@ -116,8 +178,10 @@ def test_concurrent_assignment_cannot_claim_same_job() -> None:
         second = service.assign_jobs("bale_b", campaign["id"], limit=2)
 
     assert set(first["assigned_job_ids"]).isdisjoint(set(second["assigned_job_ids"]))
-    assert first["assigned_count"] == 2
-    assert second["assigned_count"] == 0
+    # The durable worker contract allows one active job per account. A second
+    # account may claim the other job, but neither can claim a batch.
+    assert first["assigned_count"] == 1
+    assert second["assigned_count"] == 1
 
 
 def test_one_worker_lock_per_account_and_stale_release() -> None:
@@ -161,23 +225,29 @@ def test_worker_runs_assigned_jobs_sequentially_and_updates_success_counters() -
         orchestrator = OrchestratorStub()
         service = _service(Path(tmp_dir) / "worker.db", orchestrator)
         campaign = _campaign_with_jobs(service, count=2)
-        result = service.run_account_round("bale_a", campaign["id"], max_jobs=2, dry_run=False)
+        first = service.run_account_round("bale_a", campaign["id"], max_jobs=2)
+        second = service.run_account_round("bale_a", campaign["id"], max_jobs=2)
         settings = service.resolve_account_settings("bale_a")
         jobs = service.list_jobs(campaign_id=campaign["id"], status="succeeded", limit=10)["items"]
 
-    assert result["processed_count"] == 2
-    assert [call["job_id"] for call in orchestrator.calls] == [item["job_id"] for item in result["results"]]
+    assert first["processed_count"] == 1
+    assert second["processed_count"] == 1
+    assert [call["job_id"] for call in orchestrator.calls] == [
+        item["job_id"] for item in [*first["results"], *second["results"]]
+    ]
     assert len(jobs) == 2
     assert settings["current_daily_sent_count"] == 2
-    assert settings["current_round_sent_count"] == 2
+    assert settings["current_round_sent_count"] == 1
 
 
 def test_commercial_send_completed_prefers_modern_submitted_contract() -> None:
     cases = [
         (
-            {
-                "success": True,
-                "delivery_status": "submitted",
+                {
+                    "success": True,
+                    "recipient_resolved": True,
+                    "confirm_click_count": 1,
+                    "delivery_status": "submitted",
                 "send_action_verified": True,
                 "delivery_verified": False,
                 "forward_verified": False,
@@ -187,9 +257,11 @@ def test_commercial_send_completed_prefers_modern_submitted_contract() -> None:
             True,
         ),
         (
-            {
-                "success": True,
-                "delivery_status": "delivered",
+                {
+                    "success": True,
+                    "recipient_resolved": True,
+                    "confirm_click_count": 1,
+                    "delivery_status": "delivered",
                 "send_action_verified": True,
                 "delivery_verified": True,
                 "error_code": None,
@@ -208,11 +280,29 @@ def test_commercial_send_completed_prefers_modern_submitted_contract() -> None:
             False,
         ),
         (
-            {"success": True, "forward_verified": True, "diagnostics_consistent": True, "error_code": None},
+                {
+                    "success": True,
+                    "verified_forwarded_recipient_count": 1,
+                    "confirm_click_count": 1,
+                    "forward_verified": True,
+                    "diagnostics_consistent": True,
+                    "error_code": None,
+                },
             True,
         ),
         (
             {"success": True, "forward_verified": False, "diagnostics_consistent": True, "error_code": None},
+            False,
+        ),
+        (
+            {
+                "success": True,
+                "recipient_resolved": False,
+                "confirm_click_count": 1,
+                "delivery_status": "submitted",
+                "send_action_verified": True,
+                "error_code": None,
+            },
             False,
         ),
     ]
@@ -221,9 +311,19 @@ def test_commercial_send_completed_prefers_modern_submitted_contract() -> None:
         assert commercial_send_completed(payload) is expected
 
 
+def test_production_worker_contract_rejects_execution_mode_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLINICOS_ENABLE_TEST_EXECUTION_MODES", raising=False)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        service = _service(Path(tmp_dir) / "worker.db")
+        with pytest.raises(TypeError, match="execution_mode"):
+            service.run_account_round("bale_a", execution_mode="simulation")
+
+
 def test_submitted_worker_result_is_terminal_success_without_delivery_verification_or_retry() -> None:
     submitted = {
         "success": True,
+        "recipient_resolved": True,
+        "confirm_click_count": 1,
         "delivery_status": "submitted",
         "send_action_verified": True,
         "delivery_verified": False,
@@ -237,8 +337,8 @@ def test_submitted_worker_result_is_terminal_success_without_delivery_verificati
         orchestrator = OrchestratorStub([submitted])
         service = _service(Path(tmp_dir) / "worker.db", orchestrator)
         campaign = _campaign_with_jobs(service, count=1)
-        result = service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=False)
-        resumed = service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=False)
+        result = service.run_account_round("bale_a", campaign["id"], max_jobs=1)
+        resumed = service.run_account_round("bale_a", campaign["id"], max_jobs=1)
         jobs = service.list_jobs(campaign_id=campaign["id"], limit=10)["items"]
         campaign_after = service.get_campaign(campaign["id"])
 
@@ -263,12 +363,14 @@ def test_failed_job_does_not_increment_and_ordinary_failure_continues() -> None:
         )
         service = _service(Path(tmp_dir) / "worker.db", orchestrator)
         campaign = _campaign_with_jobs(service, count=2)
-        result = service.run_account_round("bale_a", campaign["id"], max_jobs=2, dry_run=False)
+        first = service.run_account_round("bale_a", campaign["id"], max_jobs=2)
+        second = service.run_account_round("bale_a", campaign["id"], max_jobs=2)
         settings = service.resolve_account_settings("bale_a")
         failed = service.list_jobs(campaign_id=campaign["id"], status="failed", limit=10)["items"]
         succeeded = service.list_jobs(campaign_id=campaign["id"], status="succeeded", limit=10)["items"]
 
-    assert result["processed_count"] == 2
+    assert first["processed_count"] == 1
+    assert second["processed_count"] == 1
     assert len(failed) == 1
     assert len(succeeded) == 1
     assert settings["current_daily_sent_count"] == 1
@@ -284,30 +386,30 @@ def test_unsafe_account_level_failure_stops_round_and_requeues_unstarted() -> No
         )
         service = _service(Path(tmp_dir) / "worker.db", orchestrator)
         campaign = _campaign_with_jobs(service, count=2)
-        result = service.run_account_round("bale_a", campaign["id"], max_jobs=2, dry_run=False)
+        result = service.run_account_round("bale_a", campaign["id"], max_jobs=2)
         queued = service.list_jobs(campaign_id=campaign["id"], status="queued", limit=10)["items"]
 
     assert result["stopped_early"] is True
     assert result["processed_count"] == 1
-    assert result["requeued_unstarted_count"] == 1
+    # No second job was preassigned: it remains queued rather than needing a
+    # requeue after the account-level unsafe failure.
+    assert result["requeued_unstarted_count"] == 0
     assert len(queued) == 1
 
 
-def test_dry_run_sends_nothing_and_does_not_increment_daily_count() -> None:
+def test_production_worker_always_dispatches_real_send() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
-        orchestrator = OrchestratorStub([{"success": True, "forward_verified": False, "diagnostics_consistent": True}])
+        orchestrator = OrchestratorStub([{"success": True, "forward_verified": True, "diagnostics_consistent": True}])
         service = _service(Path(tmp_dir) / "worker.db", orchestrator)
         campaign = _campaign_with_jobs(service, count=1)
-        result = service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=True)
+        result = service.run_account_round("bale_a", campaign["id"], max_jobs=1)
         settings = service.resolve_account_settings("bale_a")
-        skipped = service.list_jobs(campaign_id=campaign["id"], status="skipped", limit=10)["items"]
+        succeeded = service.list_jobs(campaign_id=campaign["id"], status="succeeded", limit=10)["items"]
 
     assert result["processed_count"] == 1
-    assert orchestrator.calls[0]["dry_run"] is True
-    assert settings["current_daily_sent_count"] == 0
-    assert skipped[0]["last_error_code"] == "dry_run_no_delivery"
-    assert skipped[0]["result_success"] == 0
-    assert skipped[0]["verified_forwarded_recipient_count"] == 0
+    assert orchestrator.calls[0]["execution_mode"] == "real_send"
+    assert settings["current_daily_sent_count"] == 1
+    assert succeeded[0]["result_success"] == 1
 
 
 def test_campaign_counters_and_queue_persist_after_reload() -> None:
@@ -315,7 +417,7 @@ def test_campaign_counters_and_queue_persist_after_reload() -> None:
         db_path = Path(tmp_dir) / "worker.db"
         service = _service(db_path)
         campaign = _campaign_with_jobs(service, count=2)
-        service.run_account_round("bale_a", campaign["id"], max_jobs=1, dry_run=False)
+        service.run_account_round("bale_a", campaign["id"], max_jobs=1)
         reloaded = _service(db_path)
         campaign_after = reloaded.get_campaign(campaign["id"])
         queued = reloaded.list_jobs(campaign_id=campaign["id"], status="queued", limit=10)["items"]
@@ -333,7 +435,16 @@ def test_worker_api_contracts() -> None:
         automation_routes.commercial_queue_service = service
         try:
             client = TestClient(app)
-            campaign = client.post("/automation/campaigns", json={"name": "Worker API", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"}).json()
+            campaign = client.post(
+                "/automation/campaigns",
+                json={
+                    "name": "Worker API",
+                    "platform": "bale",
+                    "status": "running",
+                    "source_channel_uid": "5613544284",
+                    "capacity_reservation": 1,
+                },
+            ).json()
             client.post(f"/automation/campaigns/{campaign['id']}/recipients", json={"phones": ["09304073331"], "import_source": "manual"})
             recipient = service.list_recipients(campaign["id"], limit=1)["items"][0]
             service.repository.update_recipient_authorization(

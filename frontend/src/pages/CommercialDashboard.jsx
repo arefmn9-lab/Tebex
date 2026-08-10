@@ -3,7 +3,7 @@ import { Pause, Play, RotateCw, Square, StepForward } from "lucide-react";
 import { getDashboardSummary } from "../api/dashboard";
 import { listEvents } from "../api/events";
 import { listJobs } from "../api/jobs";
-import { getSchedulerStatus, pauseScheduler, resumeScheduler, runSchedulerOnce, startScheduler, stopScheduler } from "../api/scheduler";
+import { pauseScheduler, resumeScheduler, runSchedulerOnce, startScheduler, stopScheduler } from "../api/scheduler";
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, fmt, shortId } from "../components/commercial/CommercialUi.jsx";
 
 const summaryLabels = {
@@ -32,14 +32,13 @@ export default function CommercialDashboard() {
     setError(null);
     setLoading(true);
     try {
-      const [summaryData, schedulerData, jobsData, eventsData] = await Promise.all([
+      const [summaryData, jobsData, eventsData] = await Promise.all([
         getDashboardSummary(),
-        getSchedulerStatus(),
         listJobs({ limit: 8 }),
         listEvents({ limit: 8 }),
       ]);
       setSummary(summaryData);
-      setScheduler(schedulerData);
+      setScheduler(summaryData.scheduler_snapshot || null);
       setJobs(jobsData.items || []);
       setEvents(eventsData.items || []);
     } catch (err) {
@@ -111,9 +110,9 @@ export default function CommercialDashboard() {
                   <Square size={16} />
                   توقف
                 </button>
-                <button className="secondary-button" disabled={!!busyAction} type="button" onClick={() => schedulerAction("run-once", () => runSchedulerOnce({ dry_run: true }))}>
+                <button className="secondary-button" disabled={!!busyAction} type="button" onClick={() => schedulerAction("run-once", runSchedulerOnce)}>
                   <StepForward size={16} />
-                  اجرای خشک یک تیک
+                  اجرای یک تیک
                 </button>
               </div>
               <div className="ops-list">

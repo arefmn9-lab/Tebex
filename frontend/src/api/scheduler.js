@@ -23,6 +23,6 @@ export function stopScheduler() {
 export function runSchedulerOnce(payload = {}) {
   return request("/automation/scheduler/run-once", {
     method: "POST",
-    body: JSON.stringify({ dry_run: true, ...payload }),
+    body: JSON.stringify(payload),
   });
 }

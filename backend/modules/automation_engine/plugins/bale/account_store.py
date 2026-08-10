@@ -278,20 +278,9 @@ class BaleAccountStore:
         }
 
     def _ensure_seed_data(self) -> None:
-        if not self.accounts_path.exists():
-            self._write_json(
-                self.accounts_path,
-                [
-                    self._normalize_account({"account_id": "bale_09214032167", "phone": "09214032167", "status": "active", "daily_limit": 10, "browser_provider": "native_chrome"}),
-                    self._normalize_account({"account_id": "bale_09214032168", "phone": "09214032168", "status": "preparing", "daily_limit": 8, "browser_provider": "native_chrome"}),
-                ],
-            )
-        if not self.message_config_path.exists():
-            self._write_json(self.message_config_path, deepcopy(DEFAULT_MESSAGE_CONFIG))
-        if not self.preparation_path.exists():
-            self._write_json(self.preparation_path, deepcopy(DEFAULT_PREPARATION))
-        if not self.source_channels_path.exists():
-            self._write_json(self.source_channels_path, [])
+        # Startup is persistence-first. Missing files are interpreted through
+        # _read_json defaults and are created only by an explicit operator write.
+        return None
 
     def _read_json(self, path: Path, default: Any) -> Any:
         try:

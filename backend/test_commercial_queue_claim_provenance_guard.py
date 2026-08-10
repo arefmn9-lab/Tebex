@@ -67,7 +67,7 @@ def _service(path: Path, adapter: FakeAdapter | None = None) -> tuple[Commercial
 
 
 def _campaign(service: CommercialQueueService) -> dict[str, Any]:
-    return service.create_campaign({"name": "Queue Claim Guard", "platform": "bale", "status": "running", "source_channel_uid": SOURCE_UID})
+    return service.create_campaign({"name": "Queue Claim Guard", "platform": "bale", "status": "running", "source_channel_uid": SOURCE_UID, "capacity_reservation": 10})
 
 
 def _raw_job(service: CommercialQueueService, campaign: dict[str, Any], phone: str = "989300000001") -> tuple[dict[str, Any], dict[str, Any]]:
@@ -116,7 +116,7 @@ def _authorize_valid(service: CommercialQueueService, recipient: dict[str, Any],
 
 
 def _assert_not_claimed(service: CommercialQueueService, adapter: FakeAdapter, campaign: dict[str, Any], job_id: str) -> None:
-    result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=1, dry_run=False)
+    result = service.run_account_round(ACCOUNT_ID, campaign["id"], max_jobs=1)
     stored = service.repository.get_job(job_id)
     assert result["processed_count"] == 0
     assert result["assigned_count"] == 0
@@ -217,7 +217,7 @@ def test_toctou_invalidated_after_assignment_rejected_before_adapter() -> None:
         service.repository.update_recipient_authorization(recipient["id"], {"live_execution_blocked": True})
         stored = service.repository.get_job(job["id"])
         details = service.repository.get_job_with_recipient(job["id"])
-        check = service.validate_live_recipient_authorization(stored, details, dry_run=False)
+        check = service.validate_live_recipient_authorization(stored, details, execution_mode="real_send")
         assert check["ok"] is False
         assert check["error_code"] == "recipient_live_execution_blocked"
         assert adapter.created == 0

@@ -138,7 +138,13 @@ def test_restart_recovery_distinguishes_browser_and_gone(tmp_path: Path) -> None
     active = make_service(tmp_path, inspector=lambda _record: [{"pid": 1}])
     account_id = provision_ready(active)
     with active.connection() as connection:
-        connection.execute("INSERT INTO bale_maintenance_sessions VALUES('s1',?,'login','active','old','runtime','old','old','2000-01-01',NULL,NULL,'{}')", (account_id,))
+        connection.execute(
+            """INSERT INTO bale_maintenance_sessions
+            (maintenance_session_id,account_id,purpose,status,backend_instance_id,runtime_session_id,
+             opened_at,heartbeat_at,expires_at,safe_diagnostics_json)
+            VALUES ('s1',?,'login','active','old','runtime','old','old','2000-01-01','{}')""",
+            (account_id,),
+        )
         connection.commit()
     result = active.recover_stale_sessions()
     assert result["items"][0]["classification"] == "browser_active_not_reattachable"

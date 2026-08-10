@@ -36,6 +36,10 @@ CREATE_GLOBAL_SETTINGS_TABLE = """
 CREATE TABLE IF NOT EXISTS commercial_global_settings (
     id TEXT PRIMARY KEY,
     max_concurrent_accounts INTEGER NOT NULL,
+    concurrency_mode TEXT NOT NULL DEFAULT 'operator_defined',
+    operator_defined_max_concurrent_accounts INTEGER NOT NULL DEFAULT 1,
+    browser_concurrency INTEGER NOT NULL DEFAULT 1,
+    worker_concurrency INTEGER NOT NULL DEFAULT 1,
     deliveries_per_account_round INTEGER NOT NULL,
     delay_between_deliveries_seconds INTEGER NOT NULL,
     round_cooldown_seconds INTEGER NOT NULL,
@@ -95,6 +99,10 @@ CREATE TABLE IF NOT EXISTS commercial_campaigns (
     status TEXT NOT NULL CHECK(status IN ('draft','queued','running','paused','completed','cancelled','failed')),
     source_channel_uid TEXT,
     policy_overrides_json TEXT,
+    lifecycle_stage TEXT NOT NULL DEFAULT 'draft',
+    queue_idempotency_key TEXT,
+    queued_review_token TEXT,
+    queued_final_review_hash TEXT,
     total_recipients INTEGER NOT NULL,
     queued_count INTEGER NOT NULL,
     running_count INTEGER NOT NULL,
@@ -106,9 +114,45 @@ CREATE TABLE IF NOT EXISTS commercial_campaigns (
     started_at TEXT,
     paused_at TEXT,
     completed_at TEXT,
+    deleted_at TEXT,
+    archived_at TEXT,
+    hidden INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 )
 """
+
+# ============================================================
+# BLOCK: CAMPAIGN_CAPACITY_RESERVATION_SCHEMA
+# PURPOSE:
+# Stores one shared-pool capacity reservation for each campaign.
+# ACCOUNT_SCOPE:
+# Does not own or persist any account assignment.
+# DEPENDENCIES:
+# commercial_campaigns
+# LAYER:
+# DATABASE
+# ============================================================
+
+CREATE_CAMPAIGN_CAPACITY_RESERVATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_campaign_capacity_reservations (
+    campaign_id TEXT PRIMARY KEY,
+    capacity INTEGER NOT NULL CHECK(capacity >= 0),
+    used_capacity INTEGER NOT NULL DEFAULT 0 CHECK(used_capacity >= 0),
+    remaining_capacity INTEGER NOT NULL CHECK(remaining_capacity >= 0),
+    requested_account_count INTEGER NOT NULL DEFAULT 0 CHECK(requested_account_count >= 0),
+    allocated_account_count INTEGER NOT NULL DEFAULT 0 CHECK(allocated_account_count >= 0),
+    reservation_status TEXT NOT NULL DEFAULT 'active',
+    released_at TEXT,
+    release_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id)
+)
+"""
+
+# ============================================================
+# END BLOCK: CAMPAIGN_CAPACITY_RESERVATION_SCHEMA
+# ============================================================
 
 CREATE_RECIPIENTS_TABLE = """
 CREATE TABLE IF NOT EXISTS commercial_recipients (
@@ -117,6 +161,11 @@ CREATE TABLE IF NOT EXISTS commercial_recipients (
     phone_raw TEXT NOT NULL,
     phone_normalized TEXT NOT NULL,
     display_name TEXT,
+    classification TEXT,
+    source_filename TEXT,
+    source_sheet TEXT,
+    source_row_number INTEGER,
+    original_value TEXT,
     import_source TEXT NOT NULL,
     validation_status TEXT NOT NULL CHECK(validation_status IN ('valid','invalid','duplicate','blocked','opted_out')),
     duplicate_of_recipient_id TEXT,
@@ -150,6 +199,8 @@ CREATE_GLOBAL_CONTACTS_TABLE = """
 CREATE TABLE IF NOT EXISTS commercial_global_contacts (
     id TEXT PRIMARY KEY,
     normalized_phone TEXT NOT NULL UNIQUE,
+    stable_display_name TEXT UNIQUE,
+    sequence_number INTEGER UNIQUE,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
@@ -403,6 +454,9 @@ CREATE TABLE IF NOT EXISTS commercial_account_worker_locks (
     account_id TEXT PRIMARY KEY,
     lock_owner TEXT NOT NULL,
     lock_token TEXT NOT NULL,
+    runtime_owner_id TEXT,
+    worker_round_id TEXT,
+    process_id INTEGER,
     active_job_id TEXT,
     acquired_at TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL,
@@ -420,6 +474,24 @@ CREATE TABLE IF NOT EXISTS commercial_scheduler_state (
     last_stopped_at TEXT,
     current_tick_id TEXT,
     last_tick_results_json TEXT,
+    runtime_owner_id TEXT,
+    process_id INTEGER,
+    application_started_at TEXT,
+    loop_interval_seconds INTEGER,
+    loop_heartbeat_at TEXT,
+    last_loop_iteration_at TEXT,
+    tick_in_progress INTEGER NOT NULL DEFAULT 0,
+    last_tick_started_at TEXT,
+    last_tick_completed_at TEXT,
+    last_failed_tick_at TEXT,
+    last_tick_error TEXT,
+    scheduler_task_created_at TEXT,
+    first_current_runtime_tick_at TEXT,
+    last_current_runtime_tick_at TEXT,
+    current_runtime_heartbeat_at TEXT,
+    historical_runtime_owner_id TEXT,
+    historical_last_tick_at TEXT,
+    historical_last_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
@@ -541,6 +613,29 @@ CREATE TABLE IF NOT EXISTS commercial_account_health (
 )
 """
 
+CREATE_BALE_ACCOUNT_CONTACT_PROOFS_TABLE = """
+CREATE TABLE IF NOT EXISTS bale_account_contact_proofs (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    mapping_id TEXT NOT NULL,
+    preparation_status TEXT NOT NULL DEFAULT 'not_prepared',
+    verification_status TEXT NOT NULL DEFAULT 'unverified',
+    binding_id TEXT,
+    normalized_phone TEXT,
+    recipient_display_name TEXT,
+    verification_method TEXT,
+    prepared_at TEXT,
+    verified_at TEXT,
+    profile_identity TEXT,
+    browser_pid INTEGER,
+    last_successful_step TEXT,
+    failure_evidence_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(account_id, mapping_id)
+)
+"""
+
 CREATE_DRY_RUN_AUDIT_TABLE = """
 CREATE TABLE IF NOT EXISTS commercial_dry_run_audit_records (
     dry_run_id TEXT PRIMARY KEY,
@@ -603,6 +698,22 @@ CREATE TABLE IF NOT EXISTS commercial_live_execution_approvals (
     consumed_at TEXT,
     expires_at TEXT NOT NULL,
     revoke_reason TEXT,
+    FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id)
+)
+"""
+
+CREATE_CAMPAIGN_FINAL_REVIEWS_TABLE = """
+CREATE TABLE IF NOT EXISTS commercial_campaign_final_reviews (
+    review_token TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    campaign_version TEXT NOT NULL,
+    validation_hash TEXT NOT NULL,
+    final_review_hash TEXT NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0,
+    blocking_errors_json TEXT NOT NULL,
+    review_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     FOREIGN KEY(campaign_id) REFERENCES commercial_campaigns(id)
 )
 """
@@ -693,6 +804,7 @@ CREATE TABLE IF NOT EXISTS commercial_execution_authorizations (
 COMMERCIAL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipients_campaign_phone ON commercial_recipients(campaign_id, phone_normalized)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_global_contacts_phone ON commercial_global_contacts(normalized_phone)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_global_contacts_stable_name ON commercial_global_contacts(stable_display_name) WHERE stable_display_name IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_runs_campaign_status ON commercial_campaign_recipient_runs(campaign_id, scenario_status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_runs_recipient ON commercial_campaign_recipient_runs(recipient_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_recipient_runs_campaign_phone_unique ON commercial_campaign_recipient_runs(campaign_id, phone_normalized)",
@@ -701,9 +813,14 @@ COMMERCIAL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_commercial_platform_run_events_platform ON commercial_platform_run_events(platform_run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_delivery_jobs_status ON commercial_delivery_jobs(status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_delivery_jobs_account_status ON commercial_delivery_jobs(account_id, status)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_one_active_job_per_account ON commercial_delivery_jobs(account_id) WHERE account_id IS NOT NULL AND status IN ('assigned','running')",
     "CREATE INDEX IF NOT EXISTS idx_commercial_delivery_jobs_campaign_status ON commercial_delivery_jobs(campaign_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_job_events_job_created ON commercial_job_events(job_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_campaigns_status ON commercial_campaigns(status)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_campaigns_lifecycle_updated ON commercial_campaigns(lifecycle_stage, updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_commercial_campaigns_status_updated ON commercial_campaigns(status, updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_capacity_reservations_remaining ON commercial_campaign_capacity_reservations(remaining_capacity)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_capacity_reservations_status ON commercial_campaign_capacity_reservations(reservation_status, campaign_id)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_import_batches_campaign ON commercial_recipient_import_batches(campaign_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_import_items_batch_status ON commercial_recipient_import_items(batch_id, validation_status)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_import_items_batch_row ON commercial_recipient_import_items(batch_id, row_number)",
@@ -716,6 +833,7 @@ COMMERCIAL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_commercial_recipient_auth_events_recipient ON commercial_recipient_authorization_events(recipient_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_live_approvals_campaign ON commercial_live_execution_approvals(campaign_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_live_approvals_status ON commercial_live_execution_approvals(approval_status, expires_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_final_reviews_campaign_hash ON commercial_campaign_final_reviews(campaign_id, final_review_hash)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_live_events_campaign ON commercial_live_execution_events(campaign_id, created_at)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_commercial_config_revisions_campaign_number ON commercial_campaign_configuration_revisions(campaign_id, revision_number)",
     "CREATE INDEX IF NOT EXISTS idx_commercial_config_revisions_campaign_status ON commercial_campaign_configuration_revisions(campaign_id, status)",
@@ -728,7 +846,45 @@ COMMERCIAL_INDEXES = [
 ]
 
 SCHEMA_ALTERATIONS = {
+    "commercial_campaign_capacity_reservations": {
+        "requested_account_count": "INTEGER NOT NULL DEFAULT 0",
+        "allocated_account_count": "INTEGER NOT NULL DEFAULT 0",
+        "reservation_status": "TEXT NOT NULL DEFAULT 'active'",
+        "released_at": "TEXT",
+        "release_reason": "TEXT",
+    },
+    "commercial_global_contacts": {
+        "stable_display_name": "TEXT",
+        "sequence_number": "INTEGER",
+    },
+    "bale_account_contact_proofs": {
+        "binding_id": "TEXT",
+        "normalized_phone": "TEXT",
+        "recipient_display_name": "TEXT",
+        "verification_method": "TEXT",
+        "prepared_at": "TEXT",
+        "profile_identity": "TEXT",
+        "browser_pid": "INTEGER",
+        "last_successful_step": "TEXT",
+        "failure_evidence_json": "TEXT",
+    },
+    "commercial_recipient_import_items": {
+        "classification": "TEXT",
+        "source_filename": "TEXT",
+        "source_sheet": "TEXT",
+        "source_row_number": "INTEGER",
+        "original_value": "TEXT",
+    },
+    "commercial_account_worker_locks": {
+        "runtime_owner_id": "TEXT",
+        "worker_round_id": "TEXT",
+        "process_id": "INTEGER",
+    },
     "commercial_global_settings": {
+        "concurrency_mode": "TEXT NOT NULL DEFAULT 'operator_defined'",
+        "operator_defined_max_concurrent_accounts": "INTEGER NOT NULL DEFAULT 1",
+        "browser_concurrency": "INTEGER NOT NULL DEFAULT 1",
+        "worker_concurrency": "INTEGER NOT NULL DEFAULT 1",
         "send_method": "TEXT NOT NULL DEFAULT 'forward_latest_channel_message'",
         "operation_order_json": "TEXT",
         "link_open_delay_seconds": "INTEGER NOT NULL DEFAULT 0",
@@ -744,6 +900,33 @@ SCHEMA_ALTERATIONS = {
     },
     "commercial_campaigns": {
         "policy_overrides_json": "TEXT",
+        "lifecycle_stage": "TEXT NOT NULL DEFAULT 'draft'",
+        "queue_idempotency_key": "TEXT",
+        "queued_review_token": "TEXT",
+        "queued_final_review_hash": "TEXT",
+        "deleted_at": "TEXT",
+        "archived_at": "TEXT",
+        "hidden": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "commercial_scheduler_state": {
+        "runtime_owner_id": "TEXT",
+        "process_id": "INTEGER",
+        "application_started_at": "TEXT",
+        "loop_interval_seconds": "INTEGER",
+        "loop_heartbeat_at": "TEXT",
+        "last_loop_iteration_at": "TEXT",
+        "tick_in_progress": "INTEGER NOT NULL DEFAULT 0",
+        "last_tick_started_at": "TEXT",
+        "last_tick_completed_at": "TEXT",
+        "last_failed_tick_at": "TEXT",
+        "last_tick_error": "TEXT",
+        "scheduler_task_created_at": "TEXT",
+        "first_current_runtime_tick_at": "TEXT",
+        "last_current_runtime_tick_at": "TEXT",
+        "current_runtime_heartbeat_at": "TEXT",
+        "historical_runtime_owner_id": "TEXT",
+        "historical_last_tick_at": "TEXT",
+        "historical_last_heartbeat_at": "TEXT",
     },
     "commercial_delivery_jobs": {
         "campaign_recipient_run_id": "TEXT",
@@ -869,6 +1052,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_GLOBAL_SETTINGS_TABLE)
     connection.execute(CREATE_ACCOUNT_SETTINGS_TABLE)
     connection.execute(CREATE_CAMPAIGNS_TABLE)
+    connection.execute(CREATE_CAMPAIGN_CAPACITY_RESERVATIONS_TABLE)
     connection.execute(CREATE_RECIPIENTS_TABLE)
     connection.execute(CREATE_GLOBAL_CONTACTS_TABLE)
     connection.execute(CREATE_CAMPAIGN_RECIPIENT_RUNS_TABLE)
@@ -883,9 +1067,11 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CREATE_RECIPIENT_INPUT_MANIFESTS_TABLE)
     connection.execute(CREATE_BROWSER_IDENTITIES_TABLE)
     connection.execute(CREATE_ACCOUNT_HEALTH_TABLE)
+    connection.execute(CREATE_BALE_ACCOUNT_CONTACT_PROOFS_TABLE)
     connection.execute(CREATE_DRY_RUN_AUDIT_TABLE)
     connection.execute(CREATE_RECIPIENT_AUTHORIZATION_EVENTS_TABLE)
     connection.execute(CREATE_LIVE_EXECUTION_APPROVALS_TABLE)
+    connection.execute(CREATE_CAMPAIGN_FINAL_REVIEWS_TABLE)
     connection.execute(CREATE_LIVE_EXECUTION_EVENTS_TABLE)
     connection.execute(CREATE_CAMPAIGN_CONFIGURATION_REVISIONS_TABLE)
     connection.execute(CREATE_EXECUTION_CONFIGURATION_SNAPSHOTS_TABLE)
@@ -900,6 +1086,38 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         for column_name, definition in columns.items():
             if column_name not in existing:
                 connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+    # Legacy reservation values represented an operator-entered integer. Preserve that
+    # integer as an account reservation; no unit conversion or message-volume scaling.
+    connection.execute(
+        """
+        UPDATE commercial_campaign_capacity_reservations
+        SET requested_account_count = capacity,
+            allocated_account_count = capacity
+        WHERE capacity > 0
+          AND requested_account_count = 0
+          AND allocated_account_count = 0
+        """
+    )
+    legacy_allocation_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'commercial_campaign_account_allocations'"
+    ).fetchone()
+    if legacy_allocation_table:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO commercial_campaign_capacity_reservations (
+                campaign_id, capacity, used_capacity, remaining_capacity, created_at, updated_at
+            )
+            SELECT
+                campaign_id,
+                SUM(capacity),
+                SUM(used_capacity),
+                SUM(remaining_capacity),
+                MIN(created_at),
+                MAX(updated_at)
+            FROM commercial_campaign_account_allocations
+            GROUP BY campaign_id
+            """
+        )
     for statement in COMMERCIAL_INDEXES:
         connection.execute(statement)
     connection.commit()

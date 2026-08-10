@@ -19,9 +19,14 @@ export function useTasks(intervalMs = 3000) {
   }, []);
 
   useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, intervalMs);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    let timer;
+    const poll = async () => {
+      if (!document.hidden) await refresh();
+      if (!cancelled) timer = window.setTimeout(poll, intervalMs);
+    };
+    poll();
+    return () => { cancelled = true; window.clearTimeout(timer); };
   }, [intervalMs, refresh]);
 
   const create = useCallback(async (scenarioPath, runAt = null) => {
@@ -44,4 +49,3 @@ export function useTasks(intervalMs = 3000) {
 
   return { tasks, loading, error, refresh, create, run, stop };
 }
-

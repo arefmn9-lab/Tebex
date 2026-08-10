@@ -50,6 +50,7 @@ def _campaign(service: CommercialQueueService, **overrides: object) -> dict:
 
 
 def _job(service: CommercialQueueService, campaign_id: str) -> dict:
+    service.repository.upsert_campaign_capacity_reservation(campaign_id, 1, 1)
     result = service.import_recipients(campaign_id, ["09304073331"])
     recipient = result["created_recipients"][0]
     job = result["created_jobs"][0]
@@ -118,7 +119,7 @@ def test_execution_plan_contains_all_correlation_ids() -> None:
     context = OperationContext.create(scheduler_tick_id="tick_1", worker_round_id="round_1", account_id="acct", campaign_id="campaign", job_id="job", recipient_id="recipient")
     job = {"id": "job", "campaign_id": "campaign", "recipient_id": "recipient", "phone_normalized": "9893", "source_channel_uid": None}
     policy = {"effective_policy": _service(Path(tempfile.mkdtemp()) / "tmp.db").resolve_effective_policy()["effective_policy"], "policy_resolution_source": {}}
-    plan = build_execution_plan(context=context, job=job, job_details={"recipient_phone_normalized": "9893"}, policy_result=policy, dry_run=True)
+    plan = build_execution_plan(context=context, job=job, job_details={"recipient_phone_normalized": "9893"}, policy_result=policy)
     data = plan.to_dict()
     for key in ["correlation_id", "scheduler_tick_id", "worker_round_id", "job_id", "campaign_id", "recipient_id", "account_id"]:
         assert data[key]
@@ -132,7 +133,7 @@ def test_scheduler_and_worker_use_resolved_policy_and_pass_plan() -> None:
         _job(service, campaign["id"])
         service.update_account_settings("acct_a", {"source_channel_uid_override": "account_channel", "deliveries_per_round_override": 1, "round_cooldown_override": 0})
         service.scheduler_start()
-        result = service.scheduler_run_once(campaign["id"], dry_run=True)
+        result = service.scheduler_run_once(campaign["id"])
 
     assert result["started_accounts"] == ["acct_a"]
     call = recorder.calls[0]
@@ -165,7 +166,7 @@ def test_resource_capacity_blocks_new_work_only_and_leaves_jobs_queued() -> None
         service.update_account_settings("acct_a", {"source_channel_uid_override": "global_channel"})
         service.update_global_settings({"max_concurrent_accounts": 0})
         service.scheduler_start()
-        result = service.scheduler_run_once(campaign["id"], dry_run=True)
+        result = service.scheduler_run_once(campaign["id"])
         jobs = service.list_jobs(campaign_id=campaign["id"], limit=10)["items"]
         provider = ResourceCapacityProvider(service.repository, cpu_percent=99, memory_percent=99)
         decision = provider.decide({"max_concurrent_accounts": 1, "browser_start_batch_size": 1, "resource_guard_enabled": True, "max_system_cpu_percent": 90, "max_system_memory_percent": 90})

@@ -9,7 +9,13 @@
     "test:phase1": "node scripts/phase1-smoke.mjs",
     "test:phase2": "node scripts/phase2-smoke.mjs",
     "test:campaign-entry": "node scripts/campaign-execution-entry-smoke.mjs",
+    "test:campaign-capacity": "node scripts/campaign-capacity-pool-smoke.mjs",
+    "test:campaign-actions": "node scripts/campaign-actions-smoke.mjs",
+    "test:campaign-validate-start": "node scripts/campaign-validate-start-flow-smoke.mjs",
+    "test:platform-routes": "node scripts/platform-route-removal-smoke.mjs",
+    "test:routed-campaign-start": "node scripts/routed-campaign-start-smoke.mjs",
     "test:bale-onboarding": "node scripts/bale-onboarding-smoke.mjs",
+    "test:auth-diagnostics": "node scripts/auth-diagnostics-regression.mjs",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {

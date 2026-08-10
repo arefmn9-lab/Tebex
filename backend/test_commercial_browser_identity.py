@@ -66,7 +66,7 @@ class Recorder:
     def __call__(self, **payload: object) -> dict:
         if self.results:
             return self.results.pop(0)
-        return {"success": True, "forward_verified": False if payload.get("dry_run") else True, "diagnostics_consistent": True, "confirm_click_count": 0, "verified_forwarded_recipient_count": 0}
+        return {"success": True, "forward_verified": False if payload.get("execution_mode") != "real_send" else True, "diagnostics_consistent": True, "confirm_click_count": 0, "verified_forwarded_recipient_count": 0}
 
 
 def _resolver(path: Path) -> BrowserIdentityResolver:
@@ -91,23 +91,36 @@ def _service(path: Path, recorder: Recorder | None = None, adapter: FakeAdapter 
 
 def _seed(service: CommercialQueueService, account_id: str, count: int = 1) -> dict:
     service.update_account_settings(account_id, {"enabled": True, "source_channel_uid_override": "5613544284", "deliveries_per_round_override": count, "round_cooldown_override": 0, "delay_between_deliveries_override": 0})
-    campaign = service.create_campaign({"name": f"Campaign {account_id}", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"})
-    service.import_recipients(campaign["id"], [f"0930407{index:04d}" for index in range(count)])
-    for recipient in service.list_recipients(campaign["id"], limit=100)["items"]:
-        service.repository.update_recipient_authorization(
-            recipient["id"],
-            {
-                "recipient_origin": "user_provided",
-                "synthetic_test_data": False,
-                "live_execution_authorized": True,
-                "live_authorized_at": "2026-07-13T00:00:00+00:00",
-                "live_authorized_by": "test",
-                "authorization_source": "test_fixture",
-                "authorization_note": "mock browser identity recipient",
-                "authorization_status": "authorized",
-                "should_not_retry": False,
-            },
-        )
+    campaign = service.create_campaign({"name": f"Campaign {account_id}", "platform": "bale", "status": "running", "source_channel_uid": "5613544284", "capacity_reservation": count})
+    phones = [f"0930407{index:04d}" for index in range(count)]
+    service.import_recipients(campaign["id"], phones)
+    manifest = service.repository.create_recipient_input_manifest(
+        campaign_id=campaign["id"],
+        phones=[f"98{phone[1:]}" for phone in phones],
+        batch_id=None,
+        submitted_by="test",
+        source_type="test_manifest",
+        confirmation_status="confirmed",
+        confirmed_by="test",
+    )
+    for index, recipient in enumerate(service.list_recipients(campaign["id"], limit=100)["items"], start=1):
+        authorization = {
+            "recipient_origin": "user_provided",
+            "synthetic_test_data": False,
+            "live_execution_authorized": True,
+            "live_authorized_at": "2026-07-13T00:00:00+00:00",
+            "live_authorized_by": "test",
+            "authorization_source": "test_fixture",
+            "authorization_note": "mock browser identity recipient",
+            "authorization_status": "authorized",
+            "should_not_retry": False,
+            "input_manifest_id": manifest["manifest_id"],
+            "input_manifest_hash": manifest["manifest_hash"],
+            "input_sequence": index,
+            "input_provenance_status": "confirmed_manifest",
+        }
+        service.repository.update_recipient_authorization(recipient["id"], authorization)
+        service.repository.update_jobs_authorization_by_recipient(recipient["id"], authorization)
     return campaign
 
 
@@ -244,7 +257,7 @@ def test_account_health_transitions_and_scheduler_filtering() -> None:
                 },
             )
         service.scheduler_start()
-        result = service.scheduler_run_once(campaign["id"], dry_run=True)
+        result = service.scheduler_run_once(campaign["id"])
     assert result["started_accounts"] == ["acct_ok"]
 
 
@@ -253,8 +266,8 @@ def test_profile_conflict_affects_only_one_account_and_unstarted_requeued() -> N
         service = _service(Path(tmp_dir) / "conflict.db", adapter=FakeAdapter(fail=True))
         campaign_a = _seed(service, "acct_bad", 1)
         campaign_b = _seed(service, "acct_good", 1)
-        failed = service.run_account_round("acct_bad", campaign_a["id"], max_jobs=1, dry_run=True)
-        ok = service.run_account_round("acct_good", campaign_b["id"], max_jobs=1, dry_run=True)
+        failed = service.run_account_round("acct_bad", campaign_a["id"], max_jobs=1)
+        ok = service.run_account_round("acct_good", campaign_b["id"], max_jobs=1)
         assert failed["processed_count"] == 0
         assert service.get_account_health("acct_bad")["health_status"] in {"session_error", "manual_review", "warning"}
         assert ok["processed_count"] == 0  # shared failing adapter proves failure is account-scoped in state, not scheduler-global

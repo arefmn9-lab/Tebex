@@ -4,6 +4,19 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
+# ============================================================
+# BLOCK: COMMERCIAL_EXECUTION_PLAN_CONTRACT
+# PURPOSE:
+# Carries job data and campaign-scoped final-send authorization.
+# ACCOUNT_SCOPE:
+# One account, campaign, recipient, and job.
+# DEPENDENCIES:
+# OperationContext-compatible input
+# LAYER:
+# SERVICE
+# ============================================================
+
+
 @dataclass(frozen=True)
 class ExecutionPlan:
     correlation_id: str
@@ -23,9 +36,9 @@ class ExecutionPlan:
     link_open_delay_seconds: int
     job_timeout_seconds: int
     max_job_duration_seconds: int
-    dry_run: bool
     effective_policy: dict[str, Any]
     policy_resolution_source: dict[str, str]
+    live_approval_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -37,7 +50,7 @@ def build_execution_plan(
     job: dict[str, Any],
     job_details: dict[str, Any],
     policy_result: dict[str, Any],
-    dry_run: bool,
+    live_approval_id: str | None = None,
 ) -> ExecutionPlan:
     policy = dict(policy_result["effective_policy"])
     source = dict(policy_result.get("policy_resolution_source") or {})
@@ -51,7 +64,7 @@ def build_execution_plan(
         account_id=str(context.account_id),
         platform=str(policy.get("platform") or "bale"),
         phone=str(job_details.get("recipient_phone_normalized") or job.get("phone_normalized") or ""),
-        display_name=job.get("display_name") or job_details.get("recipient_display_name"),
+        display_name=(job.get("display_name") or job_details.get("recipient_display_name") or job_details.get("recipient_stable_display_name")),
         source_channel_uid=str(job.get("source_channel_uid") or policy.get("source_channel_uid") or ""),
         send_method=str(policy.get("send_method") or "forward_latest_channel_message"),
         operation_order=list(policy.get("operation_order") or []),
@@ -59,7 +72,12 @@ def build_execution_plan(
         link_open_delay_seconds=int(policy.get("link_open_delay_seconds") or 0),
         job_timeout_seconds=int(policy.get("job_timeout_seconds") or 0),
         max_job_duration_seconds=int(policy.get("max_job_duration_seconds") or 0),
-        dry_run=bool(dry_run),
+        live_approval_id=live_approval_id,
         effective_policy=policy,
         policy_resolution_source=source,
     )
+
+
+# ============================================================
+# END BLOCK: COMMERCIAL_EXECUTION_PLAN_CONTRACT
+# ============================================================

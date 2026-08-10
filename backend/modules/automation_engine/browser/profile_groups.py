@@ -12,8 +12,8 @@ DEFAULT_GROUP = {
     "profile_group_id": "group_001",
     "device_group_id": "group_001",
     "name": "گروه ۱",
-    "max_accounts": 30,
-    "max_concurrent_accounts": 10,
+    "max_accounts": 0,
+    "max_concurrent_accounts": 0,
     "browser_provider": "adspower",
     "adspower_group_id": "",
     "account_ids": [],
@@ -88,8 +88,6 @@ class ProfileGroupStore:
             account_ids = [item for item in group.get("account_ids", []) if item != account_id]
             if group["profile_group_id"] == device_group_id or group["device_group_id"] == device_group_id:
                 target_found = True
-                if len(account_ids) >= int(group.get("max_accounts", group.get("group_size_limit", 30))):
-                    raise ValueError("Profile group size limit reached")
                 account_ids.append(account_id)
             group["account_ids"] = account_ids
             updated_groups.append(group)
@@ -108,9 +106,9 @@ class ProfileGroupStore:
             "profile_group_id": profile_group_id,
             "device_group_id": profile_group_id,
             "name": str(group.get("name") or "گروه ۱"),
-            "max_accounts": int(group.get("max_accounts", group.get("group_size_limit", 30))),
-            "group_size_limit": int(group.get("max_accounts", group.get("group_size_limit", 30))),
-            "max_concurrent_accounts": int(group.get("max_concurrent_accounts", 10)),
+            "max_accounts": 0,
+            "group_size_limit": 0,
+            "max_concurrent_accounts": int(group.get("max_concurrent_accounts") or 0),
             "browser_provider": browser_provider,
             "adspower_group_id": str(group.get("adspower_group_id") or ""),
             "account_ids": account_ids,

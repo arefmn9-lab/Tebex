@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from contextlib import contextmanager
@@ -14,7 +15,9 @@ from modules.automation_engine.browser import actions_browser
 from modules.automation_engine.browser.browser_manager import BrowserManager, resolve_system_browser_executable
 from modules.automation_engine.browser_identity.bale_profile_contract import (
     BaleProfileContractError,
+    LOCK_FILENAME,
     acquire_profile_lease,
+    chrome_processes_for_profile,
     profile_compare_key,
     profile_launch_args,
     release_profile_lease,
@@ -760,6 +763,136 @@ class BalePlugin:
                 "save_bale_contact",
                 diagnostics,
             )
+
+    def ensure_bale_contact_available(
+        self,
+        account_id: str,
+        normalized_phone: str,
+        canonical_display_name: str,
+        provider_mode: str | None = None,
+        runtime_session: Any | None = None,
+        close_session_when_done: bool = True,
+    ) -> dict[str, Any]:
+        """Ensure the canonical contact is verified in this exact Bale account."""
+        started = time.perf_counter()
+        contact, binding_created = self.contact_store.get_or_create_bale_contact(account_id, normalized_phone)
+        phone = str(contact.get("phone_normalized") or "")
+        display_name = str(contact.get("display_name") or "")
+        mapping_status = "allocated" if binding_created else "reused"
+        account_contact_status = str(contact.get("verification_status") or "unverified")
+        proof_reliable = (
+            account_contact_status == "verified"
+            and contact.get("bale_contact_verified") is True
+            and str(contact.get("last_verified_account_id") or "") == str(account_id)
+            and str(contact.get("bale_verification_status") or "") in {"saved", "already_exists", "verified"}
+        )
+        base = {
+            "account_id": account_id,
+            "phone": phone,
+            "phone_normalized": phone,
+            "normalized_phone": phone,
+            "display_name": display_name,
+            "recipient_display_name": display_name,
+            "contact_id": contact.get("id"),
+            "sequence_number": contact.get("sequence_number"),
+            "mapping_status": mapping_status,
+            "account_contact_status": account_contact_status,
+        }
+        if phone != str(normalized_phone) or display_name != str(canonical_display_name):
+            return {
+                **base,
+                "success": False,
+                "ok": False,
+                "error_code": "canonical_contact_binding_mismatch",
+                "error_message": "Phone and canonical Bale display name do not match the persistent mapping",
+                "failed_step": "bind_canonical_contact",
+                "last_successful_step": "resolve_mapping",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+        if proof_reliable:
+            return {
+                **base,
+                "success": True,
+                "ok": True,
+                "contact_save_status": "verified_account_contact",
+                "account_contact_status": "verified",
+                "failed_step": None,
+                "last_successful_step": "check_account_contact",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+
+        save_result = self.save_bale_contact(
+            account_id,
+            phone,
+            provider_mode=provider_mode or "native_chrome",
+            runtime_session=runtime_session,
+            close_session_when_done=close_session_when_done,
+        )
+        if not save_result.get("success"):
+            return {
+                **base,
+                **save_result,
+                "mapping_status": mapping_status,
+                "account_contact_status": "unverified",
+                "failed_step": save_result.get("failed_step") or "save_bale_contact",
+                "last_successful_step": save_result.get("last_successful_step") or "check_account_contact",
+                "nested_error": {
+                    "error_code": save_result.get("error_code"),
+                    "error_message": save_result.get("error_message"),
+                },
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+
+        save_status = str(save_result.get("contact_save_status") or "")
+        if save_status not in {"saved", "already_exists"}:
+            return {
+                **base,
+                **save_result,
+                "success": False,
+                "ok": False,
+                "error_code": "contact_save_not_verified",
+                "error_message": "Bale contact save did not return verified account-scoped proof",
+                "failed_step": "verify_contact_saved",
+                "last_successful_step": "save_bale_contact",
+                "mapping_status": mapping_status,
+                "account_contact_status": "unverified",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+        verified_at = datetime.now(timezone.utc).isoformat()
+        persisted = self.contact_store.update_contact_metadata(account_id, phone, {
+            "preparation_status": "prepared",
+            "verification_status": "verified",
+            "bale_contact_verified": True,
+            "bale_verified_at": verified_at,
+            "bale_verification_status": save_status,
+            "bale_verification_error": None,
+            "last_verified_account_id": account_id,
+        })
+        if persisted is None:
+            return {
+                **base,
+                **save_result,
+                "success": False,
+                "ok": False,
+                "error_code": "account_contact_proof_not_persisted",
+                "error_message": "Verified Bale contact proof could not be persisted for the selected account",
+                "failed_step": "persist_account_contact_proof",
+                "last_successful_step": "verify_contact_saved",
+                "mapping_status": mapping_status,
+                "account_contact_status": "verified_not_persisted",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+        return {
+            **base,
+            **save_result,
+            "success": True,
+            "ok": True,
+            "mapping_status": mapping_status,
+            "account_contact_status": "verified",
+            "failed_step": None,
+            "last_successful_step": "persist_account_contact_proof",
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
 
     def open_bale_source_channel(
         self,
@@ -2064,6 +2197,38 @@ class BalePlugin:
         self._add_step(step_results, "validate_request", "success", account_id=account_id, phone=phone_text)
         last_successful_step = "validate_request"
 
+        # A real selected delivery account is checked before source resolution,
+        # contact allocation/navigation, or forwarding. The existing canonical
+        # profile/runtime is reused; no unrelated account is inspected.
+        if job_id and not dry_run:
+            try:
+                with self._runtime_or_page_session(
+                    account_id,
+                    provider_mode=provider_mode or "native_chrome",
+                    runtime_session=runtime_session,
+                ) as (auth_page, _auth_meta):
+                    auth = self.classify_authentication_state(auth_page, timeout_ms=3000)
+                auth_state = str(auth.get("auth_state") or "unknown_auth_state")
+                authenticated = bool(auth.get("authenticated") and auth_state == "authenticated")
+                self._add_step(step_results, "delivery_authentication_check", "success" if authenticated else "failed",
+                               auth_state=auth_state, launch_initiator="delivery_job")
+                if not authenticated:
+                    visible_login = auth_state in {"login_required", "unauthenticated", "qr_login_required", "verification_code_required", "otp_required"}
+                    return finish(
+                        False,
+                        "authentication_required" if visible_login else "authentication_check_inconclusive",
+                        "Visible Bale Login/OTP requires operator action." if visible_login else "Bale authentication could not be confirmed for this delivery.",
+                        "delivery_authentication_check",
+                        {"auth_state": auth_state, "login_required": visible_login, "launch_initiator": "delivery_job",
+                         "contact_creation_attempted": False, "source_navigation_attempted": False, "send_attempted": False},
+                    )
+                last_successful_step = "delivery_authentication_check"
+            except Exception as exc:
+                self._add_step(step_results, "delivery_authentication_check", "failed", error_code=_browser_error_code(exc), launch_initiator="delivery_job")
+                return finish(False, "authentication_check_inconclusive", str(exc), "delivery_authentication_check",
+                              {"launch_initiator": "delivery_job", "contact_creation_attempted": False,
+                               "source_navigation_attempted": False, "send_attempted": False})
+
         configured = bale_account_store.get_source_channel(account_id) or {}
         configured_source_channel_uid = str(configured.get("source_channel_uid") or "")
         try:
@@ -2127,39 +2292,11 @@ class BalePlugin:
                 "error_message": None,
                 "step_results": [{"step": "resolve_contact_name", "status": "success", "display_name": resolved_display_name, "contact_store_status": "immutable_execution_plan"}],
             }
-        elif not preexisting_contact:
-            contact_result = {
-                "success": True,
-                "ok": True,
-                "action": "save_bale_contact",
-                "account_id": account_id,
-                "phone": phone_text,
-                "phone_normalized": str(resolved_contact.get("phone_normalized") or ""),
-                "display_name": resolved_display_name,
-                "contact_id": resolved_recipient_id,
-                "sequence_number": resolved_contact.get("sequence_number"),
-                "contact_store_status": "existing",
-                "contact_save_status": "already_exists",
-                "failed_step": None,
-                "last_successful_step": "resolve_contact_name",
-                "error_code": None,
-                "error_message": None,
-                "step_results": [
-                    {
-                        "step": "resolve_contact_name",
-                        "status": "success",
-                        "phone_normalized": str(resolved_contact.get("phone_normalized") or ""),
-                        "display_name": resolved_display_name,
-                        "contact_store_status": "existing",
-                        "contact_id": resolved_recipient_id,
-                        "sequence_number": resolved_contact.get("sequence_number"),
-                    }
-                ],
-            }
         else:
-            contact_result = self.save_bale_contact(
+            contact_result = self.ensure_bale_contact_available(
                 account_id,
-                phone_text,
+                str(resolved_contact.get("phone_normalized") or phone_text),
+                resolved_display_name,
                 provider_mode=provider_mode or "native_chrome",
                 runtime_session=runtime_session,
                 close_session_when_done=close_session_when_done,
@@ -2170,8 +2307,24 @@ class BalePlugin:
                 False,
                 str(contact_result.get("error_code") or "contact_save_failed"),
                 str(contact_result.get("error_message") or "Bale contact save failed"),
-                "save_or_resolve_contact",
-                {"screenshot_path": contact_result.get("screenshot_path") or "", "contact_result": contact_result},
+                str(contact_result.get("failed_step") or "save_or_resolve_contact"),
+                {
+                    "screenshot_path": contact_result.get("screenshot_path") or "",
+                    "selector": contact_result.get("selector") or "",
+                    "page_url": contact_result.get("page_url") or contact_result.get("current_url") or "",
+                    "page_title": contact_result.get("page_title") or "",
+                    "normalized_phone": contact_result.get("normalized_phone") or contact_result.get("phone_normalized") or phone_text,
+                    "recipient_display_name": contact_result.get("recipient_display_name") or contact_result.get("display_name") or resolved_display_name,
+                    "mapping_status": contact_result.get("mapping_status"),
+                    "account_contact_status": contact_result.get("account_contact_status"),
+                    "browser_reused": contact_result.get("browser_reused"),
+                    "duration_ms": contact_result.get("duration_ms"),
+                    "nested_error": contact_result.get("nested_error") or {
+                        "error_code": contact_result.get("error_code"),
+                        "error_message": contact_result.get("error_message"),
+                    },
+                    "contact_result": contact_result,
+                },
             )
         resolved_display_name = str(contact_result.get("display_name") or resolved_display_name).strip()
         resolved_recipient_id = resolved_recipient_id or str(contact_result.get("contact_id") or "")
@@ -2661,7 +2814,35 @@ class BalePlugin:
         with self._page_session(account_id, provider_mode=provider_mode) as session:
             yield session
 
-    def create_reusable_runtime_session(self, account_id: str, provider_mode: str | None = None, profile_path: str | None = None) -> dict[str, Any]:
+    # ============================================================
+    # BLOCK: BALE_REUSABLE_RUNTIME_SESSION_CREATION
+    # PURPOSE:
+    # Creates one persistent Playwright browser context for one Bale account.
+    # ACCOUNT_SCOPE:
+    # One account and its canonical browser profile.
+    # DEPENDENCIES:
+    # Playwright Sync API, Bale profile lease contract
+    # LAYER:
+    # PLUGIN
+    # ============================================================
+
+    # FUNCTION:
+    # create_reusable_runtime_session
+    # RESPONSIBILITY:
+    # Starts the account browser and returns its reusable runtime handles.
+    # INPUT:
+    # account_id, provider_mode, canonical profile_path
+    # OUTPUT:
+    # Playwright, browser context, page, and profile metadata
+    # SIDE EFFECTS:
+    # Acquires a profile lease and launches a persistent Chrome context.
+    def create_reusable_runtime_session(
+        self,
+        account_id: str,
+        provider_mode: str | None = None,
+        profile_path: str | None = None,
+        account_record: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             from playwright.sync_api import sync_playwright
         except Exception as exc:
@@ -2672,7 +2853,13 @@ class BalePlugin:
         if not browser_path:
             raise BalePluginError("browser_start_timeout", "No system Chrome/Edge found")
 
-        account = bale_account_store.get_account(account_id)
+        account = account_record or bale_account_store.get_account(account_id)
+        if account and str(account.get("account_id") or "") != account_id:
+            raise BaleProfileContractError(
+                "PROFILE_IDENTITY_MISMATCH",
+                "Resolved Bale registration belongs to another account",
+                {"expected_account_id": account_id, "actual_account_id": account.get("account_id")},
+            )
         profile_record = resolve_profile_record(account_id, account, require_registered=True)
         if profile_compare_key(browser_path) != profile_compare_key(profile_record.chrome_executable):
             raise BaleProfileContractError("PROFILE_IDENTITY_MISMATCH", "Resolved browser executable does not match the Bale profile registry", {"expected": profile_record.chrome_executable, "actual": browser_path})
@@ -2682,9 +2869,10 @@ class BalePlugin:
         profile_dir.mkdir(parents=True, exist_ok=True)
         lease_payload = acquire_profile_lease(profile_record, run_id=f"bale_runtime_{account_id}")
         lease = lease_payload["lease"]
-        playwright = sync_playwright().start()
+        playwright = None
         context = None
         try:
+            playwright = sync_playwright().start()
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=profile_record.user_data_dir,
                 executable_path=browser_path,
@@ -2695,6 +2883,7 @@ class BalePlugin:
             page = context.pages[0] if context.pages else context.new_page()
             return {
                 "playwright": playwright,
+                "browser": getattr(context, "browser", None),
                 "context": context,
                 "page": page,
                 "profile_path": profile_record.user_data_dir,
@@ -2704,13 +2893,19 @@ class BalePlugin:
                 "profile_directory": profile_record.profile_directory,
                 "profile_lease": lease,
                 "runtime_process_identity": runtime_identity,
+                "browser_pid": runtime_identity.get("browser_pid") or runtime_identity.get("process_id"),
             }
         except Exception:
             if context is not None:
                 context.close()
             release_profile_lease(profile_record, lease, abnormal=True, reason="runtime_session_launch_failed")
-            playwright.stop()
+            if playwright is not None:
+                playwright.stop()
             raise
+
+    # ============================================================
+    # END BLOCK: BALE_REUSABLE_RUNTIME_SESSION_CREATION
+    # ============================================================
 
     def close_reusable_runtime_session(self, runtime_session: Any) -> dict[str, Any]:
         metadata = getattr(runtime_session, "metadata", {}) or {}
@@ -2736,6 +2931,54 @@ class BalePlugin:
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error_code": "session_close_failed", "message": str(exc)}
+
+    # ============================================================
+    # BLOCK: BALE_STALE_RUNTIME_LEASE_RECOVERY
+    # PURPOSE:
+    # Releases an orphan profile lease owned by this backend process.
+    # ACCOUNT_SCOPE:
+    # One account profile; cross-process and active-browser leases are preserved.
+    # DEPENDENCIES:
+    # Bale profile lease contract
+    # LAYER:
+    # PLUGIN
+    # ============================================================
+
+    # FUNCTION:
+    # recover_stale_reusable_runtime_lease
+    # RESPONSIBILITY:
+    # Removes a same-process lease only when its runtime and Chrome process are gone.
+    # INPUT:
+    # account_id
+    # OUTPUT:
+    # Recovery result
+    # SIDE EFFECTS:
+    # May remove the account's orphan .clinicos_profile_lease.json.
+    def recover_stale_reusable_runtime_lease(self, account_id: str) -> dict[str, Any]:
+        account = bale_account_store.get_account(account_id)
+        profile_record = resolve_profile_record(account_id, account, require_registered=True)
+        lock_path = Path(profile_record.user_data_dir) / LOCK_FILENAME
+        if not lock_path.exists():
+            return {"recovered": False, "reason": "profile_lease_not_found"}
+        try:
+            lease = json.loads(lock_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"recovered": False, "reason": "profile_lease_unreadable"}
+        if int(lease.get("owner_process_id") or 0) != os.getpid():
+            return {"recovered": False, "reason": "profile_lease_owned_by_another_process"}
+        if chrome_processes_for_profile(profile_record):
+            return {"recovered": False, "reason": "browser_process_still_active"}
+        released = release_profile_lease(
+            profile_record,
+            lease,
+            abnormal=True,
+            reason="stale_authentication_runtime_missing",
+        )
+        return {"recovered": bool(released.get("ok")), **released}
+
+    # ============================================================
+    # END BLOCK: BALE_STALE_RUNTIME_LEASE_RECOVERY
+    # ============================================================
 
     @contextmanager
     def _page_session(self, account_id: str, provider_mode: str | None = None) -> Any:
@@ -2885,6 +3128,7 @@ class BalePlugin:
             "chat_ui_detected": bool(logged_in_ui_detected),
             "dialog_items_detected": bool(dialog_selector),
             "chat_list_visible": chat_list_visible,
+            "chat_list_selector": chat_list_selector or dialog_selector or "",
             "search_input_detected": bool(search_selector),
             "search_icon_detected": search_icon_visible,
             "search_icon_visible": search_icon_visible,
@@ -2908,6 +3152,33 @@ class BalePlugin:
         contacts_ui_available = bool(self._contacts_ui_visible(page))
         loading_visible = bool(self._first_visible_selector(page, ['[aria-label="Loading-icon"]', '[role="progressbar"]', '[class*="loading" i]', '[class*="spinner" i]'], timeout_ms=500))
         reconnect_visible = any(token in text_lower for token in ["offline", "reconnect", "connecting", "connection", "disconnected"]) or "Ø¯Ø±Ø­Ø§Ù„ Ø§ØªØµØ§Ù„" in visible_text
+        chat_row_count = 0
+        for selector in selectors.CHAT_ITEM_SELECTORS:
+            try:
+                chat_row_count = max(chat_row_count, int(page.locator(selector).count()))
+            except Exception:
+                continue
+        if chat_row_count == 0 and login.get("dialog_items_detected"):
+            chat_row_count = 1
+        storage_diagnostics = {"local_storage_accessible": None, "indexeddb_accessible": None, "service_worker_state": "unknown", "cookies_present": None}
+        try:
+            storage_diagnostics.update(page.evaluate("""() => ({
+                local_storage_accessible: (() => { try { void localStorage.length; return true; } catch (_) { return false; } })(),
+                indexeddb_accessible: typeof indexedDB !== 'undefined',
+                service_worker_state: navigator.serviceWorker?.controller?.state || (navigator.serviceWorker ? 'available_without_controller' : 'unsupported')
+            })""") or {})
+        except Exception:
+            pass
+        try:
+            storage_diagnostics["cookies_present"] = bool(page.context.cookies())
+        except Exception:
+            pass
+        try:
+            renderer_crashed = bool(page.is_closed())
+        except Exception:
+            renderer_crashed = False
+        service_worker_failed = storage_diagnostics["service_worker_state"] in {"redundant", "failed"}
+        chat_list_ready = bool(login.get("chat_list_visible") and chat_row_count > 0 and not loading_visible and not reconnect_visible)
         strong_chat_evidence = bool(
             login.get("chat_list_visible")
             or login.get("message_input_detected")
@@ -2952,7 +3223,7 @@ class BalePlugin:
             auth_state = "auth_unverified"
             legacy_auth_state = "loading"
             error_code = "auth_unverified"
-        elif chat_shell_visible:
+        elif chat_shell_visible and chat_list_ready and not renderer_crashed and not service_worker_failed and storage_diagnostics["local_storage_accessible"] is not False and storage_diagnostics["indexeddb_accessible"] is not False:
             auth_state = "authenticated"
             legacy_auth_state = "authenticated"
             error_code = None
@@ -2960,6 +3231,10 @@ class BalePlugin:
             auth_state = "unauthenticated"
             legacy_auth_state = "login_required"
             error_code = "authentication_required"
+        elif chat_shell_visible and login.get("chat_list_visible") and chat_row_count == 0 and not loading_visible:
+            auth_state = "auth_unverified"
+            legacy_auth_state = "authenticated_but_chat_list_empty"
+            error_code = "bale_authenticated_but_chat_list_empty"
         elif not page_url or "loading" in text_lower:
             auth_state = "auth_unverified"
             legacy_auth_state = "loading"
@@ -2968,6 +3243,25 @@ class BalePlugin:
             auth_state = "auth_unverified"
             legacy_auth_state = "unknown_auth_state"
             error_code = "auth_unverified"
+
+        authenticated_shell_ready = bool(
+            chat_shell_visible
+            and chat_list_ready
+            and not renderer_crashed
+            and not service_worker_failed
+            and storage_diagnostics["local_storage_accessible"] is not False
+            and storage_diagnostics["indexeddb_accessible"] is not False
+        )
+        # A chat message, archived dialog, or hidden stale QR/OTP fragment can
+        # contain login words after Bale's authenticated app shell is ready.
+        # Direct shell/chat evidence wins unless an actual login UI is visible
+        # (which is excluded by chat_shell_visible above).
+        if authenticated_shell_ready:
+            if auth_state != "authenticated":
+                evidence.append("stale_login_text_ignored_in_authenticated_shell")
+            auth_state = "authenticated"
+            legacy_auth_state = "authenticated"
+            error_code = None
 
         authenticated = auth_state == "authenticated"
         return {
@@ -2979,6 +3273,22 @@ class BalePlugin:
             "contacts_ui_available": contacts_ui_available,
             "loading_visible": loading_visible,
             "offline_or_reconnecting_visible": reconnect_visible,
+            "chat_list_ready": chat_list_ready,
+            "chat_row_count": chat_row_count,
+            "renderer_crashed": renderer_crashed,
+            "service_worker_failed": service_worker_failed,
+            "chat_readiness_state": (
+                "bale_authenticated_and_chats_loaded" if authenticated and chat_list_ready
+                else "bale_authenticated_but_chats_stuck_loading" if chat_shell_visible and loading_visible
+                else "bale_authenticated_but_chat_list_empty" if chat_shell_visible and login.get("chat_list_visible") and chat_row_count == 0
+                else "bale_shell_loaded_but_network_failed" if chat_shell_visible and reconnect_visible
+                else "bale_shell_loaded_but_storage_failed" if chat_shell_visible and (storage_diagnostics["local_storage_accessible"] is False or storage_diagnostics["indexeddb_accessible"] is False)
+                else "bale_shell_loaded_but_service_worker_failed" if chat_shell_visible and service_worker_failed
+                else "bale_renderer_crashed" if renderer_crashed
+                else "bale_page_blank" if not page_url and not visible_text
+                else "temporarily_inconclusive"
+            ),
+            **storage_diagnostics,
             "page_url": page_url,
             "error_code": error_code,
             "detection_evidence": evidence,
@@ -2996,6 +3306,9 @@ class BalePlugin:
                     "logged_in_ui_detected",
                     "login_page_detected",
                     "chat_list_visible",
+                    "chat_list_selector",
+                    "login_form_visible",
+                    "login_form_selector",
                     "search_icon_visible",
                     "tabs_visible",
                     "side_menu_visible",

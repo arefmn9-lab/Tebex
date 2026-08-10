@@ -7,6 +7,7 @@ import { getSchedulerStatus } from "../api/scheduler";
 import { listDiagnosticRuns } from "../api/automation";
 import { listBrowserProviders } from "../api/platforms";
 import { request } from "../api/client";
+import { parseDiagnosticSources } from "../diagnosticSources";
 import {
   createDiagnosticEvent, downloadDiagnostics, getClientDiagnosticEvents,
   readableReport, subscribeDiagnostics,
@@ -30,7 +31,7 @@ function backendEvent(event) {
 }
 
 export default function OperationsAndLogs() {
-  const [data, setData] = useState({ jobs: [], events: [], logs: [], runs: [], providers: [], health: [], scheduler: null });
+  const [data, setData] = useState({ jobs: [], events: [], logs: [], runs: [], providers: [], health: [], scheduler: null, persistedClientEvents: [], sourceMetadata: {} });
   const [clientEvents, setClientEvents] = useState(getClientDiagnosticEvents);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -41,26 +42,31 @@ export default function OperationsAndLogs() {
     setLoading(true); setError("");
     const sources = await Promise.allSettled([
       listJobs({ limit: 40, offset: 0 }), listEvents({ limit: 80, offset: 0 }), listLogs(),
-      listDiagnosticRuns(), listBrowserProviders(), request("/automation/accounts/health"), getSchedulerStatus(),
+      listDiagnosticRuns(), listBrowserProviders(), request("/automation/accounts/health"), getSchedulerStatus(), request("/automation/diagnostics/client-events"),
     ]);
+    const parsed = parseDiagnosticSources(sources);
+    const value = parsed.values;
     const failures = sources.filter((item) => item.status === "rejected");
     setData({
-      jobs: sources[0].value?.items || [], events: sources[1].value?.items || [],
-      logs: Array.isArray(sources[2].value) ? sources[2].value : [],
-      runs: sources[3].value?.runs || [],
-      providers: Array.isArray(sources[4].value?.items) ? sources[4].value.items : Array.isArray(sources[4].value) ? sources[4].value : [],
-      health: Array.isArray(sources[5].value?.items) ? sources[5].value.items : Array.isArray(sources[5].value) ? sources[5].value : [],
-      scheduler: sources[6].value || null,
+      jobs: value.jobs ?? [], events: value.events ?? [], logs: value.logs ?? [],
+      runs: value.diagnostic_runs ?? [], providers: value.browser_providers ?? [],
+      health: value.health ?? [], scheduler: value.scheduler,
+      persistedClientEvents: value.client_events ?? [],
+      sourceMetadata: parsed.metadata,
     });
-    if (failures.length) setError(`${failures.length} diagnostic source(s) could not be loaded. Available sources are shown below.`);
+    const parseFailures = Object.values(parsed.metadata).filter((item) => item.parse_error).length;
+    if (failures.length || parseFailures) setError(`${Math.max(failures.length, parseFailures)} diagnostic source(s) could not be loaded or parsed. Successful sources are preserved below.`);
     setLoading(false);
   }
 
   useEffect(() => { load(); return subscribeDiagnostics(() => setClientEvents(getClientDiagnosticEvents())); }, []);
-  const structured = useMemo(() => [...clientEvents, ...data.events.map(backendEvent)]
-    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp))), [clientEvents, data.events]);
+  const structured = useMemo(() => {
+    const merged = [...clientEvents, ...data.persistedClientEvents, ...data.events.map(backendEvent)];
+    return [...new Map(merged.map((event) => [event.event_id, event])).values()]
+      .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+  }, [clientEvents, data.persistedClientEvents, data.events]);
   const failures = structured.filter((event) => !event.success);
-  const context = { scheduler: data.scheduler, diagnostic_runs: data.runs.map((run) => run.name), browser_providers: data.providers };
+  const context = { scheduler: data.scheduler, diagnostic_runs: data.runs, browser_providers: data.providers, source_metadata: data.sourceMetadata, frontend_source_revision: __CLINICOS_SOURCE_REVISION__, frontend_root: __CLINICOS_FRONTEND_ROOT__ };
   const report = () => readableReport(structured, context);
   async function copyReport() { await navigator.clipboard.writeText(report()); setCopied(true); window.setTimeout(() => setCopied(false), 1500); }
   function downloadJson() { downloadDiagnostics("clinicos-diagnostics.json", JSON.stringify({ generated_at: new Date().toISOString(), context, events: structured }, null, 2), "application/json"); }
@@ -82,6 +88,12 @@ export default function OperationsAndLogs() {
         <ContentCard title="System health"><div className="status-stack">
           <p><span>Scheduler</span><b>{fmt(data.scheduler?.scheduler_status)}</b></p>
           <p><span>Available workers</span><b>{fmt(data.scheduler?.available_slots)}</b></p>
+          <p><span>Snapshot generated</span><b>{fmt(data.scheduler?.current_snapshot_generated_at)}</b></p>
+          <p><span>Latest tick</span><b>{fmt(data.scheduler?.last_tick_at)}</b></p>
+          <p><span>Tick is stale</span><b>{fmt(data.scheduler?.last_tick_is_stale)}</b></p>
+          <p><span>Latest campaign</span><b>{fmt(data.scheduler?.latest_campaign_id)}</b></p>
+          <p><span>Campaign worker started</span><b>{fmt(data.scheduler?.latest_campaign_worker_started)}</b></p>
+          <p><span>Campaign browser started</span><b>{fmt(data.scheduler?.latest_campaign_browser_started)}</b></p>
           <p><span>Account health records</span><b>{data.health.length}</b></p>
           <p><span>Browser providers</span><b>{data.providers.length}</b></p>
         </div></ContentCard>
@@ -92,6 +104,15 @@ export default function OperationsAndLogs() {
           <p><span>Backend logs</span><b>{data.logs.length}</b></p>
         </div></ContentCard>
       </div>
+
+      <ContentCard title="Bale account readiness matrix">
+        <pre className="diagnostics-file-preview" dir="ltr">{JSON.stringify(data.scheduler?.account_readiness_matrix || [], null, 2)}</pre>
+      </ContentCard>
+
+      <ContentCard title="Historical last tick results">
+        <p>These records belong to the scheduler tick at {fmt(data.scheduler?.last_tick_at)} and are not evidence of the latest campaign attempt.</p>
+        <pre className="diagnostics-file-preview" dir="ltr">{JSON.stringify(data.scheduler?.last_tick_results || [], null, 2)}</pre>
+      </ContentCard>
 
       <ContentCard title="Recent actions, errors, account/campaign and worker events">
         {structured.length ? <div className="operations-event-list">{structured.slice(0, 100).map((event) => (

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+import os
 from pathlib import Path
 from typing import Any
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[3]
-APPROVED_PROFILE_ROOT = (BACKEND_DIR / "runtime" / "browser_profiles").resolve()
+APPROVED_PROFILE_ROOT = Path(os.environ.get("CLINICOS_BALE_PROFILE_ROOT") or BACKEND_DIR / "runtime" / "browser_profiles").resolve()
 
 
 def sanitize_account_id(account_id: str) -> str:

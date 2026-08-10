@@ -5,6 +5,7 @@ from pathlib import Path
 
 from modules.automation_engine.browser_identity import bale_profile_contract as contract
 from modules.automation_engine.plugins.bale.plugin import BalePlugin, _native_profile_metadata
+from modules.automation_engine.plugins.bale.account_store import bale_account_store
 
 
 ACCOUNT_ID = "bale_09211690533"
@@ -49,13 +50,11 @@ class FakeBrowserManager:
 
 
 def canonical_profile_path() -> str:
-    repo_root = Path(__file__).resolve().parents[1]
-    return str(repo_root / "backend" / "runtime" / "browser_profiles" / ACCOUNT_ID)
+    return str(contract.PROFILE_ROOT / ACCOUNT_ID)
 
 
 def nested_account_store_path() -> str:
-    repo_root = Path(__file__).resolve().parents[1]
-    return str(repo_root / "backend" / "runtime" / "browser_profiles" / "bale" / ACCOUNT_ID)
+    return str(contract.PROFILE_ROOT / "bale" / ACCOUNT_ID)
 
 
 def assert_canonical_native_metadata(call: dict) -> None:
@@ -66,7 +65,20 @@ def assert_canonical_native_metadata(call: dict) -> None:
     assert metadata["user_data_dir"] != nested_account_store_path()
 
 
+def register_test_account() -> None:
+    if bale_account_store.get_account(ACCOUNT_ID) is None:
+        bale_account_store.create_account({
+            "account_id": ACCOUNT_ID,
+            "username_or_number": "09211690533",
+            "phone": "09211690533",
+            "browser_provider": "native_chrome",
+            "user_data_dir": canonical_profile_path(),
+            "active": True,
+        })
+
+
 def test_open_account_uses_canonical_flat_native_profile() -> None:
+    register_test_account()
     manager = FakeBrowserManager()
     result = BalePlugin(browser_manager=manager).open_account(ACCOUNT_ID)
 
@@ -75,6 +87,7 @@ def test_open_account_uses_canonical_flat_native_profile() -> None:
 
 
 def test_open_login_uses_same_canonical_flat_native_profile() -> None:
+    register_test_account()
     manager = FakeBrowserManager()
     result = BalePlugin(browser_manager=manager).open_login(ACCOUNT_ID)
 
@@ -84,6 +97,7 @@ def test_open_login_uses_same_canonical_flat_native_profile() -> None:
 
 
 def test_check_login_uses_same_canonical_flat_native_profile(monkeypatch) -> None:
+    register_test_account()
     manager = FakeBrowserManager()
     plugin = BalePlugin(browser_manager=manager)
     monkeypatch.setattr(
@@ -153,6 +167,7 @@ def test_nested_and_temp_profiles_rejected(monkeypatch, tmp_path) -> None:
         assert exc.error_code == "PROFILE_IDENTITY_MISMATCH"
 
     monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.setenv("CLINICOS_TEST_MODE", "0")
     temp_record = contract.BaleProfileRecord("bale", ACCOUNT_ID, contract.CANONICAL_CHROME_EXECUTABLE, str(tmp_path / ACCOUNT_ID), "Default")
     try:
         contract.assert_launch_allowed(temp_record, controlled_live_authorized=True)
@@ -257,6 +272,9 @@ class AuthLocator:
             return self.page.body_text
         return self.page.text.get(self.selector, "")
 
+    def count(self) -> int:
+        return int(self.selector in self.page.visible)
+
 
 class AuthPage:
     def __init__(self, visible: set[str], body_text: str = "", url: str = "https://web.bale.ai/") -> None:
@@ -277,7 +295,7 @@ def test_explicit_login_screen_is_unauthenticated() -> None:
 
 
 def test_positive_authenticated_ui_is_authenticated() -> None:
-    page = AuthPage({"body", "[data-testid='chat-list']"}, "chat list", "https://web.bale.ai/")
+    page = AuthPage({"body", "[data-testid='chat-list']", "[data-testid='chat-list-item']"}, "chat list", "https://web.bale.ai/")
     auth = BalePlugin(browser_manager=FakeBrowserManager()).classify_authentication_state(page)
     assert auth["auth_state"] == "authenticated"
     assert auth["authenticated"] is True

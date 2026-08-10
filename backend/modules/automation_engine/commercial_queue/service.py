@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
+import re
+import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +29,7 @@ from .account_health import AccountHealthRepository, AccountHealthService, BLOCK
 from .bale_authentication import BaleAuthenticationMaintenanceService, FakeBaleAuthenticationMaintenanceService
 from .context import OperationContext
 from .errors import ERROR_DOMAINS, classify_error
+from .execution_mode import ExecutionModeError, REAL_SEND, resolve_execution_mode
 from .execution_plan import build_execution_plan
 from .import_pipeline import (
     MAX_IMPORT_ROWS,
@@ -41,13 +47,198 @@ from .policy import EffectivePolicyResolver
 from .repository import CommercialQueueRepository, commercial_send_completed, parse_time, utc_now
 from .resources import ResourceCapacityProvider
 
+logger = logging.getLogger(__name__)
+
+
+# Campaign records predate the operator-facing campaign workflow.  Some were
+# intentionally retained as controlled verification evidence, templates, or
+# runtime maintenance artifacts.  They are not deleted here: classification is
+# presentation metadata so production history remains recoverable in
+# diagnostics while the normal Campaigns page stays operator-focused.
+_INTERNAL_CAMPAIGN_ID_ORIGINS = {
+    "campaign_phase5f1_contact_maintenance": "runtime_generated_artifact",
+}
+_CAMPAIGN_TEST_NAME = re.compile(r"\b(?:test|fixture|dry[ -]?run)\b", re.IGNORECASE)
+_CAMPAIGN_VERIFICATION_NAME = re.compile(
+    r"(?:^phase\s*\d|\b(?:controlled|verification|readiness|no[- ]?send)\b)",
+    re.IGNORECASE,
+)
+_CAMPAIGN_TEMPLATE_NAME = re.compile(r"\btemplate\b", re.IGNORECASE)
+
+
+def campaign_presentation(campaign: dict[str, Any], policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Classify a campaign for the operator list without mutating it.
+
+    Explicit origin metadata wins for newly-created records.  Older records
+    lack that metadata, so only unambiguous historical artifact names are
+    suppressed; unknown and historical operator campaigns remain visible.
+    """
+    policy = policy or {}
+    campaign_id = str(campaign.get("id") or "")
+    name = str(campaign.get("name") or "")
+    explicit_origin = str(policy.get("campaign_origin") or policy.get("origin") or "").strip().lower()
+    explicitly_visible = policy.get("operator_visible")
+
+    if campaign.get("deleted_at") or bool(campaign.get("hidden")):
+        return {
+            "campaign_classification": "soft_deleted_campaign",
+            "classification_reason": "soft_deleted_or_hidden",
+            "operator_visible": False,
+            "is_internal": True,
+        }
+    if campaign_id in _INTERNAL_CAMPAIGN_ID_ORIGINS:
+        return {
+            "campaign_classification": _INTERNAL_CAMPAIGN_ID_ORIGINS[campaign_id],
+            "classification_reason": "known_runtime_campaign_id",
+            "operator_visible": False,
+            "is_internal": True,
+        }
+    if explicit_origin in {"runtime_generated", "runtime", "development_fixture", "automated_test_fixture", "verification_campaign", "template"}:
+        classification = {
+            "runtime": "runtime_generated_artifact",
+        }.get(explicit_origin, explicit_origin)
+        return {
+            "campaign_classification": classification,
+            "classification_reason": "explicit_campaign_origin",
+            "operator_visible": bool(explicitly_visible) if explicitly_visible is not None else False,
+            "is_internal": not bool(explicitly_visible),
+        }
+    if explicit_origin in {"operator_ui", "real_operator_campaign", "historical_production_campaign"}:
+        return {
+            "campaign_classification": "historical_production_campaign" if explicit_origin == "historical_production_campaign" else "real_operator_campaign",
+            "classification_reason": "explicit_campaign_origin",
+            "operator_visible": True if explicitly_visible is None else bool(explicitly_visible),
+            "is_internal": False,
+        }
+    if _CAMPAIGN_TEMPLATE_NAME.search(name):
+        classification = "template"
+    elif _CAMPAIGN_TEST_NAME.search(name):
+        classification = "automated_test_fixture"
+    elif _CAMPAIGN_VERIFICATION_NAME.search(name):
+        classification = "verification_campaign"
+    elif str(campaign.get("status") or "").lower() == "completed":
+        classification = "historical_production_campaign"
+    elif name.strip():
+        classification = "uncertain"
+    else:
+        classification = "uncertain"
+    operator_visible = classification in {"real_operator_campaign", "historical_production_campaign", "uncertain"}
+    return {
+        "campaign_classification": classification,
+        "classification_reason": "legacy_name_or_state_inference",
+        "operator_visible": operator_visible,
+        "is_internal": not operator_visible,
+    }
+
+DIAGNOSTIC_MAX_JOB_ATTEMPTS_PER_RESUME = max(
+    1, int(os.environ.get("CLINICOS_DIAGNOSTIC_MAX_JOB_ATTEMPTS_PER_RESUME", "1"))
+)
+STOP_ACCOUNT_AFTER_FIRST_DETERMINISTIC_FAILURE = os.environ.get(
+    "CLINICOS_STOP_ACCOUNT_AFTER_FIRST_DETERMINISTIC_FAILURE", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+CAPTURE_FAILURE_SCREENSHOT = os.environ.get("CLINICOS_CAPTURE_FAILURE_SCREENSHOT", "1").strip().lower() in {"1", "true", "yes", "on"}
+CAPTURE_FAILURE_DOM = os.environ.get("CLINICOS_CAPTURE_FAILURE_DOM", "1").strip().lower() in {"1", "true", "yes", "on"}
+CONTACT_VERIFICATION_TTL_SECONDS = max(1, int(os.environ.get("CLINICOS_CONTACT_VERIFICATION_TTL_SECONDS", "86400")))
+
+DETERMINISTIC_UI_FAILURES = {
+    "browser_start_failure", "bale_load_failure", "contacts_navigation_failure",
+    "add_contact_failure", "contact_field_failure", "contact_save_failure",
+    "contact_verification_failure", "source_navigation_failure",
+    "source_message_failure", "forward_picker_failure",
+    "recipient_selection_failure", "send_confirmation_failure",
+    "send_verification_failure",
+}
+
+
+def classify_ui_failure_step(step: str | None) -> str | None:
+    value = str(step or "").lower()
+    rules = (
+        (("browser", "launch", "session"), "browser_start_failure"),
+        (("bale_load", "authenticated_shell"), "bale_load_failure"),
+        (("contacts_navigation", "open_contacts"), "contacts_navigation_failure"),
+        (("add_contact",), "add_contact_failure"),
+        (("phone_fill", "name_fill", "contact_field"), "contact_field_failure"),
+        (("contact_save",), "contact_save_failure"),
+        (("contact_verification", "contact_save_verified"), "contact_verification_failure"),
+        (("source_navigation", "open_source"), "source_navigation_failure"),
+        (("source_message", "wait_source_message", "select_latest"), "source_message_failure"),
+        (("forward_picker", "open_forward_picker"), "forward_picker_failure"),
+        (("recipient", "wait_recipient", "type_recipient"), "recipient_selection_failure"),
+        (("confirmation", "confirm_click"), "send_confirmation_failure"),
+        (("network_send", "forward_verified", "send_verification"), "send_verification_failure"),
+    )
+    for needles, category in rules:
+        if any(needle in value for needle in needles):
+            return category
+    return None
+
+
+def calculate_round_account_limit(
+    requested_accounts_per_round: int,
+    configured_max_concurrent_accounts: int,
+    eligible_account_count: int,
+    browser_slot_capacity: int,
+    worker_slot_capacity: int,
+    host_resource_capacity: int,
+) -> int:
+    return min(
+        max(1, int(requested_accounts_per_round)),
+        max(0, int(configured_max_concurrent_accounts)),
+        max(0, int(eligible_account_count)),
+        max(0, int(browser_slot_capacity)),
+        max(0, int(worker_slot_capacity)),
+        max(0, int(host_resource_capacity)),
+    )
+
+
+def deepest_execution_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    scenario = result.get("scenario_result") if isinstance(result.get("scenario_result"), dict) else {}
+    if not scenario and isinstance(result.get("orchestrator_result"), dict):
+        scenario = result["orchestrator_result"].get("scenario_result") or {}
+    steps = scenario.get("steps") if isinstance(scenario.get("steps"), list) else []
+    outer_steps = result.get("step_results") if isinstance(result.get("step_results"), list) else []
+    normalized_outer = [
+        {**item, "step_id": item.get("step_id") or item.get("step")}
+        for item in outer_steps if isinstance(item, dict)
+    ]
+    failed = next((item for item in reversed(steps) if isinstance(item, dict) and item.get("status") == "failed"), {})
+    succeeded = [item for item in steps if isinstance(item, dict) and item.get("status") == "success"]
+    details = failed.get("details") if isinstance(failed.get("details"), dict) else {}
+    records = scenario.get("records") if isinstance(scenario.get("records"), dict) else {}
+    diagnostics = scenario.get("diagnostics") if isinstance(scenario.get("diagnostics"), dict) else {}
+    browser = records.get("browser_session") or diagnostics.get("browser_session") or {}
+    root = ((browser.get("runtime_process_identity") or {}).get("root_process") or {}) if isinstance(browser, dict) else {}
+    failed_step = scenario.get("failed_step") or failed.get("step_id") or result.get("failed_step")
+    return {
+        "nested_error_code": scenario.get("error_code") or failed.get("error_code") or result.get("error_code"),
+        "nested_error_message": scenario.get("error_message") or failed.get("message") or result.get("error_message"),
+        "failed_step": failed_step,
+        "last_successful_step": succeeded[-1].get("step_id") if succeeded else None,
+        "selector": details.get("selector") or failed.get("selector"),
+        "page_url": details.get("page_url") or records.get("source_url") or diagnostics.get("source_url") or result.get("page_url"),
+        "screenshot_path": details.get("screenshot_path") or records.get("screenshot_path") or diagnostics.get("screenshot_path") or result.get("screenshot_path"),
+        "dom_excerpt": details.get("dom_excerpt") or records.get("dom_excerpt") or diagnostics.get("dom_excerpt") or result.get("dom_excerpt"),
+        "browser_pid": root.get("ProcessId") or result.get("browser_pid"),
+        "browser_profile_path": browser.get("profile_dir") if isinstance(browser, dict) else None,
+        # An adapter may provide a more precise failure class than a generic
+        # step-name mapping (for example an account-scoped session loss before
+        # browser work begins).  Preserve that evidence so the circuit breaker
+        # does not misclassify it as an unrelated deterministic UI defect.
+        "failure_class": result.get("failure_class") or classify_ui_failure_step(failed_step),
+        "scenario_steps": normalized_outer + steps,
+    }
+
 
 DEFAULT_GLOBAL_SETTINGS: dict[str, Any] = {
-    "max_concurrent_accounts": 3,
+    "concurrency_mode": os.environ.get("CLINICOS_CONCURRENCY_MODE", "unrestricted"),
+    "operator_defined_max_concurrent_accounts": max(1, int(os.environ.get("CLINICOS_MAX_CONCURRENT_ACCOUNTS", "1"))),
+    "max_concurrent_accounts": max(1, int(os.environ.get("CLINICOS_MAX_CONCURRENT_ACCOUNTS", "1"))),  # compatibility mirror
+    "browser_concurrency": max(1, int(os.environ.get("CLINICOS_BROWSER_SLOT_CAPACITY", "1"))),
+    "worker_concurrency": max(1, int(os.environ.get("CLINICOS_WORKER_SLOT_CAPACITY", "1"))),
     "deliveries_per_account_round": 10,
     "delay_between_deliveries_seconds": 60,
     "round_cooldown_seconds": 900,
-    "default_daily_limit_per_account": 50,
+    "default_daily_limit_per_account": max(1, int(os.environ.get("CLINICOS_DEFAULT_DAILY_LIMIT_PER_ACCOUNT", "50"))),
     "default_source_channel_uid": "",
     "account_assignment_strategy": "priority_then_least_sent",
     "max_job_duration_seconds": 300,
@@ -57,7 +248,7 @@ DEFAULT_GLOBAL_SETTINGS: dict[str, Any] = {
     "send_method": "forward_latest_channel_message",
     "operation_order_json": json.dumps(["save_contact", "forward_message"], ensure_ascii=False),
     "link_open_delay_seconds": 0,
-    "browser_start_batch_size": 10,
+    "browser_start_batch_size": max(1, int(os.environ.get("CLINICOS_BROWSER_SLOT_CAPACITY", "10"))),
     "browser_start_stagger_ms": 250,
     "max_system_memory_percent": 90,
     "max_system_cpu_percent": 95,
@@ -83,6 +274,7 @@ CONTROLLED_SINGLE_RECIPIENT_SOURCE_URL = "https://web.bale.ai/chat?uid=640738252
 CONTROLLED_SINGLE_RECIPIENT_ACCOUNT_ID = "bale_09211690533"
 CONTROLLED_SINGLE_RECIPIENT_APPROVAL_SCOPE = "single_recipient_single_send"
 CONTROLLED_LIVE_NO_SEND_MODE = "controlled_live_no_send"
+TEST_EXECUTION_MODES_ENV = "CLINICOS_ENABLE_TEST_EXECUTION_MODES"
 CONTROLLED_LIVE_NO_SEND_ENV = "CLINICOS_CONTROLLED_LIVE_NO_SEND"
 
 CONFIGURATION_FIELDS: dict[str, dict[str, Any]] = {
@@ -91,7 +283,11 @@ CONFIGURATION_FIELDS: dict[str, dict[str, Any]] = {
     "source.source_channel_url": {"default": "", "critical": True},
     "source.source_channel_label": {"default": "", "critical": False},
     "source.source_origin": {"default": "", "critical": False},
-    "accounts.allowed_account_ids": {"default": [], "critical": True},
+    # A normal campaign uses the dynamic shared account pool.  An empty list is
+    # therefore an explicit AUTO-mode value, not an incomplete configuration.
+    # Account IDs become a constraint only in a future deliberate PINNED mode.
+    "accounts.allowed_account_ids": {"default": [], "critical": False},
+    "accounts.account_selection_mode": {"default": "auto", "critical": False},
     "accounts.account_selection_strategy": {"default": "priority_round_robin", "critical": False},
     "accounts.max_concurrent_accounts": {"default": 1, "critical": False},
     "delivery.daily_delivery_limit": {"default": 50, "critical": False},
@@ -201,6 +397,25 @@ def _stable_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _operator_audit(action: str, before: Any, after: Any) -> dict[str, Any]:
+    return {"actor": "operator", "action": action, "timestamp": utc_now(), "before": before, "after": after}
+
+
+class _CanonicalBaleAuthenticationAccountStore:
+    """Read adapter over the migration-free canonical onboarding state.
+
+    Authentication must accept an operational SQLite account even when an old
+    process-global JSON registry mirror is missing or stale.
+    """
+
+    def get_account(self, account_id: str) -> dict[str, Any] | None:
+        return bale_onboarding_service.get_account(account_id)
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        payload = bale_onboarding_service.list_accounts()
+        return list(payload.get("items") or [])
+
+
 class CommercialQueueService:
     def __init__(
         self,
@@ -209,6 +424,7 @@ class CommercialQueueService:
         orchestrator: Any | None = None,
         account_auth_checker: Any | None = None,
         sleeper: Any | None = None,
+        contact_store: Any | None = None,
     ) -> None:
         self.repository = repository or CommercialQueueRepository(database_path)
         self.policy_resolver = EffectivePolicyResolver(self.repository)
@@ -224,23 +440,107 @@ class CommercialQueueService:
             browser_identity_resolver=self.browser_identity_resolver,
             account_health=self.account_health,
             plugin=bale_plugin,
+            account_store=_CanonicalBaleAuthenticationAccountStore(),
         )
         self.orchestrator = orchestrator
+        self._uses_operational_auth_source = account_auth_checker is None
         self.account_auth_checker = account_auth_checker or bale_onboarding_service.scheduler_authentication_available
         self.sleeper = sleeper or time.sleep
-        self.contact_store = bale_contact_store
-        self.recover_stale_jobs()
+        self.contact_store = contact_store or bale_contact_store
+        self.test_execution_modes_enabled = os.environ.get(TEST_EXECUTION_MODES_ENV) == "1"
+        self.scheduler_runtime: Any | None = None
+        self.scheduler_runtime_required = False
+        self._active_worker_rounds: dict[str, dict[str, Any]] = {}
+        self._active_worker_rounds_lock = threading.RLock()
+        self._readiness_cache: dict[str, tuple[str, dict[str, Any]]] = {}
+        # Test-only fault modes are intentionally held in process memory. They
+        # cannot survive a restart, cannot be configured through normal
+        # operator APIs, and are accepted only by the isolated runtime guard
+        # below.  That makes a synthetic delivery result impossible to carry
+        # into a normal ClinicOS process or production SQLite database.
+        self._test_worker_faults: dict[str, str] = {}
+
+    def _test_worker_faults_allowed(self) -> bool:
+        return (
+            os.environ.get("CLINICOS_TEST_MODE") == "1"
+            and self.test_execution_modes_enabled
+            and os.environ.get("CLINICOS_SAFE_TEST_WORKER_BOUNDARY") == "1"
+            and os.environ.get("CLINICOS_TEST_FAKE_WORKER_FAULTS") == "1"
+            and self.repository.database_path.resolve().name.casefold() != "clinicos.db"
+        )
+
+    def configure_test_worker_fault(self, account_id: str, mode: str) -> None:
+        """Arm one isolated, predeclared worker outcome for an account.
+
+        This is a deterministic runtime-fault injection seam for UI
+        acceptance.  It is deliberately narrower than a mock adapter: the
+        real scheduler, claim, worker, account-health, recovery, and lock
+        release paths still execute.  It never opens a browser, creates a
+        contact, or invokes a provider.
+        """
+        supported = {
+            "pre_send_session_loss",
+            "verified_success_then_session_loss",
+            "uncertain_after_send",
+        }
+        if not self._test_worker_faults_allowed():
+            raise CampaignLifecycleError("test_worker_faults_disabled", "Isolated test worker faults are disabled")
+        if mode not in supported:
+            raise ValueError(f"unsupported_test_worker_fault:{mode}")
+        self._test_worker_faults[str(account_id)] = mode
+
+    def _test_worker_fault_for(self, account_id: str, *, consume: bool = False) -> str | None:
+        if not self._test_worker_faults_allowed():
+            return None
+        if consume:
+            return self._test_worker_faults.pop(str(account_id), None)
+        return self._test_worker_faults.get(str(account_id))
+
+    def _resolve_execution_mode(self, execution_mode: str | None, source: str) -> str:
+        try:
+            return resolve_execution_mode(
+                execution_mode,
+                test_modes_enabled=self.test_execution_modes_enabled,
+                source=source,
+            )
+        except ExecutionModeError as exc:
+            raise CampaignLifecycleError(
+                "test_execution_mode_disabled",
+                str(exc),
+                {
+                    "environment_flag": TEST_EXECUTION_MODES_ENV,
+                    "execution_mode": exc.execution_mode,
+                    "source": exc.source,
+                },
+            ) from exc
 
     def get_global_settings(self) -> dict[str, Any]:
         existing = self.repository.get_global_settings()
         if existing is None:
-            existing = self.repository.upsert_global_settings(DEFAULT_GLOBAL_SETTINGS)
+            # Reads never create settings. Defaults are a display-only absence
+            # representation until an operator explicitly saves settings.
+            return {**_bool_fields(DEFAULT_GLOBAL_SETTINGS), "persisted": False}
         return _bool_fields(existing)
 
     def update_global_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.get_global_settings()
         merged = {**DEFAULT_GLOBAL_SETTINGS, **current, **{key: value for key, value in payload.items() if value is not None}}
-        return _bool_fields(self.repository.upsert_global_settings(merged))
+        if payload.get("max_concurrent_accounts") is not None and payload.get("operator_defined_max_concurrent_accounts") is None:
+            merged["concurrency_mode"] = "operator_defined"
+            merged["operator_defined_max_concurrent_accounts"] = int(payload["max_concurrent_accounts"])
+            merged["browser_concurrency"] = int(payload["max_concurrent_accounts"])
+            merged["worker_concurrency"] = int(payload["max_concurrent_accounts"])
+        mode = str(merged.get("concurrency_mode") or "operator_defined")
+        if mode not in {"operator_defined", "unrestricted"}:
+            raise CampaignLifecycleError("invalid_concurrency_mode", "Concurrency mode must be operator_defined or unrestricted")
+        for field in ("operator_defined_max_concurrent_accounts", "browser_concurrency", "worker_concurrency"):
+            if int(merged.get(field) or 0) < 0:
+                raise CampaignLifecycleError("invalid_concurrency", f"{field} must be a non-negative integer")
+        # Preserve the historical column for older consumers without changing the
+        # exact operator-entered value.
+        merged["max_concurrent_accounts"] = int(merged["operator_defined_max_concurrent_accounts"])
+        updated = _bool_fields(self.repository.upsert_global_settings(merged))
+        return {**updated, "mutation_audit": _operator_audit("update_global_settings", current, updated)}
 
     def list_account_settings(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         limit, offset = _pagination(limit, offset)
@@ -249,13 +549,14 @@ class CommercialQueueService:
     def get_account_settings(self, account_id: str) -> dict[str, Any]:
         existing = self.repository.get_account_settings(account_id)
         if existing is None:
-            existing = self.repository.upsert_account_settings(account_id, {})
+            return {"account_id": account_id, "persisted": False}
         return _bool_fields(existing)
 
     def update_account_settings(self, account_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.get_account_settings(account_id)
-        merged = {**current, **payload}
-        return _bool_fields(self.repository.upsert_account_settings(account_id, merged))
+        merged = {**{key: value for key, value in current.items() if key != "persisted"}, **payload}
+        updated = _bool_fields(self.repository.upsert_account_settings(account_id, merged))
+        return {**updated, "mutation_audit": _operator_audit("update_account_settings", current, updated)}
 
     def apply_global_defaults(self) -> dict[str, Any]:
         accounts = self.repository.list_account_settings(limit=10000, offset=0)
@@ -290,7 +591,168 @@ class CommercialQueueService:
         }
 
     def resolve_effective_policy(self, account_id: str | None = None, campaign_id: str | None = None, platform: str = "bale") -> dict[str, Any]:
-        return self.policy_resolver.resolve(account_id=account_id, campaign_id=campaign_id, platform=platform)
+        resolved = self.policy_resolver.resolve(account_id=account_id, campaign_id=campaign_id, platform=platform)
+        snapshot = self.repository.get_latest_configuration_snapshot(campaign_id) if campaign_id else None
+        if not snapshot:
+            return resolved
+        configuration = json.loads(snapshot.get("configuration_json") or "{}")
+        delivery = configuration.get("delivery") or {}
+        accounts = configuration.get("accounts") or {}
+        schedule = configuration.get("schedule") or {}
+        runtime = configuration.get("runtime") or {}
+        source = configuration.get("source") or {}
+        snapshot_values = {
+            "platform": source.get("platform"),
+            "send_method": delivery.get("send_method"),
+            "source_channel_uid": source.get("source_channel_uid"),
+            "operation_order": delivery.get("operation_order"),
+            "max_concurrent_accounts": accounts.get("max_concurrent_accounts"),
+            "deliveries_per_round": delivery.get("deliveries_per_round"),
+            "daily_limit_per_account": delivery.get("daily_delivery_limit"),
+            "delay_between_deliveries_seconds": delivery.get("delay_between_deliveries_seconds"),
+            "round_cooldown_seconds": delivery.get("round_cooldown_seconds"),
+            "job_timeout_seconds": delivery.get("job_timeout_seconds"),
+            "max_job_duration_seconds": delivery.get("max_job_duration_seconds"),
+            "automatic_retry_enabled": delivery.get("automatic_retry"),
+            "account_assignment_strategy": accounts.get("account_selection_strategy"),
+            "eligible_account_ids": accounts.get("allowed_account_ids"),
+            "account_selection_mode": accounts.get("account_selection_mode"),
+            "priority": schedule.get("priority"),
+            "scheduled_start_at": schedule.get("scheduled_start_at"),
+            "browser_start_batch_size": runtime.get("browser_start_batch_size"),
+            "browser_start_stagger_ms": runtime.get("browser_start_stagger_ms"),
+            "session_reuse_enabled": runtime.get("session_reuse_enabled"),
+            "resource_guard_enabled": runtime.get("resource_guard_enabled"),
+        }
+        effective = dict(resolved["effective_policy"])
+        effective.update({key: value for key, value in snapshot_values.items() if value is not None})
+        return {
+            **resolved,
+            "effective_policy": effective,
+            "immutable_snapshot_id": snapshot["snapshot_id"],
+            "immutable_snapshot_hash": snapshot["configuration_hash"],
+        }
+
+    def build_canonical_campaign_configuration(self, campaign_id: str) -> dict[str, Any]:
+        campaign = self.repository.get_campaign(campaign_id)
+        if not campaign:
+            raise CampaignLifecycleError("campaign_not_found", "Campaign not found", {"campaign_id": campaign_id})
+        overrides = json.loads(campaign.get("policy_overrides_json") or "{}")
+        # Build from committed defaults + campaign overrides, never from a prior
+        # snapshot; otherwise a changed campaign could validate against stale policy.
+        resolved = self.policy_resolver.resolve(campaign_id=campaign_id, platform=str(campaign.get("platform") or "bale"))
+        policy = resolved["effective_policy"]
+        selected_platforms = sorted({
+            str(item) for item in (overrides.get("selected_platforms") or [campaign.get("platform") or "bale"])
+            if str(item).strip()
+        })
+        # Do not snapshot today's enabled-account registry into a normal
+        # campaign.  That converts AUTO allocation into accidental pinning and
+        # makes a later unhealthy/stale account a campaign-wide blocker.
+        # Explicit IDs are retained only when a future PINNED mode is chosen.
+        selection_mode = str(overrides.get("account_selection_mode") or "auto").strip().lower()
+        explicit_accounts = (
+            overrides.get("eligible_account_ids")
+            if "eligible_account_ids" in overrides
+            else overrides.get("selected_account_ids")
+        )
+        selected_accounts = sorted({
+            str(item) for item in (explicit_accounts or []) if str(item).strip()
+        }) if selection_mode == "pinned" else []
+        source_urls = overrides.get("platform_source_urls") if isinstance(overrides.get("platform_source_urls"), dict) else {}
+        source_uid = str(policy.get("source_channel_uid") or campaign.get("source_channel_uid") or "")
+        primary_source_url = str(source_urls.get(selected_platforms[0]) or (f"https://web.bale.ai/chat?uid={source_uid}" if source_uid else ""))
+        recipients = self.repository.list_recipients(campaign_id, None, 100000, 0)
+        normalized_phones = sorted(str(row.get("phone_normalized") or "") for row in recipients if row.get("phone_normalized"))
+        recipient_fingerprint = _stable_hash(normalized_phones)
+        platform_settings = {
+            platform: {
+                "source_uid": str(sourceUid) if (sourceUid := (
+                    source_uid if platform == selected_platforms[0]
+                    else str(source_urls.get(platform) or "").split("uid=")[-1]
+                )) else "",
+                "source_url": str(source_urls.get(platform) or (primary_source_url if platform == selected_platforms[0] else "")),
+                "sender_account_ids": selected_accounts,
+            }
+            for platform in selected_platforms
+        }
+        automatic_retry = bool(policy.get("automatic_retry_enabled"))
+        canonical = {
+            "schema_version": 1,
+            "campaign_id": campaign_id,
+            "platforms": {"selected_platforms": selected_platforms},
+            "platform_settings": platform_settings,
+            "source": {
+                "platform": str(campaign.get("platform") or "bale"),
+                "source_channel_uid": source_uid,
+                "source_channel_url": primary_source_url,
+            },
+            "accounts": {
+                "allowed_account_ids": selected_accounts,
+                "account_selection_mode": "pinned" if selection_mode == "pinned" else "auto",
+                "account_selection_strategy": str(policy.get("account_assignment_strategy") or "priority_then_least_sent"),
+                "max_concurrent_accounts": int(policy.get("max_concurrent_accounts") or 1),
+            },
+            "delivery": {
+                "send_method": str(policy.get("send_method") or "forward_latest_channel_message"),
+                "operation_order": list(policy.get("operation_order") or []),
+                "deliveries_per_round": int(policy.get("deliveries_per_round") or 1),
+                "max_jobs_per_execution": int(policy.get("deliveries_per_round") or 1),
+                "daily_delivery_limit": int(policy.get("daily_limit_per_account") or 1),
+                "delay_between_deliveries_seconds": int(policy.get("delay_between_deliveries_seconds") or 0),
+                "round_cooldown_seconds": int(policy.get("round_cooldown_seconds") or 0),
+                "job_timeout_seconds": int(policy.get("job_timeout_seconds") or 180),
+                "max_job_duration_seconds": int(policy.get("max_job_duration_seconds") or 300),
+                "automatic_retry": automatic_retry,
+                "retry_policy": {"automatic_retry": automatic_retry, "max_attempts": 3 if automatic_retry else 1},
+                "pause_behavior": str(overrides.get("pause_behavior") or "requeue_unstarted_assigned"),
+            },
+            "schedule": {
+                "scheduled_start_at": policy.get("scheduled_start_at"),
+                "priority": int(policy.get("priority") or 0),
+            },
+            "runtime": {
+                "browser_start_batch_size": int(policy.get("browser_start_batch_size") or 1),
+                "browser_start_stagger_ms": int(policy.get("browser_start_stagger_ms") or 0),
+                "session_reuse_enabled": bool(policy.get("session_reuse_enabled")),
+                "resource_guard_enabled": bool(policy.get("resource_guard_enabled")),
+            },
+            "recipients": {
+                "recipient_count": len(normalized_phones),
+                "recipient_set_fingerprint": recipient_fingerprint,
+                "require_live_authorization": True,
+                "require_verified_contact": True,
+                "allow_synthetic": False,
+                "deduplication_policy": "campaign_phone_unique",
+            },
+            "safety": {
+                "require_live_readiness": True,
+                "require_approval": True,
+                "uncertain_delivery_policy": "stop_manual_review",
+                "duplicate_delivery_policy": "block",
+            },
+        }
+        return {
+            "campaign_id": campaign_id,
+            "configuration": canonical,
+            "configuration_hash": _configuration_hash(canonical),
+            "recipient_set_fingerprint": recipient_fingerprint,
+            "policy_resolution": resolved,
+        }
+
+    def ensure_campaign_execution_artifacts(self, campaign_id: str, approved_by: str) -> dict[str, Any]:
+        canonical = self.build_canonical_campaign_configuration(campaign_id)
+        if not canonical["configuration"]["recipients"]["recipient_count"]:
+            raise CampaignLifecycleError("campaign_has_no_recipients", "Campaign has no persisted recipients", {"campaign_id": campaign_id})
+        if not canonical["configuration"]["source"]["source_channel_uid"]:
+            raise CampaignLifecycleError("source_channel_not_resolved", "Campaign source is required", {"campaign_id": campaign_id})
+        artifacts = self.repository.ensure_campaign_configuration_artifacts(
+            campaign_id,
+            canonical["configuration"],
+            canonical["configuration_hash"],
+            approved_by,
+        )
+        return {**canonical, **artifacts}
 
     def _configuration_from_policy_sources(self, campaign_id: str, account_id: str | None = None) -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id) or {}
@@ -421,7 +883,7 @@ class CommercialQueueService:
             final["platform_settings"] = extension_config["platform_settings"]
         origin_trace["fields"] = field_records
         resolved_hash = _configuration_hash(final)
-        return {
+        summary = {
             "campaign_id": campaign_id,
             "configuration": final,
             "configuration_hash": resolved_hash,
@@ -432,6 +894,7 @@ class CommercialQueueService:
             "draft_revision_id": (draft_revision or {}).get("revision_id"),
             "validation": self.validate_configuration_payload(final, origin_trace),
         }
+        return summary
 
     def validate_configuration_payload(self, configuration: dict[str, Any], origin_trace: dict[str, Any] | None = None) -> dict[str, Any]:
         errors: list[dict[str, Any]] = []
@@ -593,6 +1056,37 @@ class CommercialQueueService:
                 return str(campaign["source_channel_uid"])
         return ""
 
+    def _campaign_pinned_account_ids(
+        self,
+        campaign_id: str | None,
+        policy: dict[str, Any] | None = None,
+    ) -> set[str]:
+        """Return an account scope only for an explicit future PINNED campaign.
+
+        Historical snapshots may contain ``eligible_account_ids`` because an
+        older build copied all enabled accounts into every campaign.  Those
+        legacy lists are intentionally AUTO mode and must never exclude a
+        healthy replacement account.
+        """
+        if not campaign_id:
+            return set()
+        campaign = self.repository.get_campaign(campaign_id) or {}
+        try:
+            overrides = json.loads(campaign.get("policy_overrides_json") or "{}")
+        except (TypeError, ValueError):
+            overrides = {}
+        mode = str(
+            (policy or {}).get("account_selection_mode")
+            or overrides.get("account_selection_mode")
+            or "auto"
+        ).strip().lower()
+        if mode != "pinned":
+            return set()
+        values = (policy or {}).get("eligible_account_ids")
+        if values is None:
+            values = overrides.get("eligible_account_ids", overrides.get("selected_account_ids", []))
+        return {str(item) for item in (values or []) if str(item).strip()}
+
     def _campaign_is_running(self, campaign_id: str | None) -> bool:
         if not campaign_id:
             return True
@@ -633,8 +1127,118 @@ class CommercialQueueService:
         jobs = self.repository.list_jobs(status="queued", account_id=None, campaign_id=campaign_id, limit=1, offset=0)
         return bool(jobs)
 
+    # ============================================================
+    # BLOCK: BALE_ACCOUNT_WORKER_ELIGIBILITY
+    # PURPOSE:
+    # Maps verified Bale authentication into the independent worker pool.
+    # ACCOUNT_SCOPE:
+    # One canonical account at a time; authentication records are read-only.
+    # DEPENDENCIES:
+    # BaleAccountStore, BaleOnboardingService, AccountHealthService
+    # LAYER:
+    # SERVICE
+    # ============================================================
+
+    def _account_authentication_available_for_worker(self, account_id: str) -> bool:
+        if not self._uses_operational_auth_source:
+            return bool(self.account_auth_checker(account_id))
+        operational = bale_onboarding_service.get_account(account_id)
+        return bool(
+            operational
+            and operational.get("durable_identity_verified") is True
+            and operational.get("session_health_acceptable") is True
+            and operational.get("lifecycle_status") == "ready"
+            and not operational.get("retired")
+            and self.account_auth_checker(account_id)
+        )
+
+    def _operational_resource_predicates(self, account_id: str) -> tuple[dict[str, bool], dict[str, Any]]:
+        if not self._uses_operational_auth_source:
+            return {"canonical_profile_exists": True, "session_exists": True, "browser_provider_available": True, "profile_lock_clear": True}, {}
+        operational = bale_onboarding_service.get_account(account_id) or {}
+        profile_lock_clear = True
+        session_exists = False
+        try:
+            with bale_onboarding_service.connection() as connection:
+                lock = connection.execute("SELECT expires_at FROM bale_profile_launch_locks WHERE account_id=?", (account_id,)).fetchone()
+                profile_lock_clear = not lock or str(lock["expires_at"]) <= utc_now()
+                session_exists = connection.execute("SELECT 1 FROM bale_maintenance_sessions WHERE account_id=? LIMIT 1", (account_id,)).fetchone() is not None
+        except Exception:
+            profile_lock_clear = False
+        provider = str(operational.get("browser_provider") or "")
+        return {
+            "canonical_profile_exists": bool(operational.get("profile_present")),
+            "session_exists": session_exists,
+            "browser_provider_available": bool(provider),
+            "profile_lock_clear": profile_lock_clear,
+        }, operational
+
+    def _authentication_blockers(self, account_id: str) -> tuple[list[str], dict[str, Any]]:
+        if not self._uses_operational_auth_source:
+            available = self._account_authentication_available_for_worker(account_id)
+            return ([] if available else ["auth_unavailable"]), {}
+        operational = bale_onboarding_service.get_account(account_id) or {}
+        blockers: list[str] = []
+        if not operational.get("durable_identity_verified"):
+            blockers.append("identity_verification_required")
+        if not operational.get("session_health_acceptable"):
+            blockers.append("session_revalidation_required")
+        blockers.extend(operational.get("eligibility_reasons") or [])
+        if not self._account_authentication_available_for_worker(account_id):
+            blockers.append("auth_unavailable")
+        return list(dict.fromkeys(blockers)), operational
+
+    def refresh_authenticated_bale_worker_eligibility(self) -> dict[str, Any]:
+        enabled_accounts: list[str] = []
+        activation_policy = str(bale_onboarding_service.configuration().get("activation_policy_after_identity_match") or "operator_approved")
+        for canonical in bale_account_store.list_accounts():
+            account_id = str(canonical.get("account_id") or "")
+            current = self.repository.get_account_settings(account_id) if account_id else None
+            if not current or not self._account_authentication_available_for_worker(account_id):
+                continue
+            if activation_policy == "manual":
+                continue
+            if activation_policy == "preserve_current" and not bool(current.get("enabled")):
+                continue
+            health = self.account_health.repository.get(account_id)
+            if str(health.get("health_status") or "") in BLOCKING_STATES:
+                continue
+            if bool(current.get("enabled")):
+                continue
+            self.update_account_settings(
+                account_id,
+                {
+                    "enabled": True,
+                    "priority": int(canonical.get("priority") or 100),
+                    "daily_limit_override": int(canonical.get("daily_limit") or self.get_global_settings()["default_daily_limit_per_account"]),
+                    "worker_status": "idle",
+                },
+            )
+            enabled_accounts.append(account_id)
+            logger.info(
+                "[BALE_WORKER_READY] account_id=%s authenticated=true persistence=verified "
+                "healthy=true enabled=true",
+                account_id,
+            )
+        return {"enabled_account_ids": enabled_accounts, "enabled_count": len(enabled_accounts)}
+
+    def activate_verified_account_eligibility(self, account_id: str, previously_eligible: bool = False) -> dict[str, Any]:
+        self.refresh_authenticated_bale_worker_eligibility()
+        readiness = next((row for row in self.account_readiness_matrix() if row["account_id"] == account_id), None)
+        eligible = bool(readiness and readiness.get("worker_eligible"))
+        woke = False
+        if eligible and not previously_eligible:
+            wake = getattr(self.scheduler_runtime, "wake_eligibility", None) if self.scheduler_runtime is not None else None
+            woke = bool(wake()) if callable(wake) else False
+        return {"account_id": account_id, "worker_eligible": eligible, "transitioned_to_eligible": eligible and not previously_eligible, "scheduler_woken": woke, "readiness": readiness}
+
+    # ============================================================
+    # END BLOCK: BALE_ACCOUNT_WORKER_ELIGIBILITY
+    # ============================================================
+
     def _eligibility_for_account(self, account: dict[str, Any], campaign_id: str | None = None) -> tuple[bool, str | None, dict[str, Any]]:
         account_id = str(account["account_id"])
+        self.reconcile_worker_state(account_id)
         effective = self.resolve_account_settings(account_id)
         health = self.account_health.repository.get(account_id)
         if str(health.get("health_status")) in BLOCKING_STATES:
@@ -650,15 +1254,53 @@ class CommercialQueueService:
             return False, "cooling_down", effective
         if int(effective["current_daily_sent_count"]) >= int(effective["daily_limit"]):
             return False, "daily_limited", effective
-        if not self.account_auth_checker(account_id):
+        if not self._account_authentication_available_for_worker(account_id):
             return False, "auth_unavailable", effective
+        resource_predicates, _ = self._operational_resource_predicates(account_id)
+        for predicate, reason in (
+            ("canonical_profile_exists", "profile_missing"), ("session_exists", "session_missing"),
+            ("browser_provider_available", "browser_provider_unavailable"), ("profile_lock_clear", "profile_lock_active"),
+        ):
+            if not resource_predicates[predicate]: return False, reason, effective
         if not self._assignment_source_uid(effective, campaign_id):
             return False, "source_missing", effective
         if not self._account_has_queued_work(account_id, campaign_id):
             return False, "no_queued_jobs", effective
         return True, None, effective
 
+    def _worker_readiness_for_account(self, account: dict[str, Any]) -> tuple[bool, str | None, dict[str, Any]]:
+        account_id = str(account["account_id"])
+        self.reconcile_worker_state(account_id)
+        effective = self.resolve_account_settings(account_id)
+        health = self.account_health.repository.get(account_id)
+        if str(health.get("health_status")) in BLOCKING_STATES:
+            return False, f"health_{health['health_status']}", effective
+        lock = self.repository.get_worker_lock(account_id)
+        if not effective["enabled"]:
+            return False, "disabled", effective
+        if effective["worker_status"] != "idle":
+            return False, "worker_not_idle", effective
+        if lock and not self._lock_expired(lock):
+            return False, "lock_active", effective
+        if self._cooldown_active(effective):
+            return False, "cooling_down", effective
+        if int(effective["current_daily_sent_count"]) >= int(effective["daily_limit"]):
+            return False, "daily_limited", effective
+        if not self._account_authentication_available_for_worker(account_id):
+            return False, "auth_unavailable", effective
+        resource_predicates, _ = self._operational_resource_predicates(account_id)
+        for predicate, reason in (
+            ("canonical_profile_exists", "profile_missing"),
+            ("session_exists", "session_missing"),
+            ("browser_provider_available", "browser_provider_unavailable"),
+            ("profile_lock_clear", "profile_lock_active"),
+        ):
+            if not resource_predicates[predicate]:
+                return False, reason, effective
+        return True, None, effective
+
     def _ordered_eligible_accounts(self, campaign_id: str | None = None) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+        self.refresh_authenticated_bale_worker_eligibility()
         accounts = self.repository.list_all_account_settings()
         eligible: list[dict[str, Any]] = []
         groups = {"disabled": [], "cooling_down": [], "daily_limited": [], "locked": [], "ineligible": []}
@@ -703,59 +1345,577 @@ class CommercialQueueService:
             )
         return eligible, groups
 
+    def account_readiness_matrix(self) -> list[dict[str, Any]]:
+        return self.canonical_bale_account_states()
+
+    def canonical_bale_account_states(self, *, include_soft_deleted: bool = False) -> list[dict[str, Any]]:
+        """Authoritative persisted Bale state used by UI, capacity, readiness and workers."""
+        payload = bale_onboarding_service.list_accounts()
+        settings = {str(row["account_id"]): row for row in self.repository.list_all_account_settings()}
+        worker_locks = {str(row["account_id"]): row for row in self.repository.list_active_worker_locks()}
+        active_jobs = self.repository.list_active_jobs_by_account()
+        profile_locks: dict[str, dict[str, Any]] = {}
+        with bale_onboarding_service.connection() as connection:
+            now = utc_now()
+            profile_locks = {
+                str(row["account_id"]): dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM bale_profile_launch_locks WHERE expires_at > ?",
+                    (now,),
+                )
+            }
+        result: list[dict[str, Any]] = []
+        for operational in payload.get("items", []):
+            account_id = str(operational["account_id"])
+            soft_deleted = str(operational.get("lifecycle_status") or "") == "retired"
+            if soft_deleted and not include_soft_deleted:
+                continue
+            account_settings = settings.get(account_id) or {}
+            worker_lock = worker_locks.get(account_id)
+            profile_lock = profile_locks.get(account_id)
+            readiness = operational.get("readiness") if isinstance(operational.get("readiness"), dict) else {}
+            active_job = active_jobs.get(account_id)
+            normalized_phone = str(operational.get("normalized_identifier") or operational.get("normalized_phone") or "")
+            bound_phone = str(operational.get("identity_bound_phone") or operational.get("bound_normalized_phone") or "")
+            durable = bool(readiness.get("identity_verified"))
+            raw_session_state = str(operational.get("session_status") or operational.get("session_last_known_state") or "unknown")
+            last_positive = operational.get("session_last_positive_at") or operational.get("last_authenticated_shell_at") or operational.get("last_authenticated_at")
+            # `readiness` is the sole lifecycle/auth source.  This projection
+            # only layers current worker ownership on top; it must not invent a
+            # second interpretation of stale probes or durable session evidence.
+            session_ok = bool(readiness.get("session_authenticated"))
+            profile_exists = bool(readiness.get("profile_available", operational.get("profile_present")))
+            enabled = bool(operational.get("scheduling_enabled"))
+            commercial_enabled = bool(account_settings.get("enabled"))
+            blockers = list(readiness.get("blockers") or operational.get("eligibility_reasons") or [])
+            predicates = {
+                "registered": not soft_deleted,
+                "lifecycle_ready": bool(readiness.get("lifecycle_ready")),
+                "account_enabled": bool(readiness.get("eligible")),
+                "commercial_enabled": commercial_enabled,
+                "worker_idle": str(account_settings.get("worker_status") or "idle") == "idle",
+                "worker_lock_clear": worker_lock is None,
+                "profile_lock_clear": profile_lock is None,
+                "active_job_clear": active_job is None,
+                "operation_clear": not bool(readiness.get("operation_busy")),
+            }
+            for key, ok in predicates.items():
+                if not ok:
+                    blockers.append(key if key.endswith("_required") else f"{key}_required")
+            blockers = list(dict.fromkeys(str(item) for item in blockers if item))
+            eligible = not blockers
+            operation = {
+                "operation_id": operational.get("latest_operation_id"),
+                "status": operational.get("latest_operation_status"),
+            } if operational.get("latest_operation_id") else {}
+            result.append({
+                **operational,
+                "account_id": account_id,
+                "normalized_phone": normalized_phone,
+                "registered": not soft_deleted,
+                "soft_deleted": soft_deleted,
+                "onboarding_completed": bool(operational.get("onboarding_completed")),
+                "durable_identity_verified": durable,
+                "bound_normalized_phone": bound_phone or None,
+                "identity_match": bool(durable and bound_phone == normalized_phone),
+                "session_state": "authenticated" if session_ok else raw_session_state,
+                "raw_persisted_session_state": raw_session_state,
+                "session_last_positive_at": last_positive,
+                "strong_negative_evidence": operational.get("last_strong_negative_evidence") or operational.get("last_negative_auth_evidence"),
+                "effective_auth_state": "authenticated" if session_ok else raw_session_state,
+                "backend_auth_state": "authenticated" if session_ok else raw_session_state,
+                "canonical_compatibility_source": "onboarding_readiness",
+                "canonical_profile_path": operational.get("canonical_profile_path"),
+                "profile_generation_id": operational.get("profile_generation_id"),
+                "profile_exists": profile_exists,
+                "enabled": enabled,
+                "commercial_enabled": commercial_enabled,
+                "worker_eligible": eligible,
+                "operation_busy": bool(readiness.get("operation_busy")),
+                "lifecycle_ready": bool(readiness.get("lifecycle_ready")),
+                "eligible": bool(readiness.get("eligible")),
+                "readiness": readiness,
+                "queue_eligible": eligible,
+                "blockers": blockers,
+                "eligibility_reasons": blockers,
+                "exact_failing_eligibility_predicate": None if eligible else ";".join(blockers),
+                "active_job": active_job,
+                "account_lock": worker_lock,
+                "worker_lock": worker_lock,
+                "profile_lock": profile_lock,
+                "worker_status": account_settings.get("worker_status") or "idle",
+                "last_operation": operation or None,
+                "last_error": operation.get("safe_error_message") or operational.get("safe_error_message"),
+                "worker_eligibility_predicates": predicates,
+            })
+        return result
+
+    def delete_bale_account_and_profile(self, account_id: str, operation_id: str) -> dict[str, Any]:
+        before = next((row for row in self.canonical_bale_account_states(include_soft_deleted=True) if row["account_id"] == account_id), None)
+        if before is None:
+            raise CampaignLifecycleError("account_not_found", "Bale account not found", {"account_id": account_id})
+        blockers: list[str] = []
+        active_job = before.get("active_job") or {}
+        if str(active_job.get("status") or "") in {"assigned", "running"}:
+            blockers.append(f"{active_job.get('status')}_job")
+        if before.get("account_lock"):
+            blockers.append("active_worker_lock")
+        profile_lock = before.get("profile_lock") or {}
+        expires_at = parse_time(profile_lock.get("expires_at")) if profile_lock else None
+        if profile_lock and (expires_at is None or expires_at > datetime.now(timezone.utc)):
+            blockers.append("active_profile_operation_lock")
+        runtime = self.runtime_session_manager.get_session(account_id)
+        if runtime is not None:
+            blockers.append("active_browser_runtime")
+        if blockers:
+            raise CampaignLifecycleError("account_delete_blocked", "Bale account cannot be removed", {
+                "success": False, "blocked": True, "blockers": blockers,
+                "account_id": account_id, "operation_id": operation_id,
+            })
+        now = utc_now()
+        profile_path = Path(str(before.get("canonical_profile_path") or ""))
+        profile_root = Path(bale_onboarding_service.profile_root).resolve(strict=False)
+        resolved_profile = profile_path.resolve(strict=False)
+        if resolved_profile.parent != profile_root or resolved_profile.name != account_id:
+            raise CampaignLifecycleError("profile_path_not_canonical", "Refusing to delete a non-canonical profile path", {"account_id": account_id})
+        profile_path = resolved_profile
+        quarantine = profile_path.with_name(f"{profile_path.name}.quarantine.{uuid4().hex}")
+        profile_moved = False
+        registry_record = bale_onboarding_service.account_store.get_account(account_id)
+        try:
+            if profile_path.exists():
+                profile_path.rename(quarantine)
+                profile_moved = True
+            with bale_onboarding_service.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("DELETE FROM commercial_account_worker_locks WHERE account_id=?", (account_id,))
+                connection.execute("DELETE FROM bale_profile_launch_locks WHERE account_id=?", (account_id,))
+                bale_onboarding_service._audit(connection, account_id, None, operation_id, "account_and_profile_deleted", "Account removed by operator and profile quarantined.", {"quarantine_path": str(quarantine) if profile_moved else None})
+                connection.execute("DELETE FROM commercial_browser_identities WHERE account_id=?", (account_id,))
+                connection.execute("DELETE FROM commercial_account_health WHERE account_id=?", (account_id,))
+                connection.execute("DELETE FROM commercial_account_settings WHERE account_id=?", (account_id,))
+                connection.execute("DELETE FROM bale_operational_accounts WHERE account_id=?", (account_id,))
+                # Historical production rows may predate (or have lost) the
+                # JSON registry mirror.  The operational SQLite account is
+                # still authoritative and must remain destructively removable.
+                if registry_record is not None:
+                    bale_onboarding_service.account_store.delete_account(account_id)
+                connection.commit()
+        except Exception:
+            if registry_record and bale_onboarding_service.account_store.get_account(account_id) is None:
+                bale_onboarding_service.account_store.create_account(registry_record)
+            if profile_moved and quarantine.exists() and not profile_path.exists():
+                quarantine.rename(profile_path)
+            raise
+        cleanup_pending = False
+        if profile_moved:
+            try:
+                shutil.rmtree(quarantine)
+            except OSError:
+                cleanup_pending = True
+        after = next((row for row in self.canonical_bale_account_states(include_soft_deleted=True) if row["account_id"] == account_id), None)
+        return {
+            "success": True, "action": "remove_account_and_profile", "account_id": account_id,
+            "operation_id": operation_id, "deleted": True, "active": False,
+            "before": before, "after": after, "profile_deleted": not cleanup_pending,
+            "profile_preserved": False, "profile_cleanup_pending": cleanup_pending,
+            "quarantine_path": str(quarantine) if cleanup_pending else None,
+            "processes_stopped": [], "locks_released": True, "blockers": [],
+            "error_code": "profile_cleanup_pending" if cleanup_pending else None,
+            "error_message": "Profile quarantine cleanup is pending" if cleanup_pending else None,
+        }
+
+    def soft_delete_bale_account(self, account_id: str, operation_id: str) -> dict[str, Any]:
+        return self.delete_bale_account_and_profile(account_id, operation_id)
+
     def scheduler_status(self) -> dict[str, Any]:
+        snapshot_generated_at = utc_now()
+        self.reconcile_worker_states()
         state = self.repository.get_scheduler_state()
         global_settings = self.get_global_settings()
         active_locks = self.repository.list_active_worker_locks()
-        eligible, groups = self._ordered_eligible_accounts()
+        strict_eligible, groups = self._ordered_eligible_accounts()
+        ready_accounts = [
+            account
+            for account in self.repository.list_all_account_settings()
+            if self._worker_readiness_for_account(account)[0]
+        ]
         job_counts = self.repository.count_jobs_by_status()
+        latest_campaigns = self.repository.list_campaigns(None, 1, 0)
+        latest_campaign = latest_campaigns[0] if latest_campaigns else None
+        latest_campaign_id = str(latest_campaign["id"]) if latest_campaign else None
+        latest_events = self.repository.list_events(None, latest_campaign_id, None, 500, 0) if latest_campaign_id else []
+        latest_round_id = next((str(event.get("worker_round_id")) for event in latest_events if event.get("worker_round_id")), None)
+        latest_run_events = [event for event in latest_events if latest_round_id and str(event.get("worker_round_id") or "") == latest_round_id]
+        if not latest_run_events:
+            latest_run_events = latest_events
+        parsed_latest: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for event in latest_run_events:
+            try:
+                diagnostics = json.loads(event.get("diagnostics_json") or "{}")
+            except (TypeError, ValueError):
+                diagnostics = {}
+            if isinstance(diagnostics, dict) and isinstance(diagnostics.get("orchestrator_result"), dict):
+                historical_evidence = deepest_execution_evidence(diagnostics["orchestrator_result"])
+                for key in ("browser_pid", "screenshot_path", "failed_step", "page_url"):
+                    if historical_evidence.get(key) is not None and diagnostics.get(key) is None:
+                        diagnostics[key] = historical_evidence[key]
+            parsed_latest.append((event, diagnostics if isinstance(diagnostics, dict) else {}))
+        historical_last_tick_at = state.get("historical_last_tick_at") or state.get("last_tick_at")
+        event_names = [str(event.get("event_type") or "").lower() for event in latest_run_events]
+        worker_started = any(name == "job_started" for name in event_names)
+        browser_evidence = [
+            (event, diagnostics) for event, diagnostics in parsed_latest
+            if str(event.get("step_name") or "") == "browser_started"
+            or bool(diagnostics.get("browser_pid"))
+            or bool(((diagnostics.get("orchestrator_result") or {}).get("browser_pid")))
+        ]
+        latest_job_ids = list(dict.fromkeys(str(event["job_id"]) for event in latest_run_events if event.get("job_id")))
+        latest_account_ids = list(dict.fromkeys(str(event["account_id"]) for event in latest_run_events if event.get("account_id")))
+        latest_failed_steps = list(dict.fromkeys(str(event["step_name"]) for event in latest_run_events if event.get("status") == "failed" and event.get("step_name")))
+        latest_browser_pids = list(dict.fromkeys(
+            int(diagnostics["browser_pid"]) for _event, diagnostics in parsed_latest if diagnostics.get("browser_pid")
+        ))
+        latest_screenshots = list(dict.fromkeys(
+            str(diagnostics["screenshot_path"]) for _event, diagnostics in parsed_latest if diagnostics.get("screenshot_path")
+        ))
+        campaign_status = str((latest_campaign or {}).get("status") or "")
+        campaign_started_at = (latest_campaign or {}).get("started_at")
+        runtime_status = self.scheduler_runtime.status() if self.scheduler_runtime is not None else {
+            "scheduler_object_instance_id": None,
+            "scheduler_service_instance_id": id(self),
+            "scheduler_task_exists": False,
+            "background_task_created": False,
+            "background_task_alive": False,
+            "scheduler_task_done": False,
+            "scheduler_task_cancelled": False,
+            "scheduler_task_exception": None,
+            "scheduler_runtime_status": "missing",
+            "process_id": os.getpid(),
+            "application_startup_time": None,
+            "loop_interval_seconds": state.get("loop_interval_seconds"),
+        }
+        configured_enabled = state["scheduler_status"] == "running"
+        reported_scheduler_status = state["scheduler_status"]
+        if self.scheduler_runtime_required:
+            if not configured_enabled:
+                reported_scheduler_status = "stopped" if state["scheduler_status"] == "stopped" else "paused"
+            elif not runtime_status.get("background_task_alive"):
+                reported_scheduler_status = str(runtime_status.get("scheduler_runtime_status") or "unavailable")
+        current_runtime_owner = str(runtime_status.get("runtime_owner_id") or "")
+        current_owner_matches = bool(
+            current_runtime_owner
+            and current_runtime_owner == str(state.get("runtime_owner_id") or "")
+        )
+        current_heartbeat_at = (
+            state.get("current_runtime_heartbeat_at") if current_owner_matches else None
+        )
+        current_last_tick_at = (
+            state.get("last_current_runtime_tick_at") if current_owner_matches else None
+        )
+        heartbeat_age_seconds = None
+        if current_heartbeat_at:
+            try:
+                heartbeat_age_seconds = max(
+                    0,
+                    int((datetime.fromisoformat(snapshot_generated_at) - datetime.fromisoformat(str(current_heartbeat_at))).total_seconds()),
+                )
+            except (TypeError, ValueError):
+                pass
+        heartbeat_limit = max(120, int(runtime_status.get("loop_interval_seconds") or state.get("loop_interval_seconds") or 10) * 3)
+        current_runtime_stale_reason = (
+            "runtime_owner_mismatch" if self.scheduler_runtime_required and not current_owner_matches
+            else "current_runtime_heartbeat_missing" if self.scheduler_runtime_required and heartbeat_age_seconds is None
+            else "current_runtime_heartbeat_expired" if heartbeat_age_seconds is not None and heartbeat_age_seconds > heartbeat_limit
+            else None
+        )
+        concurrency = self.resource_provider.configuration_inputs(
+            int(global_settings["operator_defined_max_concurrent_accounts"]), len(ready_accounts),
+            mode=str(global_settings["concurrency_mode"]),
+            browser_capacity=int(global_settings["browser_concurrency"]),
+            worker_capacity=int(global_settings["worker_concurrency"]),
+        )
         return {
-            "scheduler_status": state["scheduler_status"],
-            "max_concurrent_accounts": int(global_settings["max_concurrent_accounts"]),
+            "scheduler_status": reported_scheduler_status,
+            "configured_scheduler_status": state["scheduler_status"],
+            "configured_enabled": configured_enabled,
+            **runtime_status,
+            "loop_heartbeat_at": state.get("loop_heartbeat_at"),
+            "last_loop_iteration_at": state.get("last_loop_iteration_at"),
+            "tick_in_progress": bool(state.get("tick_in_progress")),
+            "last_tick_started_at": state.get("last_tick_started_at"),
+            "last_tick_completed_at": state.get("last_tick_completed_at"),
+            "last_successful_tick_at": state.get("last_tick_at"),
+            "last_failed_tick_at": state.get("last_failed_tick_at"),
+            "last_tick_error": state.get("last_tick_error"),
+            "global_live_execution_enabled": bool(global_settings.get("live_campaign_execution_enabled")),
+            "concurrency_mode": str(global_settings["concurrency_mode"]),
+            "max_concurrent_accounts": None if global_settings["concurrency_mode"] == "unrestricted" else int(global_settings["operator_defined_max_concurrent_accounts"]),
             "active_account_count": len(active_locks),
-            "available_slots": max(0, int(global_settings["max_concurrent_accounts"]) - len(active_locks)),
-            "eligible_account_count": len(eligible),
+            "available_slots": max(0, len(ready_accounts) - len(active_locks)) if global_settings["concurrency_mode"] == "unrestricted" else max(0, int(global_settings["operator_defined_max_concurrent_accounts"]) - len(active_locks)),
+            "eligible_account_count": len(ready_accounts),
+            "concurrency_inputs": concurrency,
+            "effective_concurrency": concurrency["effective_concurrency"],
+            "accounts_per_round": int((self.resolve_effective_policy(campaign_id=latest_campaign_id)["effective_policy"] if latest_campaign_id else {}).get("accounts_per_round") or 1),
             "queued_job_count": int(job_counts.get("queued", 0)),
             "active_accounts": [str(lock["account_id"]) for lock in active_locks],
             "cooling_down_accounts": groups["cooling_down"],
             "daily_limited_accounts": groups["daily_limited"],
             "disabled_accounts": groups["disabled"],
-            "last_tick_at": state.get("last_tick_at"),
+            "current_snapshot_generated_at": snapshot_generated_at,
+            "last_tick_at": current_last_tick_at,
+            "last_tick_is_stale": current_runtime_stale_reason is not None,
+            "last_tick_age_seconds": heartbeat_age_seconds,
+            "current_runtime_owner": current_runtime_owner or None,
+            "persisted_runtime_owner": state.get("runtime_owner_id"),
+            "current_runtime_owner_matches_persisted": current_owner_matches,
+            "scheduler_task_created_at": state.get("scheduler_task_created_at") or runtime_status.get("scheduler_task_created_at"),
+            "first_current_runtime_tick_at": state.get("first_current_runtime_tick_at") if current_owner_matches else None,
+            "last_current_runtime_tick_at": current_last_tick_at,
+            "current_heartbeat": current_heartbeat_at,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
+            "current_runtime_stale_reason": current_runtime_stale_reason,
+            "historical_runtime_owner": state.get("historical_runtime_owner_id"),
+            "historical_last_tick_at": historical_last_tick_at,
+            "historical_last_heartbeat_at": state.get("historical_last_heartbeat_at"),
+            "latest_campaign_id": latest_campaign_id,
+            "latest_campaign_start_requested": campaign_status in {"queued", "running", "paused", "completed"},
+            "latest_campaign_started": bool(campaign_started_at),
+            "latest_campaign_worker_started": worker_started,
+            "latest_campaign_browser_started": True if browser_evidence else None,
+            "latest_campaign_browser_started_evidence_available": bool(browser_evidence),
+            "latest_worker_round_id": latest_round_id,
+            "latest_job_ids": latest_job_ids,
+            "latest_assigned_account_ids": latest_account_ids,
+            "latest_failed_steps": latest_failed_steps,
+            "latest_browser_pids": latest_browser_pids,
+            "latest_screenshots": latest_screenshots,
+            "active_assigned_count_per_account": self.repository.active_job_counts_by_account(),
+            "circuit_breaker_state": {
+                "stop_after_first_deterministic_failure": STOP_ACCOUNT_AFTER_FIRST_DETERMINISTIC_FAILURE,
+                "cooling_down_accounts": groups["cooling_down"],
+            },
+            "diagnostic_execution": {
+                "max_job_attempts_per_resume_per_account": DIAGNOSTIC_MAX_JOB_ATTEMPTS_PER_RESUME,
+                "capture_failure_screenshot": CAPTURE_FAILURE_SCREENSHOT,
+                "capture_failure_dom": CAPTURE_FAILURE_DOM,
+            },
+            "latest_campaign_tick_occurred": bool(current_last_tick_at and campaign_started_at and str(current_last_tick_at) >= str(campaign_started_at)),
             "current_tick_id": state.get("current_tick_id"),
             "account_assignment_strategy": str(global_settings["account_assignment_strategy"]),
+            "account_readiness_matrix": self.account_readiness_matrix(),
+            "last_tick_results_label": "historical_last_tick_results",
             "last_tick_results": json.loads(state.get("last_tick_results_json") or "[]"),
         }
 
-    def scheduler_run_once(self, campaign_id: str | None = None, dry_run: bool = True) -> dict[str, Any]:
+    def scheduler_status_snapshot(self) -> dict[str, Any]:
+        """Read persisted/cached runtime state only; never reconcile or calculate readiness."""
+        from app.performance import span
+        snapshot_generated_at = utc_now()
+        with span("scheduler_snapshot_database"):
+            state_reader = getattr(self.repository, "get_scheduler_state_snapshot", self.repository.get_scheduler_state)
+            state = state_reader()
+            active_locks = self.repository.list_active_worker_locks()
+            job_counts = self.repository.count_jobs_by_status()
+        with span("scheduler_service"):
+            runtime_status = self.scheduler_runtime.status() if self.scheduler_runtime is not None else {
+                "scheduler_runtime_status": "not_started",
+                "background_task_alive": False,
+                "process_id": os.getpid(),
+            }
+            current_owner = str(runtime_status.get("runtime_owner_id") or "")
+            owner_matches = bool(current_owner and current_owner == str(state.get("runtime_owner_id") or ""))
+            try:
+                last_results = json.loads(state.get("last_tick_results_json") or "[]")
+            except (TypeError, ValueError):
+                last_results = []
+            computed_at = state.get("last_tick_completed_at") or state.get("updated_at") or snapshot_generated_at
+            return {
+                "scheduler_status": state.get("scheduler_status") or "stopped",
+                "configured_scheduler_status": state.get("scheduler_status") or "stopped",
+                **runtime_status,
+                "last_tick_id": state.get("current_tick_id"),
+                "current_tick_id": state.get("current_tick_id"),
+                "last_tick_started_at": state.get("last_tick_started_at"),
+                "last_tick_completed_at": state.get("last_tick_completed_at"),
+                "last_heartbeat": state.get("loop_heartbeat_at"),
+                "loop_heartbeat_at": state.get("loop_heartbeat_at"),
+                "current_runtime_owner": current_owner or None,
+                "persisted_runtime_owner": state.get("runtime_owner_id"),
+                "current_runtime_owner_matches_persisted": owner_matches,
+                "scheduler_task_created_at": state.get("scheduler_task_created_at") or runtime_status.get("scheduler_task_created_at"),
+                "first_current_runtime_tick_at": state.get("first_current_runtime_tick_at") if owner_matches else None,
+                "last_current_runtime_tick_at": state.get("last_current_runtime_tick_at") if owner_matches else None,
+                "current_heartbeat": state.get("current_runtime_heartbeat_at") if owner_matches else None,
+                "historical_runtime_owner": state.get("historical_runtime_owner_id"),
+                "historical_last_tick_at": state.get("historical_last_tick_at") or state.get("last_tick_at"),
+                "historical_last_heartbeat_at": state.get("historical_last_heartbeat_at"),
+                "tick_in_progress": bool(state.get("tick_in_progress")),
+                "current_active_workers": len(active_locks),
+                "active_account_count": len(active_locks),
+                "active_accounts": [str(item["account_id"]) for item in active_locks],
+                "queued_job_count": int(job_counts.get("queued", 0)),
+                "running_job_count": int(job_counts.get("running", 0)),
+                "queue_counts": job_counts,
+                "last_blocker_summary": state.get("last_tick_error"),
+                "current_round_state": "running" if state.get("tick_in_progress") else "idle",
+                "last_tick_results": last_results,
+                "computed_at": computed_at,
+                "revision": "|".join(str(state.get(key) or "") for key in ("updated_at", "current_tick_id", "last_tick_completed_at")),
+                "stale": bool(self.scheduler_runtime_required and not owner_matches),
+                "stale_reason": "runtime_owner_mismatch" if self.scheduler_runtime_required and not owner_matches else None,
+                "read_model": "persisted_scheduler_snapshot",
+                "readiness_calculated": False,
+            }
+
+    def scheduler_run_once(self, campaign_id: str | None = None) -> dict[str, Any]:
+        self._resolve_execution_mode(REAL_SEND, "campaign_scheduler")
+        if self.scheduler_runtime_required and not bool(self.get_global_settings().get("live_campaign_execution_enabled")):
+            return {**self.scheduler_status(), "started_accounts": [], "results": [], "reason": "live_campaign_execution_disabled"}
         state = self.repository.get_scheduler_state()
         if state["scheduler_status"] in {"paused", "stopped"}:
             return {**self.scheduler_status(), "started_accounts": [], "results": [], "reason": f"scheduler_{state['scheduler_status']}"}
-        global_policy = self.resolve_effective_policy(campaign_id=campaign_id)["effective_policy"]
+        running_campaigns = (
+            [self.repository.get_campaign(campaign_id)] if campaign_id
+            else self.repository.list_campaigns("running", 10000, 0)
+        )
+        running_campaigns = [item for item in running_campaigns if item]
+        now_iso = utc_now()
+        runnable: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for item in running_campaigns:
+            item_policy = self.resolve_effective_policy(campaign_id=str(item["id"]))["effective_policy"]
+            scheduled = item_policy.get("scheduled_start_at")
+            if scheduled and str(scheduled) > now_iso:
+                continue
+            runnable.append((item, item_policy))
+        runnable.sort(key=lambda pair: (-int(pair[1].get("priority") or 0), str(pair[0].get("created_at") or ""), str(pair[0]["id"])))
+        if not runnable:
+            return {**self.scheduler_status(), "started_accounts": [], "results": [], "reason": "no_running_campaigns"}
+        global_policy = runnable[0][1]
+        selected_campaign = runnable[0][0]
+        selected_campaign_id = str(selected_campaign["id"])
+        reservation = self.repository.get_campaign_capacity_reservation(selected_campaign_id)
+        exact_required = int(
+            (reservation or {}).get("requested_account_count")
+            or (reservation or {}).get("allocated_account_count")
+            or 0
+        )
+        initial_exact_reservation = bool(
+            exact_required
+            and str(selected_campaign.get("lifecycle_stage") or "") == "initializing_capacity"
+        )
         snapshot = self.resource_provider.snapshot()
         capacity = self.resource_provider.decide(global_policy, snapshot, scheduler_status=str(state["scheduler_status"]))
         active_locks = self.repository.list_active_worker_locks()
-        available_slots = min(max(0, int(global_policy["max_concurrent_accounts"]) - len(active_locks)), capacity.available_worker_slots)
+        unrestricted = str(global_policy.get("concurrency_mode") or "operator_defined") == "unrestricted"
+        # Requested account count owns campaign slot demand.  Older campaigns
+        # have no requested-account reservation, so their established meaning
+        # remains "up to the configured concurrent-account ceiling".  The
+        # legacy ``accounts_per_round`` default is therefore not allowed to
+        # silently collapse a no-demand campaign from its configured capacity
+        # to one account.
+        requested_round = exact_required or int(global_policy.get("max_concurrent_accounts") or 0)
+        available_slots = min(requested_round, capacity.available_worker_slots, capacity.available_browser_start_slots)
+        if not unrestricted:
+            available_slots = min(available_slots, max(0, int(global_policy.get("operator_defined_max_concurrent_accounts") or global_policy["max_concurrent_accounts"]) - len(active_locks)))
+        if exact_required and str(global_policy.get("concurrency_mode") or "operator_defined") != "unrestricted":
+            configured = {
+                "max_concurrent_accounts": int(global_policy.get("operator_defined_max_concurrent_accounts") or global_policy.get("max_concurrent_accounts") or 0),
+                "browser_concurrency": int(global_policy.get("browser_concurrency") or 0),
+                "worker_concurrency": int(global_policy.get("worker_concurrency") or 0),
+            }
+            mismatches = {key: value for key, value in configured.items() if value < exact_required}
+            if mismatches:
+                return {
+                    **self.scheduler_status(), "started_accounts": [], "results": [],
+                    "reason": "requested_accounts_exceed_runtime_capacity",
+                    "required_account_count": exact_required, "configured": configured,
+                    "concurrency_floor_shortfalls": mismatches,
+                }
         if available_slots <= 0 or not capacity.allow_new_worker:
             reason = "no_available_slots" if "concurrency_limit_reached" in capacity.reason_codes else (capacity.reason_codes[0] if capacity.reason_codes else "no_available_slots")
             diagnostics = {"resource_snapshot": snapshot.to_dict(), "capacity_decision": capacity.to_dict()}
-            return {**self.scheduler_status(), "started_accounts": [], "results": [], "reason": reason, "retry_after_seconds": capacity.retry_after_seconds, "capacity_diagnostics": diagnostics}
-        eligible, _groups = self._ordered_eligible_accounts(campaign_id)
-        selected = eligible[:available_slots]
+            return {
+                **self.scheduler_status(), "started_accounts": [], "results": [], "reason": reason,
+                "retry_after_seconds": capacity.retry_after_seconds, "capacity_diagnostics": diagnostics,
+                "desired_concurrency": exact_required or requested_round,
+                "active_concurrency": 0,
+                "replacement_needed": exact_required if exact_required else 0,
+            }
+        eligible, groups = self._ordered_eligible_accounts(selected_campaign_id)
+        if initial_exact_reservation and len(eligible) < exact_required:
+            return {
+                **self.scheduler_status(), "started_accounts": [], "results": [],
+                "reason": "requested_accounts_exceed_eligible",
+                "required_account_count": exact_required, "eligible_account_count": len(eligible),
+                "replacement_needed": exact_required - len(eligible), "blockers": groups,
+            }
+        if initial_exact_reservation and available_slots < exact_required:
+            return {
+                **self.scheduler_status(), "started_accounts": [], "results": [],
+                "reason": "requested_accounts_exceed_runtime_capacity",
+                "required_account_count": exact_required, "available_slots": available_slots,
+                "replacement_needed": exact_required - available_slots,
+            }
+        round_account_limit = min(requested_round, len(eligible), max(0, available_slots))
+        selected = eligible[:round_account_limit]
+        claimed_by_account: dict[str, str] = {}
+        if initial_exact_reservation:
+            if len(selected) != exact_required:
+                return {
+                    **self.scheduler_status(), "started_accounts": [], "results": [],
+                    "reason": "requested_accounts_exceed_eligible",
+                    "required_account_count": exact_required, "selected_account_count": len(selected),
+                    "replacement_needed": exact_required - len(selected),
+                }
+            try:
+                claims = self.repository.claim_exact_campaign_round_atomic(
+                    selected_campaign_id,
+                    [str(account["account_id"]) for account in selected],
+                    str(selected_campaign.get("source_channel_uid") or ""),
+                )
+            except ValueError as exc:
+                return {
+                    **self.scheduler_status(), "started_accounts": [], "results": [],
+                    "reason": str(exc), "required_account_count": exact_required,
+                    "replacement_needed": exact_required,
+                }
+            claimed_by_account = {str(job["account_id"]): str(job["id"]) for job in claims}
+            self.repository.update_campaign(selected_campaign_id, {"lifecycle_stage": "running"})
+        logger.info(
+            "[ACCOUNT_ROTATION] campaign_id=%s strategy=%s eligible_account_ids=%s selected_account_ids=%s",
+            campaign_id,
+            global_policy["account_assignment_strategy"],
+            [str(account["account_id"]) for account in eligible],
+            [str(account["account_id"]) for account in selected],
+        )
         tick_id = f"tick_{uuid4().hex[:12]}"
         if not selected:
             self.repository.update_scheduler_state({"last_tick_at": utc_now(), "current_tick_id": tick_id, "last_tick_results_json": "[]"})
-            return {**self.scheduler_status(), "started_accounts": [], "results": [], "reason": "no_eligible_accounts"}
+            return {
+                **self.scheduler_status(), "started_accounts": [], "results": [], "reason": "no_eligible_accounts",
+                "desired_concurrency": exact_required or requested_round,
+                "active_concurrency": 0,
+                "replacement_needed": exact_required or 0,
+            }
 
-        def run_selected(account: dict[str, Any]) -> dict[str, Any]:
+        def run_selected(account: dict[str, Any], selected_campaign_id: str) -> dict[str, Any]:
             account_id = str(account["account_id"])
             try:
-                result = self.run_account_round(account_id=account_id, campaign_id=campaign_id, max_jobs=None, dry_run=dry_run, scheduler_tick_id=tick_id)
+                result = self.run_account_round(
+                    account_id=account_id,
+                    campaign_id=selected_campaign_id,
+                    max_jobs=None,
+                    scheduler_tick_id=tick_id,
+                    preassigned_job_id=claimed_by_account.get(account_id),
+                )
                 status_after = self.worker_status(account_id)
                 succeeded = sum(1 for item in result.get("results", []) if item.get("status") == "succeeded")
                 failed = sum(1 for item in result.get("results", []) if item.get("status") == "failed")
                 skipped = sum(1 for item in result.get("results", []) if item.get("status") == "skipped")
                 return {
                     "account_id": account_id,
+                    "campaign_id": selected_campaign_id,
                     "started": True,
                     "assigned_count": int(result.get("assigned_count") or 0),
                     "processed_count": int(result.get("processed_count") or 0),
@@ -771,8 +1931,21 @@ class CommercialQueueService:
                     "raw_result": result,
                 }
             except Exception as exc:
+                # A worker exception is account-scoped.  Do not let one
+                # browser/profile/session failure terminate the scheduler or
+                # poison an unrelated campaign.  Only unstarted assignments
+                # are returned to the queue here; a running job is left for
+                # the existing certainty/reconciliation path rather than
+                # risking a duplicate send.
+                error_code = str(getattr(exc, "error_code", None) or "worker_unhandled_exception")
+                self.account_health.set_status(account_id, "session_error", error_code)
+                requeued_unstarted = self.repository.requeue_assigned_jobs_for_account(
+                    account_id,
+                    reason=f"scheduler_worker_exception:{error_code}",
+                )
                 return {
                     "account_id": account_id,
+                    "campaign_id": selected_campaign_id,
                     "started": False,
                     "assigned_count": 0,
                     "processed_count": 0,
@@ -784,6 +1957,9 @@ class CommercialQueueService:
                     "round_duration_ms": 0,
                     "worker_status_after": self.worker_status(account_id)["worker_status"],
                     "cooldown_until": self.worker_status(account_id).get("cooldown_until"),
+                    "account_health_status": self.get_account_health(account_id).get("health_status"),
+                    "requeued_unstarted_count": requeued_unstarted,
+                    "error_code": error_code,
                     "error": str(exc),
                 }
 
@@ -793,7 +1969,14 @@ class CommercialQueueService:
         for start in range(0, len(selected), batch_size):
             batch = selected[start : start + batch_size]
             with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                futures = [executor.submit(run_selected, account) for account in batch]
+                futures = [
+                    executor.submit(
+                        run_selected,
+                        account,
+                        selected_campaign_id,
+                    )
+                    for index, account in enumerate(batch)
+                ]
                 for future in as_completed(futures):
                     results.append(future.result())
             if stagger_seconds > 0 and start + batch_size < len(selected):
@@ -805,7 +1988,15 @@ class CommercialQueueService:
         if strategy == "round_robin" and selected_ids:
             updates["round_robin_cursor"] = selected_ids[-1]
         self.repository.update_scheduler_state(updates)
-        return {**self.scheduler_status(), "started_accounts": selected_ids, "results": results, "reason": None}
+        return {
+            **self.scheduler_status(), "started_accounts": selected_ids, "results": results, "reason": None,
+            "desired_concurrency": exact_required or requested_round,
+            "active_concurrency": len(selected_ids),
+            "replacement_needed": max(0, exact_required - len(selected_ids)),
+            "eligible_account_count": len(eligible),
+            "excluded_accounts": groups,
+            "initial_exact_reservation": initial_exact_reservation,
+        }
 
     def list_account_runtime_status(
         self,
@@ -846,20 +2037,24 @@ class CommercialQueueService:
         return {"items": rows[offset : offset + limit], "limit": limit, "offset": offset, "total": len(rows)}
 
     def dashboard_summary(self) -> dict[str, Any]:
-        scheduler = self.scheduler_status()
-        job_counts = self.repository.count_jobs_by_status()
-        accounts = self.repository.list_all_account_settings()
+        from app.performance import span
+        with span("dashboard_aggregate_queries"):
+            aggregate = self.repository.dashboard_aggregates()
+        with span("dashboard_scheduler_snapshot"):
+            scheduler = self.scheduler_status_snapshot()
+        job_counts = aggregate["jobs"]
         return {
-            "total_accounts": len(accounts),
-            "active_workers": scheduler["active_account_count"],
-            "available_worker_slots": scheduler["available_slots"],
+            "total_accounts": aggregate["total_accounts"],
+            "active_workers": aggregate["active_workers"],
+            "available_worker_slots": None,
             "queued_jobs": int(job_counts.get("queued", 0)),
             "running_jobs": int(job_counts.get("running", 0)),
-            "succeeded_today": self.repository.count_jobs_today_by_status("succeeded"),
-            "failed_today": self.repository.count_jobs_today_by_status("failed"),
+            "succeeded_today": int(aggregate["jobs_today"].get("succeeded", 0)),
+            "failed_today": int(aggregate["jobs_today"].get("failed", 0)),
             "paused_jobs": int(job_counts.get("paused", 0)),
-            "campaigns_running": self.repository.count_campaigns_by_status("running"),
+            "campaigns_running": int(aggregate["campaigns"].get("running", 0)),
             "scheduler_status": scheduler["scheduler_status"],
+            "scheduler_snapshot": scheduler,
         }
 
     def assign_jobs(self, account_id: str, campaign_id: str | None = None, limit: int | None = None) -> dict[str, Any]:
@@ -878,8 +2073,12 @@ class CommercialQueueService:
             "remaining_daily_capacity": remaining,
             "reason": None,
         }
+        reservation = self.repository.get_campaign_capacity_reservation(campaign_id) if campaign_id else None
         if not effective["enabled"]:
             return {**base, "reason": "account_disabled"}
+        allowed_account_ids = self._campaign_pinned_account_ids(campaign_id, policy)
+        if allowed_account_ids and account_id not in allowed_account_ids:
+            return {**base, "reason": "account_outside_campaign_scope"}
         health = self.account_health.repository.get(account_id)
         if str(health.get("health_status")) in BLOCKING_STATES:
             return {**base, "reason": f"account_health_{health['health_status']}"}
@@ -891,19 +2090,29 @@ class CommercialQueueService:
             return {**base, "reason": "account_cooling_down"}
         if remaining <= 0:
             return {**base, "reason": "daily_limit_reached"}
-        if not self.account_auth_checker(account_id):
+        if not self._account_authentication_available_for_worker(account_id):
             return {**base, "reason": "account_auth_unavailable"}
         source_uid = self._assignment_source_uid(effective, campaign_id)
         if not source_uid:
             return {**base, "reason": "source_channel_not_configured"}
         requested = int(limit) if limit is not None else int(policy["deliveries_per_round"])
-        effective_limit = max(0, min(requested, int(policy["deliveries_per_round"]), remaining))
+        effective_limit = max(
+            0,
+            min(
+                requested,
+                int(policy["deliveries_per_round"]),
+                remaining,
+                DIAGNOSTIC_MAX_JOB_ATTEMPTS_PER_RESUME,
+                1,  # invariant: at most one assigned/running job per account
+            ),
+        )
         if effective_limit <= 0:
             return {**base, "reason": "assignment_limit_zero"}
         blocked_count = self.repository.quarantine_ineligible_queued_jobs(campaign_id)
         jobs = self.repository.assign_queued_jobs_atomic(account_id, campaign_id, effective_limit, source_uid)
         if not jobs:
             return {**base, "reason": "no_eligible_queued_jobs" if blocked_count else "no_queued_jobs", "blocked_ineligible_queued_count": blocked_count}
+        refreshed_reservation = self.repository.get_campaign_capacity_reservation(campaign_id) if campaign_id else None
         return {
             **base,
             "assigned_count": len(jobs),
@@ -911,20 +2120,355 @@ class CommercialQueueService:
             "remaining_daily_capacity": remaining - len(jobs),
             "blocked_ineligible_queued_count": blocked_count,
             "reason": None,
+            "campaign_capacity_reservation": refreshed_reservation,
         }
 
-    def create_campaign(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.repository.create_campaign(payload)
+    # ============================================================
+    # BLOCK: CAMPAIGN_CAPACITY_POOL_SERVICE
+    # PURPOSE:
+    # Reserves shared sending capacity for campaigns without owning accounts.
+    # ACCOUNT_SCOPE:
+    # Accounts stay in the shared scheduler pool.
+    # DEPENDENCIES:
+    # CommercialQueueRepository
+    # LAYER:
+    # SERVICE
+    # ============================================================
 
-    def list_campaigns(self, status: str | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    def campaign_capacity_pool(self) -> dict[str, Any]:
+        rows = self.account_readiness_matrix()
+        # Dependency-injected workers are used only by isolated tests and
+        # controlled adapters.  They do not have onboarding rows, but their
+        # durable account-settings fixtures still describe a valid pool.  Real
+        # production services keep the canonical onboarding projection as the
+        # sole source of account readiness.
+        if not rows and not self._uses_operational_auth_source:
+            rows = []
+            for account in self.repository.list_all_account_settings():
+                ready, reason, effective = self._worker_readiness_for_account(account)
+                rows.append({
+                    **account,
+                    "worker_eligible": ready,
+                    "eligibility_reasons": [] if ready else [reason],
+                    "enabled": bool(effective.get("enabled")),
+                    "worker_status": effective.get("worker_status"),
+                })
+        eligible_rows = [row for row in rows if bool(row.get("worker_eligible"))]
+        total_capacity = len(eligible_rows)
+        reserved_capacity = self.repository.reserved_campaign_capacity()
+        summary = {
+            "eligible_account_count": total_capacity,
+            "reserved_account_count": reserved_capacity,
+            "free_account_count": max(0, total_capacity - reserved_capacity),
+            "active_account_count": sum(str(row.get("worker_status") or "idle") != "idle" for row in rows),
+            "eligible_account_ids": [str(row["account_id"]) for row in eligible_rows],
+            "accounts": rows,
+        }
+        logger.info(
+            "[CAMPAIGN_CAPACITY_POOL] total=%s reserved=%s free=%s",
+            total_capacity,
+            reserved_capacity,
+            summary["free_account_count"],
+        )
+        return summary
+
+    def create_campaign(self, payload: dict[str, Any]) -> dict[str, Any]:
+        reservation_present = "capacity_reservation" in payload
+        reservation_capacity = max(0, int(payload.pop("capacity_reservation", 0) or 0))
+        pool = self.campaign_capacity_pool()
+        if reservation_present and reservation_capacity > pool["free_account_count"]:
+            raise ValueError("campaign_capacity_pool_insufficient")
+        campaign = self.repository.create_campaign(payload)
+        if reservation_present:
+            self.repository.upsert_campaign_capacity_reservation(
+                campaign["id"], reservation_capacity, pool["eligible_account_count"],
+            )
+        logger.info(
+            "[CAMPAIGN_RESERVATION] campaign_id=%s operation=create capacity=%s",
+            campaign["id"],
+            reservation_capacity,
+        )
+        created = self.get_campaign(campaign["id"]) or campaign
+        return {**created, "mutation_audit": _operator_audit("create_campaign", None, created)}
+
+    def list_campaigns(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        include_internal: bool = False,
+    ) -> dict[str, Any]:
+        from app.performance import span
         limit, offset = _pagination(limit, offset)
-        return {"items": self.repository.list_campaigns(status, limit, offset), "limit": limit, "offset": offset}
+        with span("campaign_list_query"):
+            # Legacy/internal records are filtered after classification.  Read a
+            # bounded candidate window from the beginning so an old run of
+            # verification artifacts cannot make a real campaign disappear
+            # from the first operator page.
+            candidate_limit = min(1000, max(limit + offset + 100, limit))
+            campaigns = self.repository.list_campaigns(
+                status,
+                candidate_limit,
+                0,
+                include_deleted=include_internal,
+            )
+            reservations = self.repository.list_campaign_capacity_reservations([str(item["id"]) for item in campaigns])
+        with span("campaign_list_serialization"):
+            items = []
+            for campaign in campaigns:
+                try:
+                    policy = json.loads(campaign.get("policy_overrides_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    policy = {}
+                presentation = campaign_presentation(campaign, policy)
+                if not include_internal and not presentation["operator_visible"]:
+                    continue
+                items.append({
+                    **campaign,
+                    **presentation,
+                    "policy_overrides": policy,
+                    "capacity_reservation": reservations.get(str(campaign["id"])),
+                })
+        return {
+            "items": items[offset:offset + limit],
+            "limit": limit,
+            "offset": offset,
+        }
 
     def get_campaign(self, campaign_id: str) -> dict[str, Any] | None:
-        return self.repository.get_campaign(campaign_id)
+        campaign = self.repository.get_campaign(campaign_id)
+        return self._with_campaign_reservation(campaign) if campaign else None
+
+    def campaign_capacity_state(self, campaign_id: str) -> dict[str, Any]:
+        revision = self.repository.readiness_revision(campaign_id)
+        cached = self._readiness_cache.get(campaign_id)
+        if cached and cached[0] == revision:
+            return {**cached[1], "revision": revision, "stale": False, "cache_hit": True}
+        result = self._compute_campaign_capacity_state(campaign_id)
+        result = {**result, "computed_at": utc_now(), "revision": revision, "stale": False, "cache_hit": False}
+        self._readiness_cache[campaign_id] = (revision, result)
+        return result
+
+    def _compute_campaign_capacity_state(self, campaign_id: str) -> dict[str, Any]:
+        campaign = self.get_campaign(campaign_id)
+        if not campaign:
+            raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
+        rows = self.account_readiness_matrix()
+        registered = len(rows)
+        durable = sum(bool(row.get("durable_identity_verified") or row.get("authentication_status") == "authenticated") for row in rows)
+        session_acceptable = sum(
+            bool(
+                row.get("session_health_acceptable")
+                or row.get("authentication_available")
+                or (
+                    row.get("authentication_status") == "authenticated"
+                    and row.get("session_persistence_status") == "verified"
+                )
+            )
+            for row in rows
+        )
+        enabled = sum(bool(row.get("enabled")) for row in rows)
+        commercial_enabled = sum(bool(row.get("commercial_enabled")) for row in rows)
+        eligible_rows = [row for row in rows if bool(row.get("worker_eligible"))]
+        eligible = len(eligible_rows)
+        active = sum(str(row.get("worker_status") or "idle") != "idle" for row in rows)
+        reservation = campaign.get("capacity_reservation")
+        policy = self.resolve_effective_policy(campaign_id=campaign_id)["effective_policy"]
+        required = int(
+            (reservation or {}).get("requested_account_count")
+            or (reservation or {}).get("allocated_account_count")
+            or 0
+        )
+        # Capacity allocation and exact start validation must expose the same
+        # runtime ceiling.  A reservation can be persisted for a larger
+        # desired round, but it is not execution-ready when any bounded
+        # runtime lane is smaller than that round.
+        exact_concurrency = {
+            "max_concurrent_accounts": int(policy.get("operator_defined_max_concurrent_accounts") or policy.get("max_concurrent_accounts") or 0),
+            "browser_concurrency": int(policy.get("browser_concurrency") or 0),
+            "worker_concurrency": int(policy.get("worker_concurrency") or 0),
+        }
+        concurrency_floor_shortfalls = {}
+        if required and str(policy.get("concurrency_mode") or "operator_defined") != "unrestricted":
+            concurrency_floor_shortfalls = {
+                field: value for field, value in exact_concurrency.items()
+                if value < required
+            }
+        queued_jobs = int(campaign.get("queued_count") or 0)
+        exact_runtime_ready = bool(
+            required
+            and eligible >= required
+            and queued_jobs >= required
+            and not concurrency_floor_shortfalls
+        )
+        unavailable = [
+            {"account_id": str(row["account_id"]), "reasons": list(row.get("eligibility_reasons") or ([row.get("exact_failing_eligibility_predicate")] if row.get("exact_failing_eligibility_predicate") else []))}
+            for row in rows if not row.get("worker_eligible")
+        ]
+        round_rows = []
+        for row in rows:
+            account_id = str(row["account_id"])
+            active_job = self.repository.get_active_job_for_account(account_id)
+            session = self.runtime_session_manager.get_session(account_id)
+            round_rows.append({
+                "account_id": account_id,
+                "job_id": (active_job or {}).get("id"),
+                "browser_pid": (getattr(session, "metadata", {}) or {}).get("browser_pid") if session else None,
+                "profile_path": getattr(session, "profile_path", None) or row.get("profile_path"),
+                "worker_state": row.get("worker_status"),
+                "authentication_state": row.get("authentication_status"),
+                "contact_preparation_state": (active_job or {}).get("contact_preparation_status"),
+                "forwarding_state": (active_job or {}).get("status"),
+                "send_verification_state": (active_job or {}).get("send_verification_status"),
+                "last_successful_step": (active_job or {}).get("last_successful_step"),
+                "current_error": (active_job or {}).get("last_error_message"),
+                "lock_state": "locked" if row.get("worker_lock") else "available",
+                "terminal_result": (active_job or {}).get("status") if (active_job or {}).get("status") in {"succeeded", "failed", "skipped", "cancelled"} else None,
+            })
+        return {
+            "campaign_id": campaign_id,
+            "campaign_status": campaign.get("status"),
+            "lifecycle_stage": campaign.get("lifecycle_stage"),
+            "registered_bale_accounts": registered,
+            "durable_identity_verified_accounts": durable,
+            "session_acceptable_accounts": session_acceptable,
+            "enabled_accounts": enabled,
+            "commercial_enabled_accounts": commercial_enabled,
+            "eligible_account_count": eligible,
+            "active_account_count": active,
+            "eligible_account_ids": [str(row["account_id"]) for row in eligible_rows],
+            "account_readiness": rows,
+            "requested_account_count": int((reservation or {}).get("requested_account_count") or 0),
+            "allocated_account_count": int((reservation or {}).get("allocated_account_count") or 0),
+            "reserved_account_count": self.repository.reserved_campaign_capacity(),
+            "free_account_count": self.campaign_capacity_pool()["free_account_count"],
+            "exact_blockers": sorted({reason for row in rows if not row.get("worker_eligible") for reason in (row.get("eligibility_reasons") or [row.get("exact_failing_eligibility_predicate")]) if reason} | ({"requested_accounts_exceed_runtime_capacity"} if concurrency_floor_shortfalls else set())),
+            "reservation": reservation,
+            "required_account_count": required,
+            "atomically_claimable_account_count": min(eligible, queued_jobs),
+            "exact_concurrency": exact_concurrency,
+            "concurrency_floor_shortfalls": concurrency_floor_shortfalls,
+            "ready_for_exact_account_execution": exact_runtime_ready,
+            "requested_account_shortfall": max(0, required - eligible),
+            "unavailable_accounts": unavailable,
+            "round_observability": round_rows,
+            "capacity_pool": self.campaign_capacity_pool(),
+        }
+
+    def allocate_campaign_capacity(self, campaign_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        before_reservation = self.repository.get_campaign_capacity_reservation(campaign_id)
+        campaign = self.get_campaign(campaign_id)
+        if not campaign:
+            raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
+        if campaign.get("platform") != "bale":
+            raise CampaignLifecycleError("capacity_platform_not_supported", "Capacity allocation is available only for Bale campaigns.")
+        state = self.campaign_capacity_state(campaign_id)
+        if state["eligible_account_count"] < 1:
+            raise CampaignLifecycleError("no_eligible_bale_accounts", "No eligible Bale account is available.", state)
+        requested_accounts = int(payload.get("requested_account_count") or payload.get("accounts_per_round") or 0)
+        if requested_accounts < 1:
+            raise CampaignLifecycleError("requested_account_count_required", "Requested account count must be at least one.", state)
+        if requested_accounts > state["eligible_account_count"]:
+            raise CampaignLifecycleError(
+                "requested_accounts_exceed_eligible",
+                "Requested accounts exceed eligible Bale accounts.",
+                {
+                    **state,
+                    "requested_account_count": requested_accounts,
+                    "required_account_count": requested_accounts,
+                    "eligible_account_count": int(state["eligible_account_count"]),
+                    "requested_account_shortfall": requested_accounts - int(state["eligible_account_count"]),
+                },
+            )
+        pool = self.campaign_capacity_pool()
+        try:
+            reservation = self.repository.upsert_campaign_capacity_reservation(campaign_id, requested_accounts, pool["eligible_account_count"])
+        except ValueError as exc:
+            raise CampaignLifecycleError(str(exc), str(exc), state) from exc
+        self.repository.update_campaign(campaign_id, {"lifecycle_stage": "capacity_allocated"})
+        result = {**self.campaign_capacity_state(campaign_id), "reservation": reservation}
+        return {**result, "mutation_audit": _operator_audit("allocate_campaign_capacity", before_reservation, reservation)}
 
     def update_campaign(self, campaign_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-        return self.repository.update_campaign(campaign_id, payload)
+        before = self.get_campaign(campaign_id)
+        reservation_present = "capacity_reservation" in payload
+        reservation_capacity = max(0, int(payload.pop("capacity_reservation", 0) or 0))
+        campaign = self.repository.update_campaign(campaign_id, payload)
+        if campaign and reservation_present:
+            pool = self.campaign_capacity_pool()
+            self.repository.upsert_campaign_capacity_reservation(
+                campaign_id,
+                reservation_capacity,
+                pool["eligible_account_count"],
+            )
+        updated = self.get_campaign(campaign_id) if campaign else None
+        return {**updated, "mutation_audit": _operator_audit("update_campaign", before, updated)} if updated else None
+
+    # ============================================================
+    # BLOCK: CAMPAIGN_DELETE_GUARD
+    # PURPOSE:
+    # Prevents deletion during active execution and delegates atomic cleanup.
+    # ACCOUNT_SCOPE:
+    # Campaign-owned data only; shared accounts remain unchanged.
+    # DEPENDENCIES:
+    # CommercialQueueRepository
+    # LAYER:
+    # SERVICE
+    # ============================================================
+
+    def delete_campaign(self, campaign_id: str) -> dict[str, Any]:
+        campaign = self.repository.get_campaign(campaign_id)
+        if campaign is None:
+            raise KeyError(campaign_id)
+        active_jobs = [
+            job
+            for job in self.repository.list_campaign_jobs_all(campaign_id)
+            if str(job.get("status") or "") in {"assigned", "running"}
+        ]
+        if campaign.get("status") == "running" or active_jobs:
+            logger.info(
+                "[CAMPAIGN_DELETE] campaign_id=%s result=blocked status=%s active_jobs=%s",
+                campaign_id,
+                campaign.get("status"),
+                len(active_jobs),
+            )
+            raise CampaignLifecycleError(
+                "campaign_delete_requires_stop",
+                "Campaign must be stopped and have no active jobs before deletion",
+                {"campaign_status": campaign.get("status"), "active_job_count": len(active_jobs)},
+            )
+        result = self.repository.delete_campaign(campaign_id)
+        if result.get("deleted"):
+            self.repository.release_campaign_capacity_reservation(campaign_id, "campaign_soft_deleted")
+        logger.info(
+            "[CAMPAIGN_DELETE] campaign_id=%s result=%s",
+            campaign_id,
+            "deleted" if result.get("deleted") else "not_found",
+        )
+        return {
+            **result,
+            "mutation_audit": _operator_audit("soft_delete_campaign", campaign, result),
+        }
+
+    # ============================================================
+    # END BLOCK: CAMPAIGN_DELETE_GUARD
+    # ============================================================
+
+    def _with_campaign_reservation(self, campaign: dict[str, Any]) -> dict[str, Any]:
+        try:
+            policy = json.loads(campaign.get("policy_overrides_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            policy = {}
+        return {
+            **campaign,
+            **campaign_presentation(campaign, policy),
+            "policy_overrides": policy,
+            "capacity_reservation": self.repository.get_campaign_capacity_reservation(str(campaign["id"])),
+        }
+
+    # ============================================================
+    # END BLOCK: CAMPAIGN_CAPACITY_POOL_SERVICE
+    # ============================================================
 
     def architecture_capabilities(self) -> dict[str, Any]:
         settings = self.get_global_settings()
@@ -980,6 +2524,9 @@ class CommercialQueueService:
     def audit_bale_authentication_profile(self, account_id: str) -> dict[str, Any]:
         return self.bale_authentication.audit_profile_paths(account_id)
 
+    def prepare_bale_authentication_open(self, account_id: str) -> dict[str, Any]:
+        return self.bale_authentication.prepare_open(account_id)
+
     def open_bale_authentication(self, account_id: str) -> dict[str, Any]:
         return self.bale_authentication.open(account_id)
 
@@ -1005,6 +2552,10 @@ class CommercialQueueService:
                 "platform": "bale",
                 "status": "paused",
                 "source_channel_uid": "",
+                "policy_overrides": {
+                    "campaign_origin": "runtime_generated",
+                    "operator_visible": False,
+                },
             })
         now = utc_now()
         bale_contact_store.assert_unique_mapping(account_id)
@@ -1227,6 +2778,7 @@ class CommercialQueueService:
         requested_account_ids: list[str] | None = None,
         requested_max_jobs: int | None = None,
     ) -> dict[str, Any]:
+        self.refresh_authenticated_bale_worker_eligibility()
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
@@ -1283,7 +2835,7 @@ class CommercialQueueService:
                 blocked = True
             if remaining <= 0:
                 blocked = True
-            if not self.account_auth_checker(account_id):
+            if not self._account_authentication_available_for_worker(account_id):
                 blocked = True
             if not self._assignment_source_uid(effective, campaign_id):
                 blocked = True
@@ -1295,6 +2847,14 @@ class CommercialQueueService:
             blocking.append("no_eligible_account")
         if sum(capacity.get(account_id, 0) for account_id in eligible_ids) <= 0:
             blocking.append("daily_capacity_insufficient")
+        reservation = self.repository.get_campaign_capacity_reservation(campaign_id)
+        capacity_pool = self.campaign_capacity_pool()
+        if not reservation:
+            blocking.append("campaign_capacity_reservation_missing")
+        elif int(reservation.get("remaining_capacity") or 0) <= 0:
+            blocking.append("campaign_capacity_reservation_exhausted")
+        elif requested_max_jobs is not None and int(requested_max_jobs) > int(reservation["remaining_capacity"]):
+            blocking.append("campaign_capacity_reservation_insufficient")
 
         locks = self.repository.list_active_worker_locks()
         active_sessions = self.runtime_session_manager.list_active_sessions()
@@ -1321,6 +2881,8 @@ class CommercialQueueService:
             "eligible_account_ids": eligible_ids,
             "unhealthy_account_ids": unhealthy_ids,
             "account_daily_capacity": capacity,
+            "campaign_capacity_reservation": reservation,
+            "capacity_pool": capacity_pool,
             "effective_max_concurrent_accounts": int(policy.get("max_concurrent_accounts") or 0),
             "effective_deliveries_per_round": int(policy.get("deliveries_per_round") or 0),
             "source_channel_resolution": {"resolved": source_resolved, "source_channel_uid": source_uid},
@@ -1631,14 +3193,94 @@ class CommercialQueueService:
         )
         return {"consumed": True, "approval": self._serialize_live_approval(updated), "validation": validation}
 
+    # ============================================================
+    # BLOCK: APPROVED_LIVE_CAMPAIGN_EXECUTION
+    # PURPOSE:
+    # Converts one validated campaign approval into a bounded live worker run.
+    # ACCOUNT_SCOPE:
+    # Uses only the approved account scope or eligible shared-pool accounts.
+    # DEPENDENCIES:
+    # Live approval store, campaign capacity reservation, worker round
+    # LAYER:
+    # SERVICE
+    # ============================================================
+
+    def execute_approved_live_campaign(self, approval_id: str) -> dict[str, Any]:
+        approval = self.get_live_execution_approval(approval_id)
+        if approval is None:
+            raise KeyError(approval_id)
+        account_scope = approval.get("requested_account_ids")
+        requested_max_jobs = approval.get("requested_max_jobs")
+        validation = self.validate_live_approval_for_execution(
+            approval_id,
+            account_ids=account_scope,
+            max_jobs=requested_max_jobs,
+        )
+        logger.info(
+            "[LIVE_EXECUTION_GATE] approval_id=%s campaign_id=%s ready=%s blocking=%s",
+            approval_id,
+            approval["campaign_id"],
+            validation["ready"],
+            validation["blocking_reasons"],
+        )
+        if not validation["ready"]:
+            return {"executed": False, "approval_id": approval_id, "validation": validation}
+
+        consumed = self.consume_live_execution_approval(approval_id)
+        if not consumed.get("consumed"):
+            return {"executed": False, "approval_id": approval_id, "validation": consumed.get("validation")}
+
+        campaign_id = str(approval["campaign_id"])
+        reservation = self.repository.get_campaign_capacity_reservation(campaign_id)
+        approved_limit = int(requested_max_jobs or 1)
+        remaining_limit = min(approved_limit, int((reservation or {}).get("remaining_capacity") or 0))
+        eligible, _groups = self._ordered_eligible_accounts(campaign_id)
+        approved_ids = set(str(item) for item in (account_scope or []) if str(item or "").strip())
+        if approved_ids:
+            eligible = [account for account in eligible if str(account["account_id"]) in approved_ids]
+
+        results: list[dict[str, Any]] = []
+        authorization = {
+            "approval_id": approval_id,
+            "campaign_id": campaign_id,
+            "max_jobs": remaining_limit,
+        }
+        for account in eligible:
+            if remaining_limit <= 0:
+                break
+            result = self.run_account_round(
+                account_id=str(account["account_id"]),
+                campaign_id=campaign_id,
+                max_jobs=remaining_limit,
+                live_execution_authorization=authorization,
+            )
+            results.append(result)
+            remaining_limit -= int(result.get("processed_count") or result.get("assigned_count") or 0)
+
+        return {
+            "executed": True,
+            "approval_id": approval_id,
+            "campaign_id": campaign_id,
+            "approved_max_jobs": approved_limit,
+            "results": results,
+            "capacity_pool": self.campaign_capacity_pool(),
+            "campaign_capacity_reservation": self.repository.get_campaign_capacity_reservation(campaign_id),
+        }
+
+    # ============================================================
+    # END BLOCK: APPROVED_LIVE_CAMPAIGN_EXECUTION
+    # ============================================================
+
     def validate_campaign_start(self, campaign_id: str) -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
         counts = self.repository.campaign_job_counts(campaign_id)
         recipient_counts = self.repository.campaign_recipient_counts(campaign_id)
+        delivery_audit = self.repository.campaign_recipient_delivery_audit(campaign_id)
+        recipient_rows = delivery_audit["recipients"]
         deliverable = int(counts.get("queued", 0))
-        authorization_summary = self.validate_campaign_recipient_authorization(campaign_id, dry_run=False)
+        authorization_summary = self.validate_campaign_recipient_authorization(campaign_id)
         blocking: list[str] = []
         if campaign["status"] in {"cancelled"}:
             blocking.append("campaign_cancelled")
@@ -1651,40 +3293,215 @@ class CommercialQueueService:
         if self.repository.campaign_has_importing_batch(campaign_id):
             blocking.append("campaign_import_in_progress")
         eligible_count = 0
+        account_results: list[dict[str, Any]] = []
+        campaign_policy = self.resolve_effective_policy(campaign_id=campaign_id)["effective_policy"]
+        allowed_ids = self._campaign_pinned_account_ids(campaign_id, campaign_policy)
         source_resolved = bool(campaign.get("source_channel_uid") or self.get_global_settings().get("default_source_channel_uid"))
         for account in self.repository.list_all_account_settings():
-            effective = self.resolve_account_settings(str(account["account_id"]))
+            account_id = str(account["account_id"])
+            effective = self.resolve_account_settings(account_id)
+            predicates: dict[str, bool] = {}
+            blockers: list[str] = []
+            predicates["campaign_account_scope"] = not allowed_ids or account_id in allowed_ids
+            if not predicates["campaign_account_scope"]: blockers.append("campaign_account_scope_excluded")
+            health = self.account_health.repository.get(account_id)
+            predicates["health_not_blocking"] = str(health.get("health_status")) not in BLOCKING_STATES
+            if not predicates["health_not_blocking"]: blockers.append(f"health_{health.get('health_status')}")
+            predicates["enabled"] = bool(effective["enabled"])
+            if not predicates["enabled"]: blockers.append("disabled")
+            predicates["worker_idle"] = effective.get("worker_status") == "idle"
+            if not predicates["worker_idle"]: blockers.append("worker_not_idle")
+            lock = self.repository.get_worker_lock(account_id)
+            predicates["worker_lock_clear"] = not lock or self._lock_expired(lock)
+            if not predicates["worker_lock_clear"]: blockers.append("lock_active")
+            predicates["cooldown_clear"] = not self._cooldown_active(effective)
+            if not predicates["cooldown_clear"]: blockers.append("cooling_down")
+            predicates["daily_limit_available"] = int(effective["current_daily_sent_count"]) < int(effective["daily_limit"])
+            if not predicates["daily_limit_available"]: blockers.append("daily_limited")
+            auth_blockers, operational = self._authentication_blockers(account_id)
+            predicates["authentication_available"] = not auth_blockers
+            blockers.extend(auth_blockers)
+            predicates["source_channel_resolved"] = bool(self._assignment_source_uid(effective, campaign_id))
+            if not predicates["source_channel_resolved"]: blockers.append("source_missing")
             if effective.get("source_channel_uid") or campaign.get("source_channel_uid"):
                 source_resolved = True
-            if not effective["enabled"] or self._cooldown_active(effective):
-                continue
-            if int(effective["current_daily_sent_count"]) >= int(effective["daily_limit"]):
-                continue
-            if not self.account_auth_checker(str(account["account_id"])):
-                continue
-            if not self._assignment_source_uid(effective, campaign_id):
-                continue
-            eligible_count += 1
+            eligible = not blockers
+            eligible_count += int(eligible)
+            account_results.append({
+                "account_id": account_id,
+                "eligible": eligible,
+                "blockers": list(dict.fromkeys(blockers)),
+                "verification_expires_at": operational.get("verification_expires_at"),
+                "predicates": predicates,
+            })
         if not source_resolved:
             blocking.append("source_channel_not_resolved")
         if eligible_count <= 0:
             blocking.append("no_eligible_account")
-        return {
+        reservation = self.repository.get_campaign_capacity_reservation(campaign_id)
+        # The operator-entered requested count is the sole campaign demand.
+        # ``allocated_account_count`` is a reservation accounting mirror and
+        # must not become an independent stale source of truth.
+        required_account_count = int(
+            (reservation or {}).get("requested_account_count")
+            or (reservation or {}).get("allocated_account_count")
+            or 0
+        )
+        registered_account_count = len(self.account_readiness_matrix())
+        unavailable_accounts = [
+            {"account_id": row["account_id"], "reasons": row["blockers"]}
+            for row in account_results if not row["eligible"]
+        ]
+        policy = campaign_policy
+        # ``accounts_per_round`` is a legacy batching preference, not a second
+        # operator demand.  In AUTO mode the scheduler derives the account
+        # batch from requested_account_count.  The remaining values are safety
+        # ceilings, so only an actual lower-than-N ceiling is a blocker.
+        exact_concurrency = {
+            "max_concurrent_accounts": int(policy.get("operator_defined_max_concurrent_accounts") or policy.get("max_concurrent_accounts") or 0),
+            "browser_concurrency": int(policy.get("browser_concurrency") or 0),
+            "worker_concurrency": int(policy.get("worker_concurrency") or 0),
+        }
+        concurrency_floor_shortfalls: dict[str, int] = {}
+        if required_account_count:
+            if eligible_count < required_account_count:
+                blocking.append("requested_accounts_exceed_eligible")
+            if deliverable < required_account_count:
+                blocking.append("exact_round_claimable_jobs_insufficient")
+            if str(policy.get("concurrency_mode") or "operator_defined") != "unrestricted":
+                concurrency_floor_shortfalls = {
+                    field: value for field, value in exact_concurrency.items()
+                    if value < required_account_count
+                }
+                if concurrency_floor_shortfalls:
+                    blocking.append("requested_accounts_exceed_runtime_capacity")
+        reason_summary: dict[str, int] = {}
+        for recipient in recipient_rows:
+            job_status = str(recipient.get("existing_job_status") or "")
+            if recipient.get("validation_status") != "valid":
+                reason = f"recipient_{recipient.get('validation_status') or 'invalid'}"
+            elif not recipient.get("existing_job_id"):
+                reason = "delivery_job_missing"
+            elif job_status != "queued":
+                reason = f"job_{job_status or 'status_missing'}"
+            elif bool(recipient.get("job_live_execution_blocked")):
+                reason = str(recipient.get("job_block_reason") or "live_execution_blocked")
+            else:
+                reason = "deliverable"
+            reason_summary[reason] = reason_summary.get(reason, 0) + 1
+        invalid_count = int(delivery_audit["invalid_count"]) + int(recipient_counts.get("invalid", 0))
+        duplicate_count = int(delivery_audit["duplicate_count"]) + int(recipient_counts.get("duplicate", 0))
+        excluded_count = (
+            int(delivery_audit["blocked_count"])
+            + int(delivery_audit["opted_out_count"])
+            + int(recipient_counts.get("excluded", 0))
+            + int(recipient_counts.get("blocked", 0))
+            + int(recipient_counts.get("opted_out", 0))
+        )
+        summary = {
             "campaign_id": campaign_id,
             "campaign_status": campaign["status"],
+            "recipient_count": len(recipient_rows),
+            "uploaded_row_count": int(delivery_audit["uploaded_row_count"]),
+            "invalid_recipient_count": invalid_count,
+            "duplicate_recipient_count": duplicate_count,
+            "excluded_recipient_count": excluded_count,
+            "existing_job_count": sum(int(value) for value in counts.values()),
             "deliverable_job_count": deliverable,
             **authorization_summary,
             "valid_recipient_count": int(recipient_counts.get("valid", 0)),
             "eligible_account_count": eligible_count,
+            "registered_account_count": registered_account_count,
+            "required_account_count": required_account_count,
+            "atomically_claimable_account_count": min(eligible_count, deliverable),
+            "ready_for_exact_account_execution": bool(
+                required_account_count
+                and eligible_count >= required_account_count
+                and deliverable >= required_account_count
+                and not concurrency_floor_shortfalls
+            ),
+            "unavailable_accounts": unavailable_accounts,
+            "exact_concurrency": exact_concurrency,
+            "concurrency_floor_shortfalls": concurrency_floor_shortfalls,
+            "requested_account_shortfall": max(0, required_account_count - eligible_count),
+            "account_selection_mode": "pinned" if allowed_ids else "auto",
+            "accounts": account_results,
             "source_channel_resolved": source_resolved,
             "blocking_reasons": blocking,
+            "recipient_reason_summary": reason_summary,
             "ok": not blocking,
+            # ``success`` means the validation request was processed. Keep it
+            # for compatibility, but make the decision explicit so clients do
+            # not mistake HTTP/request success for start approval.
+            "success": True,
+            "validation_status": "passed" if not blocking else "blocked",
+            "validation_succeeded": not blocking,
+            "valid": not blocking,
+            "can_start": not blocking,
+            "job_count": sum(int(value) for value in counts.values()),
+        }
+        summary["exact_execution_readiness"] = {
+            "ready": summary["ready_for_exact_account_execution"],
+            "required_account_count": required_account_count,
+            "eligible_account_count": eligible_count,
+            "unavailable_accounts": unavailable_accounts,
+        }
+        return {**summary, "validation_hash": self.validation_hash(summary)}
+
+    @staticmethod
+    def exact_execution_requirements(
+        required_account_count: int,
+        account_results: list[dict[str, Any]],
+        deliverable_job_count: int,
+        concurrency: dict[str, int],
+    ) -> dict[str, Any]:
+        eligible = [row for row in account_results if row.get("eligible")]
+        unavailable = [
+            {"account_id": str(row.get("account_id")), "reasons": list(row.get("blockers") or [])}
+            for row in account_results if not row.get("eligible")
+        ]
+        mismatches = {key: int(value) for key, value in concurrency.items() if int(value) < int(required_account_count)}
+        blockers: list[str] = []
+        if len(eligible) < required_account_count:
+            blockers.append("requested_accounts_exceed_eligible")
+        if deliverable_job_count < required_account_count:
+            blockers.append("exact_round_claimable_jobs_insufficient")
+        if mismatches:
+            blockers.append("requested_accounts_exceed_runtime_capacity")
+        return {
+            "required_account_count": required_account_count,
+            "eligible_account_count": len(eligible),
+            "atomically_claimable_account_count": min(len(eligible), deliverable_job_count),
+            "unavailable_accounts": unavailable,
+            "concurrency_mismatches": mismatches,
+            "blocking_reasons": blockers,
+            "ready": bool(required_account_count and not blockers),
         }
 
     def validation_hash(self, validation: dict[str, Any]) -> str:
-        return _stable_hash(validation)
+        campaign_id = str(validation.get("campaign_id") or "")
+        if not campaign_id:
+            return _stable_hash({key: value for key, value in validation.items() if key != "validation_hash"})
+        canonical = self.build_canonical_campaign_configuration(campaign_id)
+        revision = self.repository.get_latest_configuration_revision(campaign_id, {"approved", "active"})
+        snapshot = self.repository.get_latest_configuration_snapshot(campaign_id)
+        manifest = self.repository.get_confirmed_manifest_for_campaign(campaign_id)
+        return _stable_hash({
+            "campaign_id": campaign_id,
+            "configuration_hash": canonical["configuration_hash"],
+            "configuration_revision_id": (revision or {}).get("revision_id"),
+            "execution_snapshot_id": (snapshot or {}).get("snapshot_id"),
+            "recipient_set_fingerprint": canonical["recipient_set_fingerprint"],
+            "manifest_hash": (manifest or {}).get("manifest_hash"),
+        })
 
-    def validate_campaign_recipient_authorization(self, campaign_id: str, dry_run: bool = False) -> dict[str, Any]:
+    def validate_campaign_recipient_authorization(
+        self,
+        campaign_id: str,
+        execution_mode: str = REAL_SEND,
+    ) -> dict[str, Any]:
+        resolved_execution_mode = self._resolve_execution_mode(execution_mode, "campaign_authorization_validation")
+        simulation = resolved_execution_mode != REAL_SEND
         jobs = self.repository.list_jobs(status=None, account_id=None, campaign_id=campaign_id, limit=10000, offset=0)
         queued = [job for job in jobs if job.get("status") == "queued"]
         blocking_jobs: list[dict[str, Any]] = []
@@ -1692,7 +3509,7 @@ class CommercialQueueService:
         unauthorized = 0
         synthetic = 0
         revoked = 0
-        dry_run_eligible = 0
+        simulation_eligible = 0
         live_eligible = 0
         for job in queued:
             details = self.repository.get_job_with_recipient(str(job["id"])) or job
@@ -1722,18 +3539,18 @@ class CommercialQueueService:
                     "synthetic_test_data": is_synth,
                     "blocking_reasons": reasons,
                 })
-            dry_run_eligible += 1
+            simulation_eligible += 1
         return {
             "total_queued_jobs": len(queued),
             "live_authorized_job_count": live_authorized,
             "unauthorized_job_count": unauthorized,
             "synthetic_test_job_count": synthetic,
             "revoked_authorization_job_count": revoked,
-            "dry_run_eligible_job_count": dry_run_eligible,
+            "simulation_eligible_job_count": simulation_eligible,
             "live_eligible_job_count": live_eligible,
-            "blocking_jobs": [] if dry_run else blocking_jobs,
-            "blocking_reasons": [] if dry_run or not blocking_jobs else ["live_recipient_authorization_required"],
-            "dry_run_only": bool(dry_run),
+            "blocking_jobs": [] if simulation else blocking_jobs,
+            "blocking_reasons": [] if simulation or not blocking_jobs else ["live_recipient_authorization_required"],
+            "simulation_only": simulation,
         }
 
     def _require_transition(self, campaign: dict[str, Any], allowed_from: set[str], target: str) -> None:
@@ -1791,37 +3608,37 @@ class CommercialQueueService:
         if summary["deliverable_job_count"] <= 0:
             raise CampaignLifecycleError("campaign_has_no_deliverable_jobs", "Campaign has no deliverable jobs", summary)
 
-        authorization = self.validate_campaign_recipient_authorization(campaign_id, dry_run=False)
+        authorization = self.validate_campaign_recipient_authorization(campaign_id)
         if authorization["unauthorized_job_count"] > 0 or authorization["synthetic_test_job_count"] > 0 or authorization["revoked_authorization_job_count"] > 0:
             self._queue_block("authorization_incomplete", "All queueable recipients require live authorization before queueing", {"recipient_authorization": authorization})
         if not summary["ok"]:
             self._queue_block("validation_not_ok", "Campaign validation is not ok", {"validation": summary, "validation_hash": validation_hash})
 
-        dry_run_id = str(payload.get("dry_run_id") or payload.get("check_id") or "").strip()
-        if not dry_run_id:
-            self._queue_block("dry_run_evidence_missing", "Dry-run/check-without-sending evidence is required before queueing", {"campaign": campaign})
-        dry_run = self._get_dry_run_audit_record(campaign_id, dry_run_id)
-        if dry_run is None or dry_run.get("status") != "completed" or bool(dry_run.get("forbidden_mutation_detected")):
-            self._queue_block("dry_run_evidence_missing", "Completed dry-run/check-without-sending evidence was not found", {"dry_run_id": dry_run_id})
-        dry_diagnostics = self._json_field(dry_run.get("diagnostics_json"), {})
-        dry_validation = dry_diagnostics.get("validation") if isinstance(dry_diagnostics.get("validation"), dict) else {}
-        if self.validation_hash(dry_validation) != validation_hash or dry_diagnostics.get("confirmed_manifest_id") != manifest.get("manifest_id"):
-            self._queue_block("dry_run_evidence_stale", "Dry-run/check evidence no longer matches current campaign state", {"dry_run_id": dry_run_id, "validation_hash": validation_hash})
-
         final_review_hash = str(payload.get("final_review_hash") or "").strip()
         if not final_review_hash:
             self._queue_block("final_review_missing", "Final-review hash is required before queueing", {"campaign": campaign})
-        final_review = self.final_review(campaign_id)
-        if final_review.get("final_review_hash") != final_review_hash:
-            self._queue_block("final_review_stale", "Final-review hash no longer matches current campaign state", {"expected": final_review.get("final_review_hash"), "provided": final_review_hash})
-        if not final_review.get("validation", {}).get("ok"):
-            self._queue_block("final_review_missing", "Final review has blocking validation errors", {"final_review": final_review})
+        review_token = str(payload.get("review_token") or "").strip()
+        if not review_token:
+            self._queue_block("final_review_proof_missing", "Persisted final-review proof is required before queueing", {"campaign_id": campaign_id})
+        persisted_review = self.repository.get_campaign_final_review(campaign_id, review_token)
+        if persisted_review is None:
+            self._queue_block("final_review_proof_missing", "Persisted final-review proof was not found", {"campaign_id": campaign_id, "review_token": review_token})
+        if not bool(persisted_review.get("approved")):
+            self._queue_block("final_review_not_approved", "Persisted final review contains blocking errors", {"review": persisted_review})
+        if persisted_review.get("final_review_hash") != final_review_hash:
+            self._queue_block("final_review_stale", "Persisted final-review proof does not match the submitted hash", {"persisted": persisted_review.get("final_review_hash"), "provided": final_review_hash})
+        final_review = self.final_review(campaign_id, explicit_operator_confirmation=False)
+        if final_review.get("final_review_hash") != final_review_hash or final_review.get("review_token") != review_token:
+            self._queue_block("final_review_stale", "Final-review proof no longer matches current campaign state", {"expected": final_review.get("final_review_hash"), "provided": final_review_hash})
+        if final_review.get("approved") is not True:
+            self._queue_block("final_review_not_approved", "Final review has blocking validation errors", {"final_review": final_review})
         if (final_review.get("confirmed_recipients_summary") or {}).get("manifest_hash") != manifest.get("manifest_hash"):
             self._queue_block("manifest_stale", "Final-review manifest hash does not match the current confirmed manifest", {"final_review": final_review, "confirmed_manifest": manifest})
 
         effective_limit = int((final_review.get("limits") or {}).get("max_jobs_per_execution") or (final_review.get("limits") or {}).get("deliveries_per_round") or summary["deliverable_job_count"])
-        if summary["deliverable_job_count"] > effective_limit:
-            self._queue_block("limit_exceeded", "Deliverable recipient count exceeds the effective queue limit", {"deliverable_job_count": summary["deliverable_job_count"], "effective_limit": effective_limit})
+        # This limit governs each execution round/batch, not whether the whole
+        # campaign may enter the queue. Workers consume the queued campaign in
+        # bounded rounds using this value.
         approval_id = str(payload.get("approval_id") or "").strip()
         approval = self.get_live_execution_approval(approval_id) if approval_id else None
         if approval is not None and approval.get("final_review_hash") != final_review_hash:
@@ -1831,7 +3648,6 @@ class CommercialQueueService:
             "campaign": campaign,
             "validation": {**summary, "validation_hash": validation_hash},
             "confirmed_manifest": manifest,
-            "dry_run": dry_run,
             "final_review": final_review,
             "approval": approval,
             "authorized_recipient_count": int(authorization.get("live_authorized_job_count") or 0),
@@ -1843,9 +3659,52 @@ class CommercialQueueService:
 
     def queue_campaign(self, campaign_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         request = payload or {}
+        existing = self.repository.get_campaign(campaign_id)
+        if existing and existing.get("status") == "queued":
+            legacy_unbound = not any([
+                existing.get("queue_idempotency_key"),
+                existing.get("queued_review_token"),
+                existing.get("queued_final_review_hash"),
+            ])
+            if legacy_unbound:
+                persisted = self.repository.get_campaign_final_review(campaign_id, str(request.get("review_token") or ""))
+                if (
+                    persisted
+                    and bool(persisted.get("approved"))
+                    and str(persisted.get("final_review_hash") or "") == str(request.get("final_review_hash") or "")
+                    and request.get("idempotency_key")
+                ):
+                    existing = self.repository.update_campaign(campaign_id, {
+                        "queue_idempotency_key": request.get("idempotency_key"),
+                        "queued_review_token": request.get("review_token"),
+                        "queued_final_review_hash": request.get("final_review_hash"),
+                    })
+            same_request = (
+                str(existing.get("queue_idempotency_key") or "") == str(request.get("idempotency_key") or "")
+                and str(existing.get("queued_review_token") or "") == str(request.get("review_token") or "")
+                and str(existing.get("queued_final_review_hash") or "") == str(request.get("final_review_hash") or "")
+            )
+            if not same_request:
+                self._queue_block("duplicate_queue_request", "Campaign is already queued with different proof or idempotency key", {"campaign": existing})
+            return {
+                "queued": True,
+                "execution_started": False,
+                "campaign": existing,
+                "idempotency": {"key": request.get("idempotency_key"), "status": "reused"},
+            }
         evidence = self._validate_queue_request(campaign_id, request)
         self.repository.requeue_campaign_assigned_jobs(campaign_id)
-        campaign = self.repository.update_campaign(campaign_id, {"status": "queued"})
+        campaign = self.repository.update_campaign(campaign_id, {
+            "status": "queued",
+            "lifecycle_stage": "queued",
+            "queue_idempotency_key": evidence["idempotency_key"],
+            "queued_review_token": request.get("review_token"),
+            "queued_final_review_hash": request.get("final_review_hash"),
+        })
+        logger.info(
+            "[CAMPAIGN_TRANSITION] campaign_id=%s from=draft to=queued result=success",
+            campaign_id,
+        )
         return {
             "queued": True,
             "execution_started": False,
@@ -1864,15 +3723,73 @@ class CommercialQueueService:
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
+        if campaign.get("status") == "running":
+            return {"campaign": campaign, "validation": self.validate_campaign_start(campaign_id), "idempotency": {"status": "reused"}}
         self._require_transition(campaign, {"queued", "paused"}, "running")
+        settings = self.get_global_settings()
+        if self.scheduler_runtime_required:
+            if not bool(settings.get("live_campaign_execution_enabled")):
+                raise CampaignLifecycleError(
+                    "live_campaign_execution_disabled",
+                    "Global live campaign execution is disabled",
+                    {
+                        "global_live_execution_enabled": False,
+                        "campaign_execution_authorized": bool(campaign.get("queued_review_token")),
+                        "dry_run": False,
+                    },
+                )
+            runtime = self.scheduler_runtime
+            if runtime is None or not runtime.is_alive():
+                runtime_status = runtime.status() if runtime is not None else {"scheduler_runtime_status": "missing"}
+                raise CampaignLifecycleError(
+                    "scheduler_runtime_unavailable",
+                    "Scheduler background runtime is not healthy",
+                    runtime_status,
+                )
+            if self.repository.get_scheduler_state().get("scheduler_status") != "running":
+                raise CampaignLifecycleError(
+                    "scheduler_runtime_unavailable",
+                    "Scheduler is not configured as enabled",
+                    self.scheduler_status(),
+                )
+            if not campaign.get("queued_review_token") or not campaign.get("queued_final_review_hash"):
+                raise CampaignLifecycleError(
+                    "campaign_execution_not_authorized",
+                    "Campaign queue proof is missing",
+                    {"campaign_id": campaign_id},
+                )
         summary = self.validate_campaign_start(campaign_id)
         if not summary["ok"]:
             code = summary["blocking_reasons"][0] if summary["blocking_reasons"] else "invalid_campaign_transition"
             raise CampaignLifecycleError(code, "Campaign cannot start", summary)
-        updates = {"status": "running"}
+        # Exact-N allocation bounds the initial Start. Subsequent scheduler
+        # ticks keep the same per-round, one-active-job-per-account claim
+        # invariant; they must not inherit a process-memory lifetime token
+        # from a prior round and silently stop a still-running campaign.
+        requested_account_count = int(
+            (self.repository.get_campaign_capacity_reservation(campaign_id) or {}).get("requested_account_count")
+            or (self.repository.get_campaign_capacity_reservation(campaign_id) or {}).get("allocated_account_count")
+            or 0
+        )
+        # The first scheduler tick atomically claims exactly N accounts/jobs.
+        # Once that succeeds the campaign returns to the ordinary dynamic AUTO
+        # pool, where it may safely run below N while seeking replacements.
+        updates = {
+            "status": "running",
+            "lifecycle_stage": "initializing_capacity" if requested_account_count else "running",
+        }
         if not campaign.get("started_at"):
             updates["started_at"] = utc_now()
-        return {"campaign": self.repository.update_campaign(campaign_id, updates), "validation": summary}
+        updated = self.repository.update_campaign(campaign_id, updates)
+        if self.scheduler_runtime_required and not self.scheduler_runtime.wake(campaign_id):
+            self.repository.update_campaign(campaign_id, {"status": "queued", "lifecycle_stage": "blocked_runtime"})
+            raise CampaignLifecycleError("scheduler_runtime_unavailable", "Scheduler could not be signalled", self.scheduler_status())
+        logger.info(
+            "[CAMPAIGN_TRANSITION] campaign_id=%s from=%s to=running result=success",
+            campaign_id,
+            campaign.get("status"),
+        )
+        return {"campaign": updated, "validation": summary}
 
     def pause_campaign(self, campaign_id: str) -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id)
@@ -1880,7 +3797,12 @@ class CommercialQueueService:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
         self._require_transition(campaign, {"running"}, "paused")
         requeued = self.repository.requeue_campaign_assigned_jobs(campaign_id)
-        return {"campaign": self.repository.update_campaign(campaign_id, {"status": "paused", "paused_at": utc_now()}), "requeued_assigned_count": requeued}
+        updated = self.repository.update_campaign(campaign_id, {"status": "paused", "lifecycle_stage": "paused", "paused_at": utc_now()})
+        logger.info(
+            "[CAMPAIGN_TRANSITION] campaign_id=%s from=running to=paused result=success",
+            campaign_id,
+        )
+        return {"campaign": updated, "requeued_assigned_count": requeued}
 
     def resume_campaign(self, campaign_id: str) -> dict[str, Any]:
         return self.start_campaign(campaign_id)
@@ -1891,12 +3813,18 @@ class CommercialQueueService:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
         self._require_transition(campaign, {"draft", "queued", "running", "paused"}, "cancelled")
         cancelled = self.repository.cancel_campaign_pending_jobs(campaign_id)
-        return {"campaign": self.repository.update_campaign(campaign_id, {"status": "cancelled", "completed_at": utc_now()}), "cancelled_job_count": cancelled}
+        updated = self.repository.update_campaign(campaign_id, {"status": "cancelled", "lifecycle_stage": "cancelled", "completed_at": utc_now()})
+        self.repository.release_campaign_capacity_reservation(campaign_id, "campaign_cancelled")
+        return {"campaign": updated, "cancelled_job_count": cancelled}
 
     def complete_campaign_if_finished(self, campaign_id: str) -> dict[str, Any] | None:
-        return self.repository.maybe_complete_campaign(campaign_id)
+        completed = self.repository.maybe_complete_campaign(campaign_id)
+        if completed and str(completed.get("status")) == "completed":
+            self.repository.release_campaign_capacity_reservation(campaign_id, "campaign_completed")
+        return completed
 
     def run_campaign_dry_round(self, campaign_id: str) -> dict[str, Any]:
+        self._resolve_execution_mode("simulation", "run_campaign_dry_round")
         return self.check_campaign_without_sending(campaign_id, source_endpoint="/automation/campaigns/{campaign_id}/run-dry-round")
 
     def check_campaign_without_sending(self, campaign_id: str, source_endpoint: str = "/automation/campaigns/{campaign_id}/check-without-sending") -> dict[str, Any]:
@@ -1905,7 +3833,7 @@ class CommercialQueueService:
             raise CampaignLifecycleError("campaign_not_found", f"Campaign not found: {campaign_id}")
         before = self._dry_run_mutation_counts(campaign_id)
         validation = self.validate_campaign_start(campaign_id)
-        readiness = self.validate_campaign_recipient_authorization(campaign_id, dry_run=True)
+        readiness = self.validate_campaign_recipient_authorization(campaign_id, execution_mode="simulation")
         manifest = self.repository.get_confirmed_manifest_for_campaign(campaign_id)
         configuration = self.resolve_campaign_configuration(campaign_id)
         diagnostics = {
@@ -2063,7 +3991,7 @@ class CommercialQueueService:
                     "created_at": contact.get("created_at"),
                 },
                 "api_endpoint": api_endpoint,
-                "service_method": "CommercialQueueService.run_campaign_dry_round -> scheduler_run_once(dry_run=True) -> run_account_round(dry_run=True)",
+                "service_method": "CommercialQueueService.run_campaign_dry_round -> simulation",
                 "repository_call": "BaleContactStore.get_or_create_bale_contact",
                 "dry_run_request_id": sorted(dry_run_request_ids),
                 "ui_action": ui_action,
@@ -2078,8 +4006,7 @@ class CommercialQueueService:
                     ui_action,
                     api_endpoint,
                     "CommercialQueueService.run_campaign_dry_round",
-                    "CommercialQueueService.scheduler_run_once(dry_run=True)",
-                    "CommercialQueueService.run_account_round(dry_run=True)",
+                    "CommercialQueueService.run_campaign_dry_round(execution_mode=simulation)",
                     "CommercialQueueService._execute_plan",
                     "bale_plugin.forward_latest_channel_message",
                     "bale_plugin.save_bale_contact",
@@ -2551,7 +4478,10 @@ class CommercialQueueService:
                 errors.append({"error_code": "approval_scope_invalid", "recipient_id": recipient.get("id")})
         scenario_rows = self.repository.list_campaign_recipient_report_rows(campaign_id, 100000, 0)
         manifest_count = int((manifest or {}).get("recipient_count") or 0)
-        scenario_required = bool(platform_settings or isinstance(resolved_configuration.get("platforms"), dict) or scenario_rows)
+        # Recipient scenarios belong to the explicit per-recipient scenario path.
+        # A normal campaign queue is already materialized as delivery jobs and must
+        # not be rejected merely because no scenario rows were requested.
+        scenario_required = bool(scenario_rows)
         if scenario_required:
             if manifest_count and len(scenario_rows) != manifest_count:
                 errors.append({"error_code": "recipient_scenario_scope_incomplete", "field": "recipient_scenarios", "expected": manifest_count, "actual": len(scenario_rows)})
@@ -2560,24 +4490,45 @@ class CommercialQueueService:
                     errors.append({"error_code": "platform_run_scope_mismatch", "campaign_recipient_run_id": row.get("campaign_recipient_run_id")})
         return errors
 
-    def final_review(self, campaign_id: str) -> dict[str, Any]:
+    def final_review(
+        self,
+        campaign_id: str,
+        explicit_operator_confirmation: bool = True,
+        approved_by: str = "campaign_operator",
+    ) -> dict[str, Any]:
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
             raise KeyError(campaign_id)
+        if explicit_operator_confirmation:
+            artifacts = self.ensure_campaign_execution_artifacts(campaign_id, approved_by)
+        else:
+            canonical = self.build_canonical_campaign_configuration(campaign_id)
+            artifacts = {
+                **canonical,
+                "revision": self.repository.get_latest_configuration_revision(campaign_id, {"approved", "active"}),
+                "snapshot": self.repository.get_latest_configuration_snapshot(campaign_id),
+            }
         manifests = self.repository.list_recipient_input_manifests(campaign_id)
         manifest = self._latest_confirmed_manifest(campaign_id)
-        configuration = self.resolve_campaign_configuration(campaign_id)
-        revision = self.repository.get_latest_configuration_revision(campaign_id, {"approved", "active"})
-        snapshot = self.repository.get_latest_configuration_snapshot(campaign_id)
+        revision = artifacts.get("revision")
+        snapshot = artifacts.get("snapshot")
+        resolved_configuration = artifacts["configuration"]
+        configuration = {
+            "campaign_id": campaign_id,
+            "configuration": resolved_configuration,
+            "configuration_hash": artifacts["configuration_hash"],
+            "resolved_configuration": resolved_configuration,
+            "resolved_configuration_hash": artifacts["configuration_hash"],
+            "validation": {"ok": bool(revision and snapshot), "errors": [] if revision and snapshot else [{"error_code": "configuration_artifacts_missing"}]},
+        }
         recipients = self.repository.list_recipients(campaign_id, None, 10000, 0)
         jobs = self.repository.list_campaign_jobs_all(campaign_id)
-        resolved_configuration = configuration.get("resolved_configuration", {})
         selected_platforms = self._selected_platforms_from_configuration(resolved_configuration)
         platform_settings = self._platform_settings_from_configuration(resolved_configuration)
         source = resolved_configuration.get("source", {})
         accounts = configuration.get("resolved_configuration", {}).get("accounts", {})
         delivery = configuration.get("resolved_configuration", {}).get("delivery", {})
-        timing = configuration.get("resolved_configuration", {}).get("timing", {})
+        timing = configuration.get("resolved_configuration", {}).get("schedule", {})
         scenario_rows = self.repository.list_campaign_recipient_report_rows(campaign_id, 100000, 0)
         platform_run_count = sum(len(row.get("selected_platforms") or []) for row in scenario_rows)
         source_summary = {
@@ -2603,7 +4554,13 @@ class CommercialQueueService:
             "verified_count": sum(1 for recipient in recipients if bool(recipient.get("bale_contact_verified"))),
             "unverified_count": sum(1 for recipient in recipients if not bool(recipient.get("bale_contact_verified"))),
         }
+        start_validation = self.validate_campaign_start(campaign_id)
         validation_errors = self._approval_validation_errors(campaign_id, configuration, manifest, snapshot)
+        validation_errors.extend(
+            {"error_code": reason, "field": "campaign"}
+            for reason in start_validation.get("blocking_reasons", [])
+            if not any(error.get("error_code") == reason for error in validation_errors)
+        )
         validation = {
             "ok": not validation_errors,
             "errors": validation_errors,
@@ -2632,7 +4589,7 @@ class CommercialQueueService:
             "configuration_hash": configuration.get("resolved_configuration_hash"),
         }
         final_review_hash = _configuration_hash(hash_payload)
-        return {
+        review = {
             "campaign_id": campaign_id,
             "read_only": True,
             "campaign_summary": {
@@ -2676,6 +4633,47 @@ class CommercialQueueService:
             "final_review_hash": final_review_hash,
             "hash_payload": hash_payload,
             "live_execution_enabled": False,
+        }
+        campaign_version = str(campaign.get("updated_at") or campaign.get("created_at") or "")
+        validation_hash = self.validation_hash(start_validation)
+        persisted = self.repository.persist_campaign_final_review({
+            "campaign_id": campaign_id,
+            "campaign_version": campaign_version,
+            "validation_hash": validation_hash,
+            "final_review_hash": final_review_hash,
+            "approved": not validation_errors,
+            "blocking_errors": validation_errors,
+            "review": review,
+        })
+        field_labels = {
+            "configuration_revision_id": "نسخه تأییدشده تنظیمات",
+            "execution_snapshot_id": "نسخه اجرایی تنظیمات",
+            "campaign": "کمپین",
+            "recipient_manifest_id": "فهرست مخاطبان",
+            "source": "منبع پیام",
+            "recipient_scenarios": "سناریوهای مخاطبان",
+        }
+        blocking_errors = [
+            {**error, "field_label_fa": field_labels.get(str(error.get("field")), str(error.get("field") or "کمپین"))}
+            for error in validation_errors
+        ]
+        return {
+            **review,
+            "ok": not blocking_errors,
+            "approved": not blocking_errors,
+            "has_blocking_errors": bool(blocking_errors),
+            "blocking_errors": blocking_errors,
+            "blocking_reasons": [str(error.get("error_code")) for error in blocking_errors],
+            "warnings": validation.get("warnings") or [],
+            "validation_hash": validation_hash,
+            "review_token": persisted.get("review_token"),
+            "campaign_version": campaign_version,
+            "recipient_count": len(recipients),
+            "deliverable_job_count": int(start_validation.get("deliverable_job_count") or 0),
+            "job_count": len(jobs),
+            "eligible_account_count": int(start_validation.get("eligible_account_count") or 0),
+            "effective_policy": resolved_configuration,
+            "required_acknowledgements": ["explicit_operator_confirmation"],
         }
 
     def _snapshot_configuration(self, snapshot: dict[str, Any] | None) -> dict[str, Any]:
@@ -2857,6 +4855,7 @@ class CommercialQueueService:
         selected_platforms: list[str] | None,
         allow_retry_state: bool = False,
     ) -> dict[str, Any]:
+        self._resolve_execution_mode(mode, "controlled_execution")
         if mode not in {"mock_only", CONTROLLED_LIVE_NO_SEND_MODE}:
             raise CampaignLifecycleError("controlled_execution_disabled", "Controlled execution defaults to disabled and only mock_only or explicitly gated no-send mode are allowed", {"mode": mode})
         if not idempotency_key:
@@ -3102,6 +5101,74 @@ class CommercialQueueService:
             })
         return applied
 
+    def reconcile_uncertain_delivery_result(self, job_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Apply a later verified outcome for an ambiguous post-send job.
+
+        A `confirm_uncertain` failure is never eligible for automatic retry.
+        This is the sole path that can close that manual-review state after a
+        delivery provider supplies a durable, idempotent verification proof.
+        It intentionally does not mark the failed sender healthy again: a
+        recipient delivery proof says nothing about that account's session.
+        """
+        job = self.repository.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        normalized = dict(result)
+        trusted_result_key = str(normalized.get("trusted_result_key") or normalized.get("remote_message_id") or "").strip()
+        if not trusted_result_key:
+            raise CampaignLifecycleError(
+                "uncertain_delivery_reconciliation_proof_required",
+                "A durable provider result key is required to reconcile uncertain delivery",
+                {"job_id": job_id},
+            )
+        normalized["trusted_result_key"] = trusted_result_key
+        normalized["outcome"] = str(normalized.get("outcome") or "sent")
+        normalized["reconciliation_verified"] = True
+        normalized["reconciliation_source"] = str(normalized.get("reconciliation_source") or "external_delivery_reconciliation")
+        if normalized["outcome"] != "sent":
+            raise CampaignLifecycleError(
+                "uncertain_delivery_reconciliation_requires_verified_send",
+                "Uncertain delivery reconciliation may close a job only with verified send evidence",
+                {"job_id": job_id, "outcome": normalized["outcome"]},
+            )
+        already_applied = bool(job.get("result_applied_at"))
+        if not already_applied and not (
+            str(job.get("status") or "") == "failed"
+            and str(job.get("last_error_code") or "") == "confirm_uncertain"
+            and bool(job.get("manual_review_required"))
+        ):
+            raise CampaignLifecycleError(
+                "uncertain_delivery_reconciliation_not_allowed",
+                "Only confirm_uncertain manual-review jobs may be reconciled",
+                {"job_id": job_id, "status": job.get("status"), "last_error_code": job.get("last_error_code")},
+            )
+        applied = self.repository.apply_trusted_worker_result(job_id, normalized)
+        job_after = applied.get("job") or {}
+        if applied.get("applied"):
+            account_id = str(job_after.get("account_id") or "")
+            if account_id:
+                self.repository.increment_account_sent_counts(account_id)
+            self.repository.create_job_event({
+                "job_id": job_id,
+                "campaign_id": job_after.get("campaign_id"),
+                "account_id": job_after.get("account_id"),
+                "recipient_id": job_after.get("recipient_id"),
+                "event_type": "uncertain_delivery_reconciliation_verified",
+                "component": "delivery_reconciliation",
+                "step_name": "reconcile_uncertain_delivery_result",
+                "status": job_after.get("status") or "succeeded",
+                "message": "Verified external delivery proof closed an uncertain job without retry",
+                "platform": job_after.get("platform"),
+                "diagnostics": {
+                    "trusted_result_key": trusted_result_key,
+                    "remote_message_id": normalized.get("remote_message_id"),
+                    "reconciliation_source": normalized["reconciliation_source"],
+                    "outcome": normalized["outcome"],
+                    "applied": True,
+                },
+            })
+        return applied
+
     def run_controlled_live_no_send_worker(
         self,
         account_id: str,
@@ -3109,6 +5176,7 @@ class CommercialQueueService:
         max_jobs: int | None = 1,
         runtime_session: Any | None = None,
     ) -> dict[str, Any]:
+        self._resolve_execution_mode(CONTROLLED_LIVE_NO_SEND_MODE, "controlled_live_no_send_worker")
         assignment = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
         processed: list[dict[str, Any]] = []
         for job_id in assignment.get("assigned_job_ids") or []:
@@ -3128,7 +5196,7 @@ class CommercialQueueService:
                     "phone": str(plan.get("phone") or plan.get("phone_normalized") or running.get("phone_normalized")),
                     "display_name": str(plan.get("display_name") or running.get("display_name") or ""),
                     "source_channel_uid": str(plan.get("source_channel_uid") or (plan.get("source") or {}).get("source_uid") or running.get("source_channel_uid") or ""),
-                    "dry_run": False,
+                    "execution_mode": CONTROLLED_LIVE_NO_SEND_MODE,
                     "adapter_mode": CONTROLLED_LIVE_NO_SEND_MODE,
                 }
             )
@@ -3160,6 +5228,7 @@ class CommercialQueueService:
         results_by_job_id: dict[str, dict[str, Any]],
         max_jobs: int | None = None,
     ) -> dict[str, Any]:
+        self._resolve_execution_mode("mock_only", "controlled_mock_worker")
         assignment = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
         processed: list[dict[str, Any]] = []
         for job_id in assignment.get("assigned_job_ids") or []:
@@ -3325,7 +5394,7 @@ class CommercialQueueService:
         campaign = self.repository.get_campaign(campaign_id)
         if campaign is None:
             raise KeyError(campaign_id)
-        items = build_preview_items(rows, self.repository.get_campaign_phone_map(campaign_id))
+        items = build_preview_items(rows, self.repository.get_campaign_phone_state_map(campaign_id))
         batch = self.repository.create_import_batch(
             campaign_id=campaign_id,
             import_source=import_source,
@@ -3411,6 +5480,29 @@ class CommercialQueueService:
             item for item in self.repository.list_import_items(batch_id, validation_status="valid", limit=10000, offset=0)
             if bool(item.get("selected_for_import")) and (not selected_item_ids or item["id"] in set(selected_item_ids))
         ]
+        for item in selected_items:
+            phone = str(item.get("phone_normalized") or "")
+            stable_name = ""
+            existing_mapping = None
+            try:
+                existing_mapping = self.contact_store.get_platform_contact("bale", phone)
+                mapping = self.repository.get_or_create_stable_contact_mapping(phone, (existing_mapping or {}).get("display_name"))
+                stable_name = str(mapping["stable_display_name"])
+                self.contact_store.ensure_stable_mapping(phone, stable_name)
+            except BaleContactError as exc:
+                masked = f"{phone[:4]}****{phone[-3:]}" if len(phone) >= 8 else "***"
+                raise CampaignLifecycleError(
+                    exc.error_code,
+                    str(exc),
+                    {
+                        "batch_id": batch_id,
+                        "row_number": item.get("row_number"),
+                        "phone_masked": masked,
+                        "stable_display_name": stable_name or (existing_mapping or {}).get("display_name"),
+                    },
+                ) from exc
+            self.repository.set_import_item_stable_mapping(str(item["id"]), stable_name)
+            item["display_name"] = stable_name
         manifest = self.repository.create_recipient_input_manifest(
             campaign_id=str(batch["campaign_id"]),
             phones=[str(item["phone_normalized"]) for item in selected_items if item.get("phone_normalized")],
@@ -3432,7 +5524,7 @@ class CommercialQueueService:
             "authorization_status": "authorized" if authorize_for_live_execution else "authorization_required",
             "should_not_retry": False,
         }
-        return self.repository.confirm_import_batch(
+        result = self.repository.confirm_import_batch(
             batch_id=batch_id,
             include_valid=include_valid,
             selected_item_ids=selected_item_ids,
@@ -3441,6 +5533,9 @@ class CommercialQueueService:
             authorization=auth_payload,
             manifest=manifest,
         )
+        if int(result.get("created_recipient_count") or 0) > 0:
+            self.repository.update_campaign(str(batch["campaign_id"]), {"lifecycle_stage": "recipients_imported"})
+        return result
 
     def delete_import_batch(self, batch_id: str) -> dict[str, Any]:
         return self.repository.delete_import_batch(batch_id)
@@ -3783,7 +5878,13 @@ class CommercialQueueService:
             "should_not_retry": bool(recipient.get("should_not_retry")),
         }
 
-    def validate_live_recipient_authorization(self, job: dict[str, Any], job_details: dict[str, Any] | None = None, dry_run: bool = False) -> dict[str, Any]:
+    def validate_live_recipient_authorization(
+        self,
+        job: dict[str, Any],
+        job_details: dict[str, Any] | None = None,
+        execution_mode: str = REAL_SEND,
+    ) -> dict[str, Any]:
+        resolved_execution_mode = self._resolve_execution_mode(execution_mode, "recipient_authorization_validation")
         details = job_details or self.repository.get_job_with_recipient(str(job["id"])) or job
         recipient_id = str(details.get("recipient_id") or job.get("recipient_id") or "")
         if str(job.get("recipient_id") or "") != recipient_id:
@@ -3792,8 +5893,8 @@ class CommercialQueueService:
         job_phone = str(job.get("phone_normalized") or details.get("phone_normalized") or "")
         if recipient_phone and job_phone and recipient_phone != job_phone:
             return self._authorization_failure(job, details, "recipient_phone_mismatch")
-        if dry_run:
-            return {"ok": True, "dry_run_only": True, "authorization": self._authorization_from_details(details)}
+        if resolved_execution_mode != REAL_SEND:
+            return {"ok": True, "simulation_only": True, "authorization": self._authorization_from_details(details)}
         provenance_status = str(details.get("recipient_input_provenance_status") or details.get("input_provenance_status") or "")
         manifest_id = details.get("recipient_input_manifest_id") or details.get("input_manifest_id")
         manifest_hash_value = details.get("recipient_input_manifest_hash") or details.get("input_manifest_hash")
@@ -3818,7 +5919,7 @@ class CommercialQueueService:
             and not bool(auth["synthetic_test_data"])
             and str(auth["authorization_status"]) == "authorized"
         ):
-            return {"ok": True, "dry_run_only": False, "authorization": auth}
+            return {"ok": True, "simulation_only": False, "authorization": auth}
         return self._authorization_failure(job, details, "live_recipient_authorization_required")
 
     def validate_job_queue_and_claim_eligibility(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -3831,7 +5932,7 @@ class CommercialQueueService:
             return {"ok": False, "error_code": "recipient_live_execution_blocked"}
         if bool(details.get("should_not_retry")) or bool(details.get("recipient_should_not_retry")):
             return {"ok": False, "error_code": "recipient_should_not_retry"}
-        auth = self.validate_live_recipient_authorization(job, details, dry_run=False)
+        auth = self.validate_live_recipient_authorization(job, details)
         if not auth.get("ok"):
             return {"ok": False, "error_code": auth.get("error_code") or auth.get("reason") or "recipient_provenance_unknown", "details": auth}
         return {"ok": True}
@@ -3882,6 +5983,7 @@ class CommercialQueueService:
         return {"items": self.repository.list_events(job_id, campaign_id, account_id, limit, offset), "limit": limit, "offset": offset}
 
     def worker_status(self, account_id: str) -> dict[str, Any]:
+        reconciliation = self.reconcile_worker_state(account_id)
         effective = self.resolve_account_settings(account_id)
         lock = self.repository.get_worker_lock(account_id)
         active_job = self.repository.get_active_job_for_account(account_id)
@@ -3900,7 +6002,94 @@ class CommercialQueueService:
             "last_job_completed_at": effective["last_job_completed_at"],
             "last_error_code": effective["last_error_code"],
             "last_error_message": effective["last_error_message"],
+            "reconciliation": reconciliation,
         }
+
+    def reconcile_worker_state(self, account_id: str) -> dict[str, Any]:
+        """Derive persisted worker state from live lock, round, job, session, and cooldown ownership."""
+        settings = self.repository.get_account_settings(account_id)
+        if settings is None:
+            return {"account_id": account_id, "changed": False, "reason": "account_settings_missing"}
+        lock = self.repository.get_worker_lock(account_id)
+        active_job = self.repository.get_active_job_for_account(account_id)
+        session = self.runtime_session_manager.get_session_diagnostics(account_id)
+        with self._active_worker_rounds_lock:
+            local_round = dict(self._active_worker_rounds.get(account_id) or {}) or None
+        cooldown_until = parse_time(settings.get("cooldown_until"))
+        now = datetime.now(timezone.utc)
+        cooldown_active = bool(cooldown_until and cooldown_until > now)
+        lock_active = bool(lock and not self._lock_expired(lock))
+        current_runtime_owner = str(getattr(self.scheduler_runtime, "owner_id", "") or "")
+        lock_owned_by_current_runtime = bool(lock_active and current_runtime_owner and str(lock.get("runtime_owner_id") or "") == current_runtime_owner)
+        lock_process_alive = self._worker_lock_process_alive(lock) if lock_active else False
+        local_round_matches = bool(
+            local_round
+            and lock_active
+            and str(local_round.get("worker_round_id") or "") == str(lock.get("worker_round_id") or "")
+        )
+        live_owner = bool(active_job or session or local_round_matches)
+        changed = False
+        actions: list[str] = []
+        status = str(settings.get("worker_status") or "idle")
+
+        if lock_active and not live_owner:
+            # A foreign runtime may still be alive until its heartbeat/TTL expires.
+            if lock_owned_by_current_runtime or (lock.get("process_id") is not None and not lock_process_alive):
+                self.repository.release_worker_lock(account_id, token=str(lock["lock_token"]))
+                lock_active = False
+                actions.append("stale_lock_released")
+                changed = True
+        elif lock and not lock_active:
+            if self.repository.release_worker_lock(account_id, token=str(lock["lock_token"])):
+                actions.append("expired_lock_released")
+                changed = True
+
+        if not live_owner and not lock_active:
+            requeued = self.repository.requeue_assigned_jobs_for_account(account_id, reason="worker_state_reconciliation")
+            if requeued:
+                actions.append(f"assigned_jobs_requeued:{requeued}")
+                changed = True
+            desired = "cooling_down" if cooldown_active else "idle"
+            if status != desired or (not cooldown_active and settings.get("cooldown_until")):
+                self.repository.update_account_runtime(account_id, {
+                    "worker_status": desired,
+                    "cooldown_until": settings.get("cooldown_until") if cooldown_active else None,
+                })
+                status = desired
+                actions.append(f"worker_status:{desired}")
+                changed = True
+
+        return {
+            "account_id": account_id,
+            "changed": changed,
+            "actions": actions,
+            "canonical_state": "running" if live_owner else "cooldown" if cooldown_active else "idle",
+            "persisted_worker_status": status,
+            "lock_active": lock_active,
+            "lock_owned_by_current_runtime": lock_owned_by_current_runtime,
+            "lock_process_alive": lock_process_alive,
+            "active_round": local_round,
+            "active_job_id": (active_job or {}).get("id"),
+            "active_session": session,
+            "cooldown_active": cooldown_active,
+        }
+
+    @staticmethod
+    def _worker_lock_process_alive(lock: dict[str, Any] | None) -> bool:
+        if not lock or lock.get("process_id") is None:
+            return False
+        try:
+            process_id = int(lock["process_id"])
+            if process_id <= 0:
+                return False
+            os.kill(process_id, 0)
+            return True
+        except (OSError, ProcessLookupError, ValueError, TypeError):
+            return False
+
+    def reconcile_worker_states(self) -> dict[str, Any]:
+        results = [self.reconcile_worker_state(str(row["account_id"])) for row in self.repository.list_all_account_settings()]
+        return {"results": results, "changed_count": sum(1 for row in results if row["changed"])}
 
     def _lock_expired(self, lock: dict[str, Any]) -> bool:
         expires = parse_time(lock.get("expires_at"))
@@ -3916,16 +6105,304 @@ class CommercialQueueService:
             self.repository.refresh_campaign_counts(campaign["id"])
         return result
 
-    def run_account_round(self, account_id: str, campaign_id: str | None = None, max_jobs: int | None = None, dry_run: bool = False, scheduler_tick_id: str | None = None) -> dict[str, Any]:
+    def _persist_execution_evidence(
+        self,
+        *,
+        job: dict[str, Any],
+        context: OperationContext,
+        result: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> None:
+        """Persist safe, queryable production evidence from the real adapter result."""
+        common = {
+            "job_id": job["id"], "campaign_id": job["campaign_id"],
+            "account_id": context.account_id, "recipient_id": job["recipient_id"],
+            "correlation_id": context.correlation_id,
+            "scheduler_tick_id": context.scheduler_tick_id,
+            "worker_round_id": context.worker_round_id,
+            "platform": "bale", "component": "worker_execution",
+        }
+        browser_pid = evidence.get("browser_pid")
+        browser_profile_path = evidence.get("browser_profile_path")
+        if browser_pid:
+            for name in ("browser_launch_started", "browser_started", "bale_loaded"):
+                self.repository.create_job_event({
+                    **common, "event_type": "execution_step", "step_name": name,
+                    "status": "succeeded", "message": f"{name} persisted from adapter evidence",
+                    "diagnostics": {
+                        "step": name, "started_at": None, "completed_at": utc_now(),
+                        "success": True, "selector": None, "selector_strategy": None,
+                        "page_url": evidence.get("page_url"), "page_title": None,
+                        "visible_element_text": None, "browser_pid": browser_pid,
+                        "browser_profile_path": browser_profile_path,
+                        "account_id": context.account_id, "job_id": job["id"],
+                        "campaign_id": job["campaign_id"],
+                    },
+                })
+        step_aliases = {
+            "open_bale_web": ("browser_launch_started", "browser_started", "bale_loaded"),
+            "open_contacts": ("contacts_navigation_started", "contacts_opened"),
+            "contacts_navigation": ("contacts_navigation_started", "contacts_opened"),
+            "open_add_contact": ("add_contact_started", "add_contact_opened"),
+            "fill_phone": ("phone_fill_started", "phone_filled"),
+            "fill_name": ("name_fill_started", "name_filled"),
+            "click_contact_save": ("contact_save_clicked",),
+            "confirm_contact_saved": ("contact_save_verified",),
+            "save_or_resolve_contact": ("contact_save_verified",),
+            "open_source": ("source_navigation_started", "source_channel_opened"),
+            "open_source_channel": ("source_navigation_started", "source_channel_opened"),
+            "wait_source_message": ("source_message_found",),
+            "open_forward_picker": ("forward_picker_opened",),
+            "type_recipient_name": ("recipient_" + "search_filled",),
+            "wait_recipient_results": ("exact_recipient_found",),
+            "select_recipient": ("recipient_selected",),
+            "confirmation_visible": ("confirmation_visible",),
+            "confirm_forward": ("confirm_clicked",),
+            "network_send_observed": ("network_send_observed",),
+            "forward_verified": ("forward_verified",),
+        }
+        for step in evidence.get("scenario_steps") or []:
+            if not isinstance(step, dict):
+                continue
+            details = step.get("details") if isinstance(step.get("details"), dict) else step
+            for persisted_name in step_aliases.get(str(step.get("step_id") or ""), (str(step.get("step_id") or "unknown_step"),)):
+                success = step.get("status") == "success"
+                self.repository.create_job_event({
+                    **common, "event_type": "execution_step", "step_name": persisted_name,
+                    "status": "succeeded" if success else str(step.get("status") or "unknown"),
+                    "message": step.get("message"), "error_code": step.get("error_code"),
+                    "error_message": step.get("message"),
+                    "diagnostics": {
+                        "step": persisted_name, "started_at": details.get("started_at"),
+                        "completed_at": details.get("completed_at") or utc_now(),
+                        "success": success, "selector": details.get("selector"),
+                        "selector_strategy": details.get("selector_strategy"),
+                        "page_url": details.get("page_url") or evidence.get("page_url"),
+                        "page_title": details.get("page_title"),
+                        "visible_element_text": details.get("visible_element_text"),
+                        "nested_error_code": step.get("error_code"),
+                        "nested_error_message": step.get("message"),
+                        "screenshot_path": evidence.get("screenshot_path") if step.get("status") == "failed" and CAPTURE_FAILURE_SCREENSHOT else None,
+                        "dom_excerpt": evidence.get("dom_excerpt") if step.get("status") == "failed" and CAPTURE_FAILURE_DOM else None,
+                        "browser_pid": browser_pid, "account_id": context.account_id,
+                        "job_id": job["id"], "campaign_id": job["campaign_id"],
+                    },
+                })
+
+    def _verified_account_contact_proof(
+        self, account_id: str, mapping_id: str, normalized_phone: str, display_name: str
+    ) -> tuple[bool, dict[str, Any] | None, str]:
+        proof = self.repository.get_account_contact_proof(account_id, mapping_id)
+        if proof is None:
+            return False, None, "missing"
+        if str(proof.get("mapping_id") or "") != mapping_id:
+            return False, proof, "mapping_mismatch"
+        if str(proof.get("account_id") or "") != account_id:
+            return False, proof, "account_mismatch"
+        if str(proof.get("normalized_phone") or "") != normalized_phone or str(proof.get("recipient_display_name") or "") != display_name:
+            return False, proof, "mapping_mismatch"
+        if str(proof.get("preparation_status") or "") != "prepared":
+            return False, proof, str(proof.get("preparation_status") or "not_prepared")
+        if str(proof.get("verification_status") or "") != "verified":
+            return False, proof, str(proof.get("verification_status") or "unverified")
+        verified_at = proof.get("verified_at")
+        verified_time = parse_time(str(verified_at or ""))
+        if verified_time is None or datetime.now(timezone.utc) - verified_time > timedelta(seconds=CONTACT_VERIFICATION_TTL_SECONDS):
+            return False, proof, "stale"
+        return True, proof, "verified"
+
+    def _prepare_and_gate_bale_contact(self, plan: Any, runtime_session: Any | None) -> tuple[Any, dict[str, Any]]:
+        """Resolve the global mapping, verify its account binding, then allow forwarding."""
+        test_fault = self._test_worker_fault_for(str(plan.account_id))
+        if test_fault:
+            # A test fault still traverses the regular worker completion and
+            # error-classification paths below, but bypasses every operation
+            # capable of touching a Bale profile, contact, browser, or send.
+            return plan, {
+                "success": True,
+                "ok": True,
+                "test_fake_delivery_boundary": True,
+                "test_worker_fault": test_fault,
+                "adapter_called": False,
+                "browser_launch_count": 0,
+                "contact_created": False,
+                "final_send_invoked": False,
+            }
+        # Isolated UI/runtime acceptance may prove scheduler assignment through
+        # the worker boundary without creating a contact, opening Bale, or
+        # attempting a send.  The second flag prevents a production process
+        # from ever taking this synthetic branch by accident.
+        if (
+            os.environ.get("CLINICOS_TEST_MODE") == "1"
+            and os.environ.get("CLINICOS_SAFE_TEST_WORKER_BOUNDARY") == "1"
+        ):
+            return plan, {
+                "success": False,
+                "ok": False,
+                "forward_verified": False,
+                "error_code": "test_delivery_boundary_reached",
+                "error_message": "Isolated test stopped before Bale contact and delivery boundary",
+                "failed_step": "test_safe_worker_boundary",
+                "adapter_called": False,
+                "browser_launch_count": 0,
+                "recipient_click_count": 0,
+                "confirm_click_count": 0,
+                "verified_forwarded_recipient_count": 0,
+                "diagnostics_consistent": True,
+                "safe_to_requeue": True,
+                "test_safe_boundary": True,
+            }
+        existing_mapping = self.contact_store.get_platform_contact("bale", plan.phone)
+        database_mapping = self.repository.get_or_create_stable_contact_mapping(plan.phone, (existing_mapping or {}).get("display_name"))
+        normalized_phone = str(database_mapping.get("normalized_phone") or "")
+        display_name = str(database_mapping.get("stable_display_name") or "")
+        mapping = self.contact_store.ensure_stable_mapping(normalized_phone, display_name, plan.account_id)
+        mapping_id = str(database_mapping.get("id") or "")
+        binding_id = mapping.get("account_binding_id")
+        plan = replace(plan, display_name=display_name, phone=normalized_phone)
+        verified, proof, proof_state = self._verified_account_contact_proof(
+            plan.account_id, mapping_id, normalized_phone, display_name
+        )
+        preparation_result: dict[str, Any] | None = None
+        if not verified:
+            self.repository.upsert_account_contact_proof({
+                "account_id": plan.account_id, "mapping_id": mapping_id,
+                "binding_id": binding_id, "normalized_phone": normalized_phone,
+                "recipient_display_name": display_name,
+                "preparation_status": proof_state if proof_state in {"failed", "stale", "revoked"} else "not_prepared",
+                "verification_status": "unverified",
+            })
+            preparation_result = bale_plugin.ensure_bale_contact_available(
+                plan.account_id,
+                normalized_phone,
+                display_name,
+                provider_mode="native_chrome",
+                runtime_session=runtime_session,
+                close_session_when_done=runtime_session is None,
+            )
+            preparation_verified = bool(
+                preparation_result.get("success")
+                and str(preparation_result.get("account_contact_status") or "") == "verified"
+                and str(preparation_result.get("contact_save_status") or "") in {"saved", "already_exists", "verified_account_contact"}
+            )
+            if preparation_verified:
+                now = utc_now()
+                self.contact_store.update_contact_metadata(plan.account_id, normalized_phone, {
+                    "preparation_status": "prepared",
+                    "verification_status": "verified",
+                    "verification_method": preparation_result.get("verification_method") or "visible_account_contact_probe",
+                    "prepared_at": preparation_result.get("prepared_at") or now,
+                    "verified_at": preparation_result.get("verified_at") or now,
+                    "profile_identity": plan.account_id,
+                    "browser_pid": preparation_result.get("browser_pid"),
+                    "last_successful_step": preparation_result.get("last_successful_step") or "verify_contact_saved",
+                    "failure_evidence": None,
+                    "last_verified_account_id": plan.account_id,
+                    "bale_contact_verified": True,
+                    "bale_verified_at": preparation_result.get("verified_at") or now,
+                })
+                self.repository.upsert_account_contact_proof({
+                    "account_id": plan.account_id, "mapping_id": mapping_id,
+                    "binding_id": binding_id, "normalized_phone": normalized_phone,
+                    "recipient_display_name": display_name,
+                    "preparation_status": "prepared", "verification_status": "verified",
+                    "verification_method": preparation_result.get("verification_method") or "visible_account_contact_probe",
+                    "prepared_at": preparation_result.get("prepared_at") or now,
+                    "verified_at": preparation_result.get("verified_at") or now,
+                    "profile_identity": plan.account_id, "browser_pid": preparation_result.get("browser_pid"),
+                    "last_successful_step": preparation_result.get("last_successful_step") or "verify_contact_saved",
+                })
+            else:
+                self.repository.upsert_account_contact_proof({
+                    "account_id": plan.account_id, "mapping_id": mapping_id,
+                    "binding_id": binding_id, "normalized_phone": normalized_phone,
+                    "recipient_display_name": display_name,
+                    "preparation_status": "failed", "verification_status": "failed",
+                    "last_successful_step": preparation_result.get("last_successful_step"),
+                    "failure_evidence": {
+                        "error_code": preparation_result.get("error_code"),
+                        "error_message": preparation_result.get("error_message"),
+                        "failed_step": preparation_result.get("failed_step"),
+                        "screenshot_path": preparation_result.get("screenshot_path"),
+                    },
+                })
+            verified, proof, proof_state = self._verified_account_contact_proof(
+                plan.account_id, mapping_id, normalized_phone, display_name
+            )
+        if not verified:
+            failure = preparation_result or {}
+            return plan, {
+                "success": False, "ok": False, "forward_verified": False,
+                "error_code": "contact_preparation_required",
+                "error_message": failure.get("error_message") or f"Account-scoped contact proof is {proof_state}",
+                "failed_step": "pre_forward_contact_gate",
+                "last_successful_step": failure.get("last_successful_step") or "resolve_stable_contact_mapping",
+                "mapping_id": mapping_id,
+                "binding_id": (proof or {}).get("binding_id") or binding_id,
+                "account_contact_verification_status": (proof or {}).get("verification_status") or proof_state,
+                "contact_preparation_result": failure,
+                "protected_bale_forward_scenario_started": False,
+                "forward_picker_opened": False,
+                "diagnostics_consistent": True,
+            }
+        return plan, {
+            "success": True, "ok": True, "mapping_id": mapping_id,
+            "binding_id": (proof or {}).get("binding_id") or binding_id,
+            "account_contact_verification_status": "verified",
+            "contact_proof_verified_at": (proof or {}).get("verified_at"),
+        }
+    def run_account_round(
+        self,
+        account_id: str,
+        campaign_id: str | None = None,
+        max_jobs: int | None = None,
+        scheduler_tick_id: str | None = None,
+        live_execution_authorization: dict[str, Any] | None = None,
+        preassigned_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_execution_mode = self._resolve_execution_mode(REAL_SEND, "campaign_worker")
         owner = f"worker_{uuid4().hex[:12]}"
         worker_round_id = f"round_{uuid4().hex[:12]}"
         context = OperationContext.create(scheduler_tick_id=scheduler_tick_id, worker_round_id=worker_round_id, account_id=account_id, platform="bale")
+        live_approval_id = str((live_execution_authorization or {}).get("approval_id") or "") or None
+        logger.info(
+            "[FINAL_SEND_AUTHORIZATION] account_id=%s campaign_id=%s approval_id=%s allow_final_send=%s",
+            account_id,
+            campaign_id,
+            live_approval_id,
+            True,
+        )
+        logger.info(
+            "[REAL_SEND_EXECUTION] account_id=%s campaign_id=%s worker_round_id=%s "
+            "execution_mode=%s operation_mode=%s allow_final_send=%s",
+            account_id,
+            campaign_id,
+            worker_round_id,
+            resolved_execution_mode,
+            "live_send",
+            True,
+        )
         policy_result = self.resolve_effective_policy(account_id=account_id, campaign_id=campaign_id)
         effective = policy_result["effective_policy"]
-        lock = self.repository.acquire_worker_lock(account_id, owner, ttl_seconds=max(30, int(effective["max_job_duration_seconds"]) + 30))
+        runtime_owner_id = str(getattr(self.scheduler_runtime, "owner_id", "") or f"process_{os.getpid()}")
+        lock = self.repository.acquire_worker_lock(
+            account_id,
+            owner,
+            ttl_seconds=max(30, int(effective["max_job_duration_seconds"]) + 30),
+            runtime_owner_id=runtime_owner_id,
+            worker_round_id=worker_round_id,
+            process_id=os.getpid(),
+        )
         if lock is None:
             return {"success": False, "account_id": account_id, "reason": "worker_lock_active", "processed_count": 0, "results": []}
         token = str(lock["lock_token"])
+        with self._active_worker_rounds_lock:
+            self._active_worker_rounds[account_id] = {
+                "worker_round_id": worker_round_id,
+                "runtime_owner_id": runtime_owner_id,
+                "lock_token": token,
+                "started_at": utc_now(),
+            }
         round_started = time.perf_counter()
         processed_results: list[dict[str, Any]] = []
         stop_reason: str | None = None
@@ -3960,7 +6437,21 @@ class CommercialQueueService:
                         "capacity_diagnostics": {"resource_snapshot": snapshot.to_dict(), "capacity_decision": capacity.to_dict()},
                         "round_diagnostics": round_diagnostics,
                     }
-            assign_result = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
+            if preassigned_job_id:
+                preassigned = self.repository.get_job(preassigned_job_id)
+                valid_preassignment = bool(
+                    preassigned
+                    and str(preassigned.get("account_id") or "") == account_id
+                    and str(preassigned.get("campaign_id") or "") == str(campaign_id or "")
+                    and str(preassigned.get("status") or "") == "assigned"
+                )
+                assign_result = {
+                    "assigned_count": 1 if valid_preassignment else 0,
+                    "assigned_job_ids": [preassigned_job_id] if valid_preassignment else [],
+                    "reason": None if valid_preassignment else "exact_round_preassignment_invalid",
+                }
+            else:
+                assign_result = self.assign_jobs(account_id=account_id, campaign_id=campaign_id, limit=max_jobs)
             if assign_result["assigned_count"] == 0:
                 stop_reason = assign_result.get("reason") or "no_jobs_assigned"
                 return {
@@ -3977,11 +6468,72 @@ class CommercialQueueService:
                 }
             self.repository.update_account_runtime(account_id, {"worker_status": "running"})
             assigned_jobs = self.repository.list_assigned_jobs_for_account(account_id, campaign_id, assign_result["assigned_count"])
-            if not dry_run and assigned_jobs:
+            # This double-gated branch exists solely for isolated UI/runtime
+            # acceptance.  It intentionally runs *before* the pre-browser
+            # context helper, because that helper can create a Bale contact.
+            # Returning jobs to queued is evidence of a safe, no-send boundary
+            # rather than a worker/account failure, so the campaign remains
+            # running and can be inspected without touching an external Bale
+            # profile, contact, browser, or adapter.
+            if (
+                assigned_jobs
+                and os.getenv("CLINICOS_TEST_MODE") == "1"
+                and os.getenv("CLINICOS_SAFE_TEST_WORKER_BOUNDARY") == "1"
+                and self._test_worker_fault_for(account_id) is None
+            ):
+                deferred = self.repository.defer_assigned_jobs_at_safe_test_boundary(
+                    account_id,
+                    [str(job["id"]) for job in assigned_jobs],
+                )
+                stop_reason = "test_delivery_boundary_reached"
+                round_diagnostics.update(
+                    {
+                        "test_safe_worker_boundary": True,
+                        "test_boundary_deferred_count": len(deferred),
+                        "browser_start_count": 0,
+                        "contact_preparation_count": 0,
+                    }
+                )
+                return {
+                    "success": True,
+                    "account_id": account_id,
+                    "assigned_count": assign_result["assigned_count"],
+                    "processed_count": 0,
+                    "results": [
+                        {
+                            "job_id": row["id"],
+                            "status": "queued",
+                            "duration_ms": 0,
+                            "delay_applied_seconds": 0,
+                            "session_id": None,
+                            "session_reused": False,
+                            "result": {
+                                "success": False,
+                                "test_safe_boundary": True,
+                                "error_code": "test_delivery_boundary_reached",
+                                "safe_to_requeue": True,
+                                "adapter_called": False,
+                                "browser_launch_count": 0,
+                            },
+                        }
+                        for row in deferred
+                    ],
+                    "stopped_early": True,
+                    "stop_reason": stop_reason,
+                    "requeued_unstarted_count": len(deferred),
+                    "assignment": assign_result,
+                    "lock_acquired": True,
+                    "lock_token": token,
+                    "round_duration_ms": int((time.perf_counter() - round_started) * 1000),
+                    "worker_round_id": worker_round_id,
+                    "correlation_id": context.correlation_id,
+                    "round_diagnostics": round_diagnostics,
+                }
+            if assigned_jobs:
                 authorized_jobs: list[dict[str, Any]] = []
                 for job in assigned_jobs:
                     job_details = self.repository.get_job_with_recipient(job["id"]) or job
-                    auth_check = self.validate_live_recipient_authorization(job, job_details=job_details, dry_run=False)
+                    auth_check = self.validate_live_recipient_authorization(job, job_details=job_details)
                     if auth_check.get("ok"):
                         authorized_jobs.append(job)
                         continue
@@ -4067,7 +6619,7 @@ class CommercialQueueService:
                         "result": result,
                     })
                 assigned_jobs = authorized_jobs
-            if not dry_run and assigned_jobs:
+            if assigned_jobs:
                 snapshot_valid_jobs: list[dict[str, Any]] = []
                 for job in assigned_jobs:
                     campaign_snapshot = self.repository.get_latest_configuration_snapshot(str(job["campaign_id"]))
@@ -4133,6 +6685,26 @@ class CommercialQueueService:
                     stop_reason = result["error_code"]
                     break
                 assigned_jobs = snapshot_valid_jobs
+            if assigned_jobs:
+                try:
+                    for assigned_job in assigned_jobs:
+                        self._ensure_pre_browser_runtime_context(assigned_job, account_id)
+                except Exception as exc:
+                    stop_reason = getattr(exc, "error_code", None) or str(exc) or "runtime_context_construction_failed"
+                    requeued_unstarted = self.repository.requeue_assigned_jobs_for_account(
+                        account_id,
+                        reason=f"pre_browser_context_failed:{stop_reason}",
+                    )
+                    return {
+                        "success": False,
+                        "account_id": account_id,
+                        "assigned_count": assign_result["assigned_count"],
+                        "processed_count": 0,
+                        "reason": stop_reason,
+                        "results": [],
+                        "requeued_unstarted_count": requeued_unstarted,
+                        "round_diagnostics": round_diagnostics,
+                    }
             if bool(effective.get("session_reuse_enabled")) and assigned_jobs:
                 try:
                     runtime_session = self.runtime_session_manager.acquire_or_create_session(account_id, token, worker_round_id, effective)
@@ -4189,10 +6761,16 @@ class CommercialQueueService:
                 )
                 job_started = time.perf_counter()
                 job_details = self.repository.get_job_with_recipient(job["id"]) or job
-                plan = build_execution_plan(context=job_context, job=job, job_details=job_details, policy_result=job_policy_result, dry_run=bool(dry_run))
+                plan = build_execution_plan(
+                    context=job_context,
+                    job=job,
+                    job_details=job_details,
+                    policy_result=job_policy_result,
+                    live_approval_id=live_approval_id,
+                )
                 session_jobs_before = runtime_session.jobs_processed if runtime_session is not None else 0
                 campaign_snapshot = self.repository.get_latest_configuration_snapshot(str(job["campaign_id"]))
-                if campaign_snapshot is not None and not dry_run:
+                if campaign_snapshot is not None:
                     snapshot_check = self.validate_job_configuration_snapshot(job_details)
                     if not snapshot_check.get("ok"):
                         result = {
@@ -4250,11 +6828,18 @@ class CommercialQueueService:
                         stop_reason = result["error_code"]
                         break
                     snapshot_config = snapshot_check["configuration"]
-                    plan.source_channel_uid = str(_get_nested(snapshot_config, "source.source_channel_uid") or plan.source_channel_uid)
-                    plan.effective_policy["source_channel_uid"] = plan.source_channel_uid
+                    snapshot_source_uid = str(_get_nested(snapshot_config, "source.source_channel_uid") or plan.source_channel_uid)
+                    plan = replace(
+                        plan,
+                        source_channel_uid=snapshot_source_uid,
+                        effective_policy={**plan.effective_policy, "source_channel_uid": snapshot_source_uid},
+                    )
                 session_prepare_duration_ms = 0
                 session_health_duration_ms = 0
-                if runtime_session is not None:
+                plan, contact_gate = self._prepare_and_gate_bale_contact(plan, runtime_session)
+                if not contact_gate.get("success"):
+                    result = contact_gate
+                elif runtime_session is not None:
                     try:
                         self.runtime_session_manager.prepare_for_job(runtime_session, plan)
                         session_prepare_duration_ms = int(runtime_session.last_prepare_duration_ms)
@@ -4267,7 +6852,22 @@ class CommercialQueueService:
                         result = self._execute_plan(plan, idempotency_key=job["idempotency_key"], runtime_session=runtime_session)
                 else:
                     result = self._execute_plan(plan, idempotency_key=job["idempotency_key"], runtime_session=None)
+                if contact_gate.get("success"):
+                    result = {
+                        **result,
+                        "contact_gate": contact_gate,
+                        "protected_bale_forward_scenario_started": not bool(contact_gate.get("test_fake_delivery_boundary")),
+                    }
                 duration_ms = int((time.perf_counter() - job_started) * 1000)
+                evidence = deepest_execution_evidence(result)
+                for field in (
+                    "nested_error_code", "nested_error_message", "failed_step",
+                    "last_successful_step", "selector", "page_url", "screenshot_path",
+                    "browser_pid", "browser_profile_path", "failure_class",
+                ):
+                    if evidence.get(field) is not None:
+                        result[field] = evidence[field]
+                self._persist_execution_evidence(job=job, context=job_context, result=result, evidence=evidence)
                 session_reset_duration_ms = 0
                 reset_failed_after_verified_success: dict[str, Any] | None = None
                 if runtime_session is not None and result.get("success"):
@@ -4285,24 +6885,7 @@ class CommercialQueueService:
                 send_completed = commercial_send_completed(result)
                 delivery_verified = bool(result.get("delivery_verified") or result.get("forward_verified"))
                 structured_error = classify_error(result, component="worker", step=result.get("failed_step")).to_dict() if not send_completed else {}
-                if dry_run:
-                    completed = self.repository.complete_job(
-                        job["id"],
-                        "skipped",
-                        {
-                            "result_success": False,
-                            "verified_forwarded_recipient_count": int(result.get("verified_forwarded_recipient_count") or 0),
-                            "forward_verified": bool(result.get("forward_verified")),
-                            "diagnostics_consistent": bool(result.get("diagnostics_consistent")),
-                            "last_error_code": "dry_run_no_delivery",
-                            "last_error_message": "Dry-run completed without forwarding",
-                            "failed_component": "worker",
-                            "failed_step": "dry_run",
-                        },
-                    )
-                    event_type = "job_paused"
-                    event_status = "skipped"
-                elif send_completed:
+                if send_completed:
                     completed = self.repository.complete_job(
                         job["id"],
                         "succeeded",
@@ -4330,7 +6913,7 @@ class CommercialQueueService:
                             "forward_verified": bool(result.get("forward_verified")),
                             "diagnostics_consistent": bool(result.get("diagnostics_consistent")),
                             "last_error_code": result.get("error_code") or "delivery_failed",
-                            "last_error_message": result.get("error_message") or "Delivery failed",
+                            "last_error_message": result.get("nested_error_message") or result.get("error_message") or "Delivery failed",
                             **structured_error,
                         },
                     )
@@ -4353,9 +6936,10 @@ class CommercialQueueService:
                         "component": "worker",
                         "duration_ms": duration_ms,
                         "status": event_status,
-                        "message": "Delivery job completed by worker",
+                        "step_name": result.get("failed_step"),
+                        "message": result.get("nested_error_message") or result.get("error_message") or "Delivery job failed in production adapter" if not send_completed else "Delivery job completed by worker",
                         "error_code": result.get("error_code"),
-                        "error_message": result.get("error_message"),
+                        "error_message": result.get("nested_error_message") or result.get("error_message"),
                         "error_domain": structured_error.get("error_domain"),
                         "retryable": structured_error.get("retryable"),
                         "safe_to_continue_round": structured_error.get("safe_to_continue_round"),
@@ -4372,10 +6956,83 @@ class CommercialQueueService:
                         "delay_applied_seconds": delay,
                         "execution_plan": plan.to_dict(),
                         "orchestrator_result": result,
+                        "top_level_error_code": result.get("error_code"),
+                        "nested_error_code": result.get("nested_error_code"),
+                        "nested_error_message": result.get("nested_error_message"),
+                        "failed_step": result.get("failed_step"),
+                        "last_successful_step": result.get("last_successful_step"),
+                        "selector": result.get("selector"),
+                        "page_url": result.get("page_url"),
+                        "screenshot_path": result.get("screenshot_path"),
+                        "browser_pid": result.get("browser_pid"),
                         "post_success_reset_failure": reset_failed_after_verified_success,
                         },
                     }
                 )
+                # A failed job may be returned to the queue only when the
+                # durable worker evidence proves the transition stopped before
+                # recipient selection or any irreversible delivery action.
+                # The repository reclassifies the persisted evidence instead
+                # of trusting this in-memory flag, so an ambiguous failure can
+                # never take this retry path.
+                if (
+                    not send_completed
+                    and bool(result.get("pre_browser_context_failure"))
+                    and not bool(result.get("forward_picker_opened"))
+                    and not bool(result.get("recipient_selected"))
+                    and int(result.get("confirm_click_count") or 0) == 0
+                    and not bool(result.get("final_send_invoked"))
+                ):
+                    recovery = self.repository.recover_failed_jobs_without_send(
+                        str(job["campaign_id"]), [str(job["id"])]
+                    )
+                    requeued_unstarted += int(recovery.get("requeued_count") or 0)
+                post_success_fault = str(result.get("test_post_success_account_failure") or "")
+                if send_completed and post_success_fault:
+                    # The result has already been durably completed.  The
+                    # post-success account fault therefore quarantines only
+                    # this account and leaves the successful recipient
+                    # immutable; a future scheduler tick can safely fill the
+                    # slot from a spare account for other queued work.
+                    fault = classify_error(
+                        {
+                            "error_code": post_success_fault,
+                            "error_message": "Injected isolated account failure after verified delivery",
+                            "failed_step": "test_post_verified_delivery_fault",
+                        },
+                        component="worker",
+                        step="test_post_verified_delivery_fault",
+                    ).to_dict()
+                    self.account_health.record_failure(account_id, fault)
+                    requeued_unstarted += self.repository.requeue_assigned_jobs_for_account(
+                        account_id,
+                        exclude_job_ids={str(job["id"])},
+                        reason=f"post_verified_account_fault:{post_success_fault}",
+                    )
+                    self.repository.create_job_event(
+                        {
+                            "job_id": job["id"],
+                            "campaign_id": job["campaign_id"],
+                            "account_id": account_id,
+                            "recipient_id": job["recipient_id"],
+                            "event_type": "post_verified_account_fault_isolated",
+                            "component": "test_runtime",
+                            "step_name": "test_post_verified_delivery_fault",
+                            "status": "failed",
+                            "message": "Account fault isolated after verified delivery; completed recipient remains immutable",
+                            "error_code": post_success_fault,
+                            "diagnostics": {
+                                "test_only": True,
+                                "adapter_called": False,
+                                "browser_launched": False,
+                                "contact_created": False,
+                                "final_send_invoked": False,
+                                "completed_job_id": job["id"],
+                                "requeued_unstarted_count": requeued_unstarted,
+                            },
+                        }
+                    )
+                    stop_reason = post_success_fault
                 self.complete_campaign_if_finished(job["campaign_id"])
                 if runtime_session is not None and result.get("success"):
                     self.runtime_session_manager.mark_job_complete(runtime_session, duration_ms)
@@ -4396,7 +7053,50 @@ class CommercialQueueService:
                     "session_reset_duration_ms": session_reset_duration_ms,
                     "result": result,
                 })
+                reservation_after_job = self.repository.get_campaign_capacity_reservation(str(job["campaign_id"]))
+                logger.info(
+                    "[RECIPIENT_PROGRESS] campaign_id=%s account_id=%s recipient_id=%s job_id=%s "
+                    "job_status=%s processed_index=%s remaining_assigned=%s "
+                    "capacity_used=%s capacity_remaining=%s",
+                    job["campaign_id"],
+                    account_id,
+                    job["recipient_id"],
+                    job["id"],
+                    (completed or {}).get("status"),
+                    job_index + 1,
+                    max(0, len(assigned_jobs) - job_index - 1),
+                    (reservation_after_job or {}).get("used_capacity"),
+                    (reservation_after_job or {}).get("remaining_capacity"),
+                )
                 previous_job_completed = True
+                failure_class = result.get("failure_class")
+                if (
+                    not send_completed
+                    and STOP_ACCOUNT_AFTER_FIRST_DETERMINISTIC_FAILURE
+                    and failure_class in DETERMINISTIC_UI_FAILURES
+                ):
+                    stop_reason = str(failure_class)
+                    cooldown_until = (datetime.now(timezone.utc) + timedelta(seconds=int(effective["round_cooldown_seconds"]))).isoformat()
+                    self.repository.update_account_runtime(account_id, {
+                        "cooldown_until": cooldown_until,
+                        "last_error_code": stop_reason,
+                        "last_error_message": result.get("nested_error_message") or result.get("error_message") or stop_reason,
+                    })
+                    self.account_health.set_status(account_id, "manual_review", stop_reason)
+                    requeued_unstarted = self.repository.requeue_assigned_jobs_for_account(
+                        account_id, exclude_job_ids={job["id"]}, reason=f"circuit_breaker:{stop_reason}"
+                    )
+                    self.repository.create_job_event({
+                        "job_id": job["id"], "campaign_id": job["campaign_id"],
+                        "account_id": account_id, "recipient_id": job["recipient_id"],
+                        "event_type": "account_circuit_breaker_opened", "component": "worker",
+                        "step_name": result.get("failed_step"), "status": "failed",
+                        "message": "Account stopped after first deterministic UI failure",
+                        "error_code": stop_reason,
+                        "diagnostics": {"failure_class": failure_class, "cooldown_until": cooldown_until,
+                                        "requeued_unstarted_count": requeued_unstarted},
+                    })
+                    break
                 if reset_failed_after_verified_success is not None:
                     stop_reason = str(reset_failed_after_verified_success["error_code"])
                     round_diagnostics["session_invalidated"] = True
@@ -4442,7 +7142,7 @@ class CommercialQueueService:
                     self.runtime_session_manager.invalidate_session(runtime_session, str(result.get("error_code") or "unsafe_failure"))
                     round_diagnostics["session_invalidated"] = True
                     round_diagnostics["session_invalidated_reason"] = str(result.get("error_code") or "unsafe_failure")
-                if (not dry_run and self._is_unsafe_failure(result)) or (runtime_session is not None and self._is_unsafe_failure(result)):
+                if self._is_unsafe_failure(result):
                     stop_reason = result.get("error_code") or "unsafe_failure"
                     requeued_unstarted = self.repository.requeue_assigned_jobs_for_account(account_id, exclude_job_ids={job["id"]}, reason=f"round_stopped:{stop_reason}")
                     break
@@ -4484,7 +7184,7 @@ class CommercialQueueService:
             effective_after = self.resolve_account_settings(account_id)
             cooldown_policy = self.resolve_effective_policy(account_id=account_id, campaign_id=campaign_id)["effective_policy"]
             cooldown = int(cooldown_policy["round_cooldown_seconds"])
-            if cooldown > 0:
+            if cooldown > 0 and processed_results:
                 cooldown_until = (datetime.now(timezone.utc) + timedelta(seconds=cooldown)).isoformat()
                 final_status = "cooling_down"
             self.repository.update_account_runtime(
@@ -4499,8 +7199,99 @@ class CommercialQueueService:
             )
             self.repository.update_worker_lock_heartbeat(account_id, token, None, ttl_seconds=1)
             self.repository.release_worker_lock(account_id, token=token)
+            with self._active_worker_rounds_lock:
+                current_round = self._active_worker_rounds.get(account_id)
+                if current_round and current_round.get("worker_round_id") == worker_round_id:
+                    self._active_worker_rounds.pop(account_id, None)
+
+    def _ensure_pre_browser_runtime_context(self, job: dict[str, Any], account_id: str) -> dict[str, Any]:
+        """Resolve and persist all Bale plan context before browser acquisition."""
+        details = self.repository.get_job_with_recipient(str(job["id"])) or job
+        phone = normalize_bale_phone(
+            str(details.get("recipient_phone_normalized") or details.get("phone_normalized") or "")
+        )
+        contact, _created = self.contact_store.get_or_create_bale_contact(account_id, phone)
+        display_name = str(contact.get("stable_name") or contact.get("display_name") or "").strip()
+        if not display_name:
+            raise BaleContactError("recipient_display_name_allocation_failed", "Bale contact mapping has no display name")
+        self.repository.persist_recipient_display_name(str(job["recipient_id"]), display_name)
+        refreshed = self.repository.get_job_with_recipient(str(job["id"])) or {}
+        persisted_name = str(refreshed.get("display_name") or refreshed.get("recipient_display_name") or "").strip()
+        if persisted_name != display_name:
+            raise BaleContactError("recipient_display_name_persistence_failed", "Recipient display name was not persisted")
+        self.repository.create_job_event({
+            "job_id": job["id"],
+            "campaign_id": job["campaign_id"],
+            "account_id": account_id,
+            "recipient_id": job["recipient_id"],
+            "event_type": "runtime_context_constructed",
+            "component": "worker",
+            "step_name": "pre_browser_runtime_context",
+            "status": "succeeded",
+            "message": "Canonical Bale contact mapping resolved before browser startup",
+            "diagnostics": {
+                "phone_normalized": phone,
+                "recipient_display_name": display_name,
+                "browser_launched": False,
+            },
+        })
+        return {"phone_normalized": phone, "recipient_display_name": display_name}
 
     def _execute_plan(self, plan: Any, idempotency_key: str | None = None, runtime_session: Any | None = None) -> dict[str, Any]:
+        test_fault = self._test_worker_fault_for(str(plan.account_id), consume=True)
+        if test_fault == "pre_send_session_loss":
+            return {
+                "success": False,
+                "error_code": "session_page_closed",
+                "error_message": "Injected isolated account-local session loss before recipient selection",
+                "failed_step": "test_pre_browser_runtime_fault",
+                "diagnostics_consistent": True,
+                "pre_browser_context_failure": True,
+                "forward_picker_opened": False,
+                "recipient_selected": False,
+                "confirm_click_count": 0,
+                "final_send_invoked": False,
+                "adapter_called": False,
+                "browser_launched": False,
+                "contact_created": False,
+                "failure_class": "session_loss",
+                "test_worker_fault": test_fault,
+            }
+        if test_fault == "verified_success_then_session_loss":
+            return {
+                "success": True,
+                "recipient_resolved": True,
+                "forward_verified": True,
+                "delivery_verified": True,
+                "delivery_status": "delivered",
+                "send_action_verified": True,
+                "confirm_click_count": 1,
+                "verified_forwarded_recipient_count": 1,
+                "diagnostics_consistent": True,
+                "adapter_called": False,
+                "browser_launched": False,
+                "contact_created": False,
+                "final_send_invoked": False,
+                "test_worker_fault": test_fault,
+                "test_post_success_account_failure": "session_page_closed",
+            }
+        if test_fault == "uncertain_after_send":
+            return {
+                "success": False,
+                "error_code": "confirm_uncertain",
+                "error_message": "Injected isolated interruption after a simulated send action and before durable verification",
+                "failed_step": "test_uncertain_delivery_reconciliation",
+                "diagnostics_consistent": False,
+                "recipient_selected": True,
+                "confirm_click_count": 1,
+                "final_send_invoked": True,
+                "send_action_verified": False,
+                "browser_terminated_after_confirm": True,
+                "adapter_called": False,
+                "browser_launched": False,
+                "contact_created": False,
+                "test_worker_fault": test_fault,
+            }
         if self.orchestrator is not None:
             return self.orchestrator(
                 job_id=plan.job_id,
@@ -4511,7 +7302,7 @@ class CommercialQueueService:
                 phone=plan.phone,
                 display_name=plan.display_name,
                 source_channel_uid=plan.source_channel_uid,
-                dry_run=plan.dry_run,
+                execution_mode=REAL_SEND,
                 execution_plan=plan.to_dict(),
                 effective_policy=plan.effective_policy,
                 policy_resolution_source=plan.policy_resolution_source,

@@ -16,11 +16,11 @@ class OrchestratorStub:
         self.calls.append(dict(payload))
         return {
             "success": True,
-            "forward_verified": False if payload.get("dry_run") else True,
+            "forward_verified": False if payload.get("execution_mode") != "real_send" else True,
             "diagnostics_consistent": True,
-            "verified_forwarded_recipient_count": 0 if payload.get("dry_run") else 1,
-            "confirm_click_count": 0 if payload.get("dry_run") else 1,
-            "dry_run": bool(payload.get("dry_run")),
+            "verified_forwarded_recipient_count": 0 if payload.get("execution_mode") != "real_send" else 1,
+            "confirm_click_count": 0 if payload.get("execution_mode") != "real_send" else 1,
+            "dry_run": bool(payload.get("execution_mode") != "real_send"),
         }
 
 
@@ -104,13 +104,12 @@ def _campaign(service: CommercialQueueService, count: int = 3, status: str = "dr
 
 def _queue_payload(service: CommercialQueueService, campaign_id: str, *, idempotency_key: str | None = None) -> dict:
     validation = service.validate_campaign_start(campaign_id)
-    dry = service.check_campaign_without_sending(campaign_id)
     review = service.final_review(campaign_id)
     manifest = service.repository.get_confirmed_manifest_for_campaign(campaign_id)
     return {
         "validation_hash": service.validation_hash(validation),
-        "dry_run_id": dry["audit"]["dry_run_id"],
         "final_review_hash": review["final_review_hash"],
+        "review_token": review["review_token"],
         "manifest_hash": manifest["manifest_hash"] if manifest else None,
         "idempotency_key": idempotency_key or f"queue-{uuid4().hex}",
         "explicit_operator_confirmation": True,
@@ -153,6 +152,51 @@ def test_valid_lifecycle_transitions() -> None:
     assert cancelled["status"] == "cancelled"
 
 
+def test_single_unique_recipient_is_persisted_validated_and_queued_without_start() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        orchestrator = OrchestratorStub()
+        service = _service(Path(tmp_dir) / "single-recipient.db", orchestrator)
+        campaign = _campaign(service, 1)
+        recipients = service.list_recipients(campaign["id"], limit=100)["items"]
+        validation = service.validate_campaign_start(campaign["id"])
+
+        assert len(recipients) == 1
+        assert recipients[0]["phone_normalized"] == "989304073500"
+        assert validation["ok"] is True
+        assert validation["recipient_count"] == 1
+        assert validation["valid_recipient_count"] == 1
+        assert validation["deliverable_job_count"] == 1
+        assert validation["recipient_reason_summary"] == {"deliverable": 1}
+
+        queued = _queue(service, campaign["id"])
+        jobs = service.repository.list_campaign_jobs_all(campaign["id"])
+        assert queued["campaign"]["status"] == "queued"
+        assert len(jobs) == 1
+        assert jobs[0]["status"] == "queued"
+        assert orchestrator.calls == []
+
+
+def test_approved_final_review_proof_survives_service_reload_and_missing_proof_is_structured() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        database = Path(tmp_dir) / "persisted-review.db"
+        service = _service(database)
+        campaign = _campaign(service, 1)
+        payload = _queue_payload(service, campaign["id"], idempotency_key="persisted-review")
+        assert payload["review_token"]
+
+        reloaded = _service(database)
+        result = reloaded.queue_campaign(campaign["id"], payload)
+        assert result["queued"] is True
+        assert result["execution_started"] is False
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        service = _service(Path(tmp_dir) / "missing-review.db")
+        campaign = _campaign(service, 1)
+        payload = _queue_payload(service, campaign["id"])
+        payload.pop("review_token")
+        assert _error_code(lambda: service.queue_campaign(campaign["id"], payload)) == "final_review_proof_missing"
+
+
 def test_invalid_transitions_and_start_validation() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         service = _service(Path(tmp_dir) / "life.db")
@@ -178,6 +222,10 @@ def test_campaign_with_no_eligible_account_cannot_start() -> None:
         summary = service.validate_campaign_start(campaign["id"])
     assert code == "no_eligible_account"
     assert summary["eligible_account_count"] == 0
+    assert summary["accounts"]
+    assert summary["accounts"][0]["eligible"] is False
+    assert summary["accounts"][0]["blockers"] == ["auth_unavailable"]
+    assert summary["accounts"][0]["predicates"]["authentication_available"] is False
 
 
 def test_scheduler_only_assigns_running_campaigns_and_filter_is_strict() -> None:
@@ -192,10 +240,10 @@ def test_scheduler_only_assigns_running_campaigns_and_filter_is_strict() -> None
         service.cancel_campaign(cancelled["id"])
         running = _running_campaign(service, 1)
         service.scheduler_start()
-        draft_result = service.scheduler_run_once(campaign_id=draft["id"], dry_run=True)
-        paused_result = service.scheduler_run_once(campaign_id=paused["id"], dry_run=True)
-        cancelled_result = service.scheduler_run_once(campaign_id=cancelled["id"], dry_run=True)
-        running_result = service.scheduler_run_once(campaign_id=running["id"], dry_run=True)
+        draft_result = service.scheduler_run_once(campaign_id=draft["id"])
+        paused_result = service.scheduler_run_once(campaign_id=paused["id"])
+        cancelled_result = service.scheduler_run_once(campaign_id=cancelled["id"])
+        running_result = service.scheduler_run_once(campaign_id=running["id"])
         other_jobs = service.list_jobs(campaign_id=draft["id"], limit=10)["items"]
     assert draft_result["started_accounts"] == []
     assert paused_result["started_accounts"] == []
@@ -208,6 +256,7 @@ def test_pause_requeues_unstarted_assigned_but_not_running_uncertain_job() -> No
     with tempfile.TemporaryDirectory() as tmp_dir:
         service = _service(Path(tmp_dir) / "life.db")
         campaign = _running_campaign(service, 2)
+        service.repository.upsert_campaign_capacity_reservation(campaign["id"], 2, 10)
         service.assign_jobs("bale_a", campaign["id"], limit=2)
         jobs = service.list_jobs(campaign_id=campaign["id"], limit=10)["items"]
         with service.repository.connection() as connection:
@@ -279,7 +328,6 @@ def test_queue_requires_hardened_evidence_and_confirmation() -> None:
         payload = _queue_payload(service, campaign["id"])
         assert _error_code(lambda: service.queue_campaign(campaign["id"], {**payload, "explicit_operator_confirmation": False})) == "operator_confirmation_required"
         assert _error_code(lambda: service.queue_campaign(campaign["id"], {**payload, "idempotency_key": ""})) == "idempotency_key_required"
-        assert _error_code(lambda: service.queue_campaign(campaign["id"], {**payload, "dry_run_id": "missing"})) == "dry_run_evidence_missing"
         assert _error_code(lambda: service.queue_campaign(campaign["id"], {**payload, "final_review_hash": "stale"})) == "final_review_stale"
         assert _error_code(lambda: service.queue_campaign(campaign["id"], {**payload, "manifest_hash": "stale"})) == "manifest_stale"
 
@@ -290,14 +338,15 @@ def test_valid_queue_response_is_non_executing_and_duplicate_is_rejected() -> No
         service = _service(Path(tmp_dir) / "life.db", orchestrator)
         campaign = _campaign(service, 1)
         result = _queue(service, campaign["id"], idempotency_key="queue-once")
-        duplicate = _error_code(lambda: service.queue_campaign(campaign["id"], _queue_payload(service, campaign["id"], idempotency_key="queue-once")))
+        duplicate = service.queue_campaign(campaign["id"], _queue_payload(service, campaign["id"], idempotency_key="queue-once"))
     assert result["queued"] is True
     assert result["execution_started"] is False
     assert result["campaign"]["status"] == "queued"
     assert result["authorized_recipient_count"] == 1
     assert result["blocked_recipient_count"] == 0
     assert result["idempotency"]["status"] == "created"
-    assert duplicate == "duplicate_queue_request"
+    assert duplicate["queued"] is True
+    assert duplicate["idempotency"]["status"] == "reused"
     assert orchestrator.calls == []
 
 
@@ -306,7 +355,9 @@ def test_queue_rejects_limit_and_account_context_failures() -> None:
         limited = _service(Path(tmp_dir) / "limited.db")
         limited.update_global_settings({"deliveries_per_account_round": 1})
         too_many = _campaign(limited, 2)
-        assert _error_code(lambda: _queue(limited, too_many["id"])) == "limit_exceeded"
+        queued = _queue(limited, too_many["id"])
+        assert queued["queued"] is True
+        assert queued["effective_limit"] == 1
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         no_account = _service(Path(tmp_dir) / "no_account.db", auth_ok=False)
@@ -314,7 +365,7 @@ def test_queue_rejects_limit_and_account_context_failures() -> None:
         assert _error_code(lambda: _queue(no_account, campaign["id"])) == "account_context_missing"
 
 
-def test_queue_rejects_missing_manifest_and_stale_dry_run_evidence() -> None:
+def test_queue_rejects_missing_manifest_without_dry_run_dependency() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         service = _service(Path(tmp_dir) / "missing_manifest.db")
         campaign = service.create_campaign({"name": "No manifest", "platform": "bale", "status": "draft", "source_channel_uid": "5613544284"})
@@ -327,22 +378,12 @@ def test_queue_rejects_missing_manifest_and_stale_dry_run_evidence() -> None:
         validation = service.validate_campaign_start(campaign["id"])
         assert _error_code(lambda: service.queue_campaign(campaign["id"], {
             "validation_hash": service.validation_hash(validation),
-            "dry_run_id": "dryrun_missing",
             "final_review_hash": "review_missing",
             "manifest_hash": "manifest_missing",
             "idempotency_key": "missing-manifest",
             "explicit_operator_confirmation": True,
             "expected_campaign_status": "draft",
         })) == "manifest_missing"
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        service = _service(Path(tmp_dir) / "stale_dry.db")
-        campaign = _campaign(service, 1)
-        payload = _queue_payload(service, campaign["id"])
-        with service.repository.connection() as connection:
-            connection.execute("UPDATE commercial_dry_run_audit_records SET diagnostics_json = ? WHERE dry_run_id = ?", ('{"validation":{},"confirmed_manifest_id":"stale"}', payload["dry_run_id"]))
-            connection.commit()
-        assert _error_code(lambda: service.queue_campaign(campaign["id"], payload)) == "dry_run_evidence_stale"
 
 
 def test_queue_rejects_stale_final_review_and_authorization_incomplete() -> None:
@@ -363,6 +404,48 @@ def test_queue_rejects_stale_final_review_and_authorization_incomplete() -> None
         assert _error_code(lambda: service.queue_campaign(campaign["id"], {**payload, "final_review_hash": "stale"})) == "final_review_stale"
 
 
+def test_delete_campaign_soft_deletes_and_preserves_owned_history() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        service = _service(Path(tmp_dir) / "delete.db")
+        campaign = service.create_campaign(
+            {
+                "name": "Delete",
+                "platform": "bale",
+                "status": "draft",
+                "source_channel_uid": "5613544284",
+                "capacity_reservation": 0,
+            }
+        )
+        service.confirm_campaign_recipients(
+            campaign["id"],
+            ["09304073599"],
+            submitted_by="test",
+            source_type="test",
+            confirmation_checked=True,
+        )
+
+        result = service.delete_campaign(campaign["id"])
+
+        assert result["deleted"] is True
+        assert result["soft_deleted"] is True
+        assert service.repository.get_campaign(campaign["id"])["deleted_at"]
+        assert service.repository.get_campaign_capacity_reservation(campaign["id"]) is not None
+        assert service.repository.list_recipients(campaign["id"], None, 100, 0)
+        assert campaign["id"] not in {row["id"] for row in service.repository.list_campaigns(None, 100, 0)}
+
+
+def test_delete_running_campaign_is_blocked_until_stopped() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        service = _service(Path(tmp_dir) / "delete.db")
+        campaign = service.create_campaign(
+            {"name": "Running", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"}
+        )
+
+        assert _error_code(lambda: service.delete_campaign(campaign["id"])) == "campaign_delete_requires_stop"
+        service.pause_campaign(campaign["id"])
+        assert service.delete_campaign(campaign["id"])["deleted"] is True
+
+
 if __name__ == "__main__":
     test_valid_lifecycle_transitions()
     test_invalid_transitions_and_start_validation()
@@ -375,6 +458,6 @@ if __name__ == "__main__":
     test_queue_requires_hardened_evidence_and_confirmation()
     test_valid_queue_response_is_non_executing_and_duplicate_is_rejected()
     test_queue_rejects_limit_and_account_context_failures()
-    test_queue_rejects_missing_manifest_and_stale_dry_run_evidence()
+    test_queue_rejects_missing_manifest_without_dry_run_dependency()
     test_queue_rejects_stale_final_review_and_authorization_incomplete()
     print("Commercial campaign lifecycle tests passed")

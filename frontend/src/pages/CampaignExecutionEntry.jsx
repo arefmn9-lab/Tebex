@@ -1,6 +1,6 @@
-import { AlertTriangle, CheckCircle2, FileCheck2, Play, RefreshCw, Search, ShieldCheck } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileCheck2, Play, RefreshCw, ShieldCheck } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { checkCampaignWithoutSending, finalReviewCampaign, listCampaigns, queueCampaign, validateCampaignStart } from "../api/campaigns";
+import { finalReviewCampaign, listCampaigns, queueCampaign, startCampaign, validateCampaignStart } from "../api/campaigns";
 import {
   Checkbox,
   ContentCard,
@@ -22,8 +22,6 @@ const QUEUE_ERROR_CODES = new Set([
   "manifest_missing",
   "manifest_stale",
   "authorization_incomplete",
-  "dry_run_evidence_missing",
-  "dry_run_evidence_stale",
   "final_review_missing",
   "final_review_stale",
   "limit_exceeded",
@@ -96,37 +94,14 @@ function getValidationWarnings(validation) {
   return [];
 }
 
-function getAuthorizationSummary(validation, checkEvidence) {
-  const fromCheck = checkEvidence?.diagnostics?.recipient_authorization || {};
+function getAuthorizationSummary(validation) {
   return {
-    liveAuthorized: asNumber(validation?.live_authorized_job_count ?? fromCheck.live_authorized_job_count),
-    liveEligible: asNumber(validation?.live_eligible_job_count ?? fromCheck.live_eligible_job_count),
-    unauthorized: asNumber(validation?.unauthorized_job_count ?? fromCheck.unauthorized_job_count),
-    synthetic: asNumber(validation?.synthetic_test_job_count ?? fromCheck.synthetic_test_job_count),
-    revoked: asNumber(validation?.revoked_authorization_job_count ?? fromCheck.revoked_authorization_job_count),
+    liveAuthorized: asNumber(validation?.live_authorized_job_count),
+    liveEligible: asNumber(validation?.live_eligible_job_count),
+    unauthorized: asNumber(validation?.unauthorized_job_count),
+    synthetic: asNumber(validation?.synthetic_test_job_count),
+    revoked: asNumber(validation?.revoked_authorization_job_count),
   };
-}
-
-function getCheckId(checkEvidence) {
-  return checkEvidence?.audit?.dry_run_id || checkEvidence?.dry_run_id || checkEvidence?.audit?.check_id || checkEvidence?.check_id || "";
-}
-
-function getCheckValidationHash(checkEvidence) {
-  return getValidationHash(checkEvidence?.diagnostics?.validation || checkEvidence?.validation || {});
-}
-
-function checkIsNonMutating(checkEvidence) {
-  if (!checkEvidence) return false;
-  const forbidden = checkEvidence?.diagnostics?.forbidden_actions || {};
-  const forbiddenValues = Object.values(forbidden);
-  return (
-    checkEvidence?.dry_run === true &&
-    checkEvidence?.diagnostics?.read_only === true &&
-    checkEvidence?.audit?.status === "completed" &&
-    checkEvidence?.audit?.forbidden_mutation_detected !== true &&
-    forbiddenValues.length > 0 &&
-    forbiddenValues.every((value) => value === false)
-  );
 }
 
 function getManifest(review) {
@@ -151,8 +126,8 @@ function createIdempotencyKey(campaignId) {
 function extractApiError(err) {
   const detail = err?.data?.detail;
   const code = detail?.error_code || detail?.summary?.error_code || err?.data?.error_code || "";
-  const message = detail?.message || err?.message || "Request failed";
-  return { code, message };
+  const message = detail?.error_message || detail?.message || err?.data?.message || err?.message || "Request failed";
+  return { code, message, validation: detail?.validation || detail?.summary || err?.data?.validation || null };
 }
 
 function EvidenceRow({ label, value, tone }) {
@@ -183,7 +158,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
   const [error, setError] = useState(null);
   const [message, setMessage] = useState("");
   const [validation, setValidation] = useState(null);
-  const [checkEvidence, setCheckEvidence] = useState(null);
   const [review, setReview] = useState(null);
   const [queuedResult, setQueuedResult] = useState(null);
   const [confirmationOpen, setConfirmationOpen] = useState(false);
@@ -199,18 +173,16 @@ export default function CampaignExecutionEntry({ onNavigate }) {
   const selectedDraft = selected?.status === "draft";
   const blockers = getValidationBlockers(validation);
   const warnings = getValidationWarnings(validation);
-  const authorization = getAuthorizationSummary(validation, checkEvidence);
+  const authorization = getAuthorizationSummary(validation);
   const manifest = getManifest(review);
   const deliverableCount = asNumber(validation?.deliverable_job_count);
   const effectiveLimit = getEffectiveLimit(review);
   const validationEvidence = getValidationHash(validation);
-  const checkEvidenceId = getCheckId(checkEvidence);
   const finalReviewHash = review?.final_review_hash || "";
   const manifestHash = manifest?.manifest_hash || "";
   const accountSourceReady = hasAccountSourceContext(validation, review);
   const authorizationComplete = [authorization.unauthorized, authorization.synthetic, authorization.revoked].every((value) => value === 0);
   const limitReady = effectiveLimit !== null && deliverableCount !== null && deliverableCount <= effectiveLimit;
-  const evidenceNonMutating = checkIsNonMutating(checkEvidence);
   const queueDisabledReasons = [
     !selected && "Select a campaign explicitly.",
     selected && !selectedDraft && "Campaign status must be draft.",
@@ -220,9 +192,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
     review && !manifest?.manifest_confirmed && "Confirmed manifest was not returned.",
     review && !manifestHash && "Manifest hash was not returned.",
     validation && !authorizationComplete && "Recipient authorization is incomplete.",
-    !checkEvidence && "Run check without sending.",
-    checkEvidence && !evidenceNonMutating && "Check evidence is missing non-mutating proof.",
-    checkEvidence && !checkEvidenceId && "Dry-run/check ID was not returned.",
     !review && "Run final review.",
     review && !finalReviewHash && "Final-review hash was not returned.",
     validation && review && !accountSourceReady && "Account/source context is missing.",
@@ -235,7 +204,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
 
   function clearEvidence() {
     setValidation(null);
-    setCheckEvidence(null);
     setReview(null);
     setQueuedResult(null);
     setConfirmationOpen(false);
@@ -291,7 +259,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
     setError(null);
     setMessage("");
     setValidation(null);
-    setCheckEvidence(null);
     setReview(null);
     setQueuedResult(null);
     try {
@@ -305,26 +272,8 @@ export default function CampaignExecutionEntry({ onNavigate }) {
     }
   }
 
-  async function runCheck() {
-    if (!selectedId || busy || !validation) return;
-    setBusy("check");
-    setError(null);
-    setMessage("");
-    setCheckEvidence(null);
-    setReview(null);
-    try {
-      const result = await checkCampaignWithoutSending(selectedId);
-      setCheckEvidence(result);
-      setMessage("Check without sending completed.");
-    } catch (err) {
-      setError(extractApiError(err));
-    } finally {
-      setBusy("");
-    }
-  }
-
   async function runFinalReview() {
-    if (!selectedId || busy || !validation || !checkEvidence) return;
+    if (!selectedId || busy || !validation) return;
     setBusy("review");
     setError(null);
     setMessage("");
@@ -355,8 +304,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
       const payload = {
         validation_hash: validation?.validation_hash,
         validation_id: validation?.validation_id,
-        dry_run_id: checkEvidence?.audit?.dry_run_id || checkEvidence?.dry_run_id,
-        check_id: checkEvidence?.audit?.check_id || checkEvidence?.check_id,
         final_review_hash: finalReviewHash,
         manifest_hash: manifestHash,
         approval_id: review?.approval_id || review?.approval?.approval_id,
@@ -364,11 +311,13 @@ export default function CampaignExecutionEntry({ onNavigate }) {
         explicit_operator_confirmation: true,
         expected_campaign_status: "draft",
       };
-      const result = await queueCampaign(selectedId, payload);
+      const queued = await queueCampaign(selectedId, payload);
+      const started = await startCampaign(selectedId);
+      const result = { ...queued, start: started, campaign: started?.campaign || queued?.campaign };
       setQueuedResult(result);
       setConfirmationOpen(false);
       setOperatorConfirmed(false);
-      setMessage(`Queued. execution_started=${compact(result?.execution_started)}`);
+      setMessage(`Queued and started. status=${compact(result?.campaign?.status)}`);
       await load();
     } catch (err) {
       setError(extractApiError(err));
@@ -385,11 +334,14 @@ export default function CampaignExecutionEntry({ onNavigate }) {
     <section className="campaign-entry-page" dir="rtl">
       <PageHeader
         title="Campaign Execution Entry"
-        description="Queueing is locked behind explicit selection, validation, check-without-sending evidence, final review, and a final operator confirmation."
+        description="Queueing is locked behind explicit selection, validation, final review, and a final operator confirmation."
         actions={<SecondaryButton onClick={() => load()} disabled={loading || Boolean(busy)}><RefreshCw size={17} />Refresh</SecondaryButton>}
       />
 
-      {error ? <InlineError>{QUEUE_ERROR_CODES.has(error.code) ? `${error.code}: ${error.message}` : error.message}</InlineError> : null}
+      {error ? <InlineError>
+        {QUEUE_ERROR_CODES.has(error.code) || error.code ? `${error.code}: ${error.message}` : error.message}
+        {error.validation ? <pre dir="ltr">{JSON.stringify(error.validation, null, 2)}</pre> : null}
+      </InlineError> : null}
       {message ? <div className="toast">{message}</div> : null}
 
       <ContentCard title="Campaign Selection" description="No campaign is selected automatically. Choose one campaign before running any action.">
@@ -442,11 +394,7 @@ export default function CampaignExecutionEntry({ onNavigate }) {
               <CheckCircle2 size={17} />
               Run validation
             </PrimaryButton>
-            <SecondaryButton disabled={!selectedId || !selectedDraft || !validation || Boolean(busy) || Boolean(queuedResult)} onClick={runCheck}>
-              <Search size={17} />
-              Check without sending
-            </SecondaryButton>
-            <SecondaryButton disabled={!selectedId || !selectedDraft || !validation || !checkEvidence || Boolean(busy) || Boolean(queuedResult)} onClick={runFinalReview}>
+            <SecondaryButton disabled={!selectedId || !selectedDraft || !validation || Boolean(busy) || Boolean(queuedResult)} onClick={runFinalReview}>
               <FileCheck2 size={17} />
               Final review
             </SecondaryButton>
@@ -470,17 +418,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
               <EvidenceRow label="Revoked jobs" value={authorization.revoked} />
               <EvidenceList items={blockers} />
               <EvidenceList items={warnings} />
-            </ContentCard>
-
-            <ContentCard title="Check Evidence">
-              <EvidenceRow label="Evidence ID" value={checkEvidenceId} />
-              <EvidenceRow label="Validation evidence" value={getCheckValidationHash(checkEvidence)} />
-              <EvidenceRow label="Read only" value={checkEvidence?.diagnostics?.read_only} tone={checkEvidence?.diagnostics?.read_only ? "success" : "danger"} />
-              <EvidenceRow label="Audit status" value={checkEvidence?.audit?.status} />
-              <EvidenceRow label="Non-mutating" value={evidenceNonMutating} tone={evidenceNonMutating ? "success" : "danger"} />
-              <EvidenceRow label="Browser launched" value={checkEvidence?.diagnostics?.forbidden_actions?.browser_launched} />
-              <EvidenceRow label="Adapter called" value={checkEvidence?.diagnostics?.forbidden_actions?.adapter_called} />
-              <EvidenceRow label="Message sent" value={checkEvidence?.diagnostics?.forbidden_actions?.message_sent} />
             </ContentCard>
 
             <ContentCard title="Final Review">
@@ -522,7 +459,6 @@ export default function CampaignExecutionEntry({ onNavigate }) {
               <EvidenceRow label="Effective limit" value={effectiveLimit} />
               <EvidenceRow label="Manifest hash" value={manifestHash} />
               <EvidenceRow label="Validation evidence" value={validationEvidence} />
-              <EvidenceRow label="Dry-run/check evidence" value={checkEvidenceId} />
               <EvidenceRow label="Final-review evidence" value={finalReviewHash} />
             </div>
             <Checkbox

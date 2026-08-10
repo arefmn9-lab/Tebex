@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+import os
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,10 @@ class ResourceCapacityProvider:
         self.cpu_percent = cpu_percent
         self.memory_percent = memory_percent
         self.available_memory_mb = available_memory_mb
+        browser_env = os.environ.get("CLINICOS_BROWSER_SLOT_CAPACITY")
+        worker_env = os.environ.get("CLINICOS_WORKER_SLOT_CAPACITY")
+        self.browser_slot_capacity = max(1, int(browser_env)) if browser_env else None
+        self.worker_slot_capacity = max(1, int(worker_env)) if worker_env else None
 
     def snapshot(self) -> ResourceSnapshot:
         return ResourceSnapshot(
@@ -54,9 +59,16 @@ class ResourceCapacityProvider:
 
     def decide(self, policy: dict[str, Any], snapshot: ResourceSnapshot | None = None, scheduler_status: str = "running") -> CapacityDecision:
         snap = snapshot or self.snapshot()
-        max_workers = int(policy.get("max_concurrent_accounts") or 0)
-        batch_size = int(policy.get("browser_start_batch_size") or max_workers or 0)
-        worker_slots = max(0, max_workers - int(snap.active_worker_count))
+        unrestricted = str(policy.get("concurrency_mode") or "operator_defined") == "unrestricted"
+        if unrestricted:
+            max_workers = max(0, int(snap.queued_job_count) + int(snap.active_worker_count))
+            batch_size = max_workers
+            worker_capacity = max_workers
+        else:
+            max_workers = int(policy.get("operator_defined_max_concurrent_accounts") or policy.get("max_concurrent_accounts") or 0)
+            batch_size = min(max_workers, int(policy.get("browser_concurrency") or max_workers))
+            worker_capacity = min(max_workers, int(policy.get("worker_concurrency") or max_workers))
+        worker_slots = max(0, worker_capacity - int(snap.active_worker_count))
         browser_slots = max(0, batch_size - int(snap.browser_starting_count))
         reasons: list[str] = []
         if scheduler_status in {"paused", "stopped"}:
@@ -78,3 +90,19 @@ class ResourceCapacityProvider:
             reason_codes=reasons,
             retry_after_seconds=30 if reasons else 0,
         )
+
+    def configuration_inputs(self, configured_max: int, eligible_count: int, host_resource_capacity: int | None = None, *, mode: str = "operator_defined", browser_capacity: int | None = None, worker_capacity: int | None = None) -> dict[str, Any]:
+        unrestricted = mode == "unrestricted"
+        browser = max(1, int(browser_capacity or self.browser_slot_capacity or configured_max or 1))
+        worker = max(1, int(worker_capacity or self.worker_slot_capacity or configured_max or 1))
+        host_capacity = None if unrestricted else max(1, int(host_resource_capacity or configured_max or 1))
+        effective = max(0, int(eligible_count)) if unrestricted else min(max(1, int(configured_max)), max(0, int(eligible_count)), browser, worker, host_capacity)
+        return {
+            "concurrency_mode": mode,
+            "configured_max_concurrent_accounts": int(configured_max),
+            "eligible_account_count": int(eligible_count),
+            "browser_slot_capacity": None if unrestricted else browser,
+            "worker_slot_capacity": None if unrestricted else worker,
+            "host_resource_capacity": host_capacity,
+            "effective_concurrency": effective,
+        }

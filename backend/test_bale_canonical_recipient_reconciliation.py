@@ -103,7 +103,7 @@ def test_duplicate_recipients_same_phone_do_not_define_execution_identity() -> N
 def test_manifest_null_authorized_true_cannot_preflight_queue_or_claim() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         service, adapter = _service(Path(tmp) / "canonical.db")
-        campaign = service.create_campaign({"name": "Null Manifest", "platform": "bale", "status": "draft", "source_channel_uid": CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID})
+        campaign = service.create_campaign({"name": "Null Manifest", "platform": "bale", "status": "draft", "source_channel_uid": CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID, "capacity_reservation": 1})
         _insert_legacy_contact_identity(service, campaign["id"])
         _approve_config(service, campaign["id"], _config())
         preflight = service.live_preflight(campaign["id"])
@@ -139,7 +139,7 @@ def test_manifest_null_authorized_true_cannot_preflight_queue_or_claim() -> None
 def test_verified_contact_without_manifest_is_not_execution_authorized() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         service, _ = _service(Path(tmp) / "canonical.db")
-        campaign = service.create_campaign({"name": "Verified Contact", "platform": "bale", "status": "draft", "source_channel_uid": CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID})
+        campaign = service.create_campaign({"name": "Verified Contact", "platform": "bale", "status": "draft", "source_channel_uid": CONTROLLED_SINGLE_RECIPIENT_SOURCE_UID, "capacity_reservation": 1})
         recipient, job = service.repository.create_recipient_and_job(campaign, "09050454491", CONTROLLED_SINGLE_RECIPIENT_PHONE, CONTROLLED_SINGLE_RECIPIENT_NAME, "contact_maintenance")
         service.repository.update_recipient_authorization(recipient["id"], {
             "recipient_origin": "user_provided",
@@ -149,7 +149,7 @@ def test_verified_contact_without_manifest_is_not_execution_authorized() -> None
             "bale_contact_verified": True,
         })
         details = service.repository.get_job_with_recipient(job["id"])
-        check = service.validate_live_recipient_authorization(job, details, dry_run=False)
+        check = service.validate_live_recipient_authorization(job, details, execution_mode="real_send")
         assert check["ok"] is False
         assert check["error_code"] == "recipient_input_manifest_required"
 

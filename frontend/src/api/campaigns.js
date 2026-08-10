@@ -16,6 +16,17 @@ export function getCampaign(campaignId) {
   return request(`/automation/campaigns/${encodeURIComponent(campaignId)}`);
 }
 
+export function getCampaignCapacity(campaignId) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/capacity`);
+}
+
+export function allocateCampaignCapacity(campaignId, payload) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/capacity`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function createCampaign(payload) {
   return request("/automation/campaigns", {
     method: "POST",
@@ -28,6 +39,10 @@ export function updateCampaign(campaignId, payload) {
     method: "PATCH",
     body: JSON.stringify(payload),
   });
+}
+
+export function deleteCampaign(campaignId) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}`, { method: "DELETE" });
 }
 
 export function validateCampaignStart(campaignId) {
@@ -55,14 +70,6 @@ export function resumeCampaign(campaignId) {
 
 export function cancelCampaign(campaignId) {
   return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/cancel`, { method: "POST" });
-}
-
-export function runCampaignDryRound(campaignId) {
-  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/run-dry-round`, { method: "POST" });
-}
-
-export function checkCampaignWithoutSending(campaignId) {
-  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/check-without-sending`, { method: "POST" });
 }
 
 export function previewCampaignRecipients(campaignId, payload) {
@@ -101,8 +108,11 @@ export function prepareCampaignContacts(campaignId) {
   return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/contacts/prepare`, { method: "POST" });
 }
 
-export function finalReviewCampaign(campaignId) {
-  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/final-review`, { method: "POST" });
+export function finalReviewCampaign(campaignId, payload = {}) {
+  return request(`/automation/campaigns/${encodeURIComponent(campaignId)}/final-review`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 export function requestSendApproval(campaignId, payload) {
@@ -195,50 +205,6 @@ export function authorizeRecipientLive(recipientId, payload) {
 
 export function revokeRecipientLive(recipientId, payload) {
   return request(`/automation/recipients/${encodeURIComponent(recipientId)}/revoke-live`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export function listBaleBulkCampaigns() {
-  return request("/automation/platforms/bale/bulk-campaigns");
-}
-
-export function saveBaleBulkCampaign(payload) {
-  return request("/automation/platforms/bale/bulk-campaigns", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export function getBaleBulkCampaign(campaignId) {
-  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}`);
-}
-
-export function validateBaleBulkCampaign(campaignId, payload) {
-  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/validate`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export function runBaleBulkDryPreflight(campaignId, payload = {}) {
-  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/dry-preflight`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export function getBaleBulkResults(campaignId) {
-  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/results`);
-}
-
-export function getBaleBulkResumeState(campaignId) {
-  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/resume-state`);
-}
-
-export function prepareBaleBulkLiveRun(campaignId, payload) {
-  return request(`/automation/platforms/bale/bulk-campaigns/${encodeURIComponent(campaignId)}/live-run`, {
     method: "POST",
     body: JSON.stringify(payload),
   });

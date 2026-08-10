@@ -4559,7 +4559,7 @@ textarea::placeholder {
 
 .account-summary-grid {
   display: grid;
-  grid-template-columns: repeat(8, minmax(100px, 1fr));
+  grid-template-columns: repeat(3, minmax(140px, 1fr));
   gap: 10px;
 }
 
@@ -4590,8 +4590,11 @@ textarea::placeholder {
 .account-list-toolbar input { width: 100%; }
 .dynamic-account-list { display: grid; gap: 8px; }
 .dynamic-account-row { border: 1px solid #e1e6ef; border-radius: 13px; overflow: hidden; }
-.account-centric-row .account-row-main { grid-template-columns: auto minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(150px, .9fr) auto; }
+.account-centric-row .account-row-main { grid-template-columns: auto minmax(180px, 1fr) minmax(150px, .75fr) minmax(390px, 1.8fr); }
 .account-actions button { display: inline-flex; align-items: center; gap: 6px; }
+.account-primary-actions { justify-content: flex-end; }
+.account-more-actions { white-space: nowrap; }
+.account-advanced-copy { margin: 0 0 12px; color: #475467; }
 .otp-safety-note { color: #475467; background: #f8fafc; border: 1px solid #e4e7ec; border-radius: 9px; padding: 10px 12px; }
 .created-account-success dl, .account-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
 .created-account-success dl div, .account-facts div { background: #f8fafc; border-radius: 9px; padding: 10px; }
@@ -4609,7 +4612,6 @@ textarea::placeholder {
   padding: 14px;
   border: 0;
   background: #fff;
-  cursor: pointer;
 }
 .account-row-main:hover { background: #f8faff; }
 .account-row-main span b, .account-row-main span small { display: block; }
@@ -4628,6 +4630,7 @@ textarea::placeholder {
 .danger-link { color: #b42318; }
 .pagination { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 15px; }
 .pagination button, .row-actions button, .wizard-actions button, .wizard-body > button { min-height: 36px; border: 1px solid #ccd5e3; background: #fff; border-radius: 9px; padding: 0 12px; cursor: pointer; }
+.account-actions .primary-button { background: var(--primary); border-color: var(--primary); color: #fff; }
 .pagination button:disabled, button:disabled { opacity: .5; cursor: not-allowed; }
 .onboarding-modal-backdrop { position: fixed; inset: 0; z-index: 2000; background: rgb(15 23 42 / 58%); display: grid; place-items: center; padding: 20px; }
 .onboarding-modal { position: relative; width: min(760px, 100%); max-height: 90vh; overflow: auto; background: #fff; border-radius: 20px; padding: 24px; box-shadow: 0 24px 80px rgb(0 0 0 / 25%); }
@@ -4652,15 +4655,15 @@ textarea::placeholder {
 .check-warn { background: #fffaeb; }
 
 @media (max-width: 1100px) {
-  .account-summary-grid { grid-template-columns: repeat(4, 1fr); }
+  .account-centric-row .account-row-main { grid-template-columns: auto minmax(180px, 1fr) minmax(150px, .75fr); }
+  .account-primary-actions { grid-column: 2 / -1; justify-content: flex-start; }
 }
 
 @media (max-width: 720px) {
   .bale-accounts-header, .account-list-toolbar { align-items: stretch; flex-direction: column; }
-  .account-summary-grid { grid-template-columns: repeat(2, 1fr); }
-  .account-row-main { grid-template-columns: 12px 1fr 24px; }
-  .account-row-main > span:nth-of-type(n+3) { display: none; }
-  .account-row-details dl { grid-template-columns: 1fr 1fr; }
+  .account-summary-grid { grid-template-columns: 1fr; }
+  .account-row-main, .account-centric-row .account-row-main { grid-template-columns: 12px 1fr; }
+  .account-primary-actions { grid-column: 1 / -1; justify-content: flex-start; }
   .wizard-stepper { grid-template-columns: repeat(4, 1fr); }
 }
 .action-error-notice {

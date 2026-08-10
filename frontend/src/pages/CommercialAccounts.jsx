@@ -17,7 +17,6 @@ import {
   updateBrowserIdentity,
   updateAccountSettings,
   validateBrowserIdentity,
-  verifyBaleAuthentication,
 } from "../api/commercialAccounts";
 import { EmptyState, ErrorState, LoadingState, Modal, PageHeader, StatusBadge, fmt, shortId } from "../components/commercial/CommercialUi.jsx";
 
@@ -136,7 +135,24 @@ export default function CommercialAccounts() {
     await runAccountAction(async () => {
       const session = await openBaleAuthentication(row.account_id);
       setAuthSessions((current) => ({ ...current, [row.account_id]: session }));
+      if (session.maintenance_session_id && !session.verified) pollAutomaticBaleLogin(row.account_id, session.maintenance_session_id);
     }, "نشست ورود دستی بله باز شد.");
+  }
+
+  function pollAutomaticBaleLogin(accountId, sessionId) {
+    window.setTimeout(async () => {
+      try {
+        const status = await getBaleAuthenticationStatus(sessionId);
+        setAuthSessions((current) => ({ ...current, [accountId]: status }));
+        if (!status.closed && !status.verified && !status.maintenance_released) pollAutomaticBaleLogin(accountId, sessionId);
+        else {
+          if (status.verified && !status.maintenance_released) await closeBaleAuthentication(sessionId);
+          load();
+        }
+      } catch (error) {
+        setMessage(error?.message || "بررسی خودکار ورود انجام نشد.");
+      }
+    }, 3000);
   }
 
   async function checkManualBaleLogin(row) {
@@ -149,18 +165,6 @@ export default function CommercialAccounts() {
       const status = await getBaleAuthenticationStatus(sessionId);
       setAuthSessions((current) => ({ ...current, [row.account_id]: status }));
     }, "وضعیت ورود بررسی شد.");
-  }
-
-  async function verifyManualBaleLogin(row) {
-    const sessionId = authSessions[row.account_id]?.maintenance_session_id;
-    if (!sessionId) {
-      setMessage("ابتدا نشست ورود دستی را باز کنید.");
-      return;
-    }
-    await runAccountAction(async () => {
-      const status = await verifyBaleAuthentication(sessionId);
-      setAuthSessions((current) => ({ ...current, [row.account_id]: status }));
-    }, "احراز هویت بله بررسی شد.");
   }
 
   async function closeManualBaleLogin(row) {
@@ -295,7 +299,6 @@ export default function CommercialAccounts() {
                   <td className="row-actions">
                     <button className="secondary-button" type="button" onClick={() => openManualBaleLogin(row)}>باز کردن بله برای ورود دستی</button>
                     <button className="secondary-button" type="button" onClick={() => checkManualBaleLogin(row)}>بررسی وضعیت ورود</button>
-                    <button className="secondary-button" type="button" onClick={() => verifyManualBaleLogin(row)}>تأیید ورود</button>
                     <button className="danger-button" type="button" onClick={() => closeManualBaleLogin(row)}>بستن نشست ورود دستی</button>
                   </td>
                   <td>

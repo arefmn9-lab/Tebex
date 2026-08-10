@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
+import os
 import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from modules.automation_engine.plugins.bale import bale_plugin
-from modules.automation_engine.plugins.bale.plugin import _native_profile_dir
+from modules.automation_engine.plugins.bale.plugin import _native_profile_dir, _save_login_debug_screenshot
 from modules.automation_engine.scenario_runner import ScenarioActionExecutor, ScenarioRunner
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_int(value: Any) -> int:
@@ -114,6 +118,36 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
         self.search_selector = ""
         self.first_recipient_result: dict[str, Any] | None = None
 
+    def _failure_evidence(self, selector: str) -> dict[str, Any]:
+        evidence: dict[str, Any] = {"selector": selector, "selector_strategy": "css"}
+        page = self.page
+        if page is None:
+            return evidence
+        try:
+            evidence["page_url"] = str(page.url or "")
+        except Exception:
+            pass
+        try:
+            evidence["page_title"] = str(page.title() or "")[:200]
+        except Exception:
+            pass
+        if os.environ.get("CLINICOS_CAPTURE_FAILURE_SCREENSHOT", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                evidence["screenshot_path"] = _save_login_debug_screenshot(page, str(self.plan.account_id))
+            except Exception as exc:
+                evidence["screenshot_error"] = type(exc).__name__
+        if os.environ.get("CLINICOS_CAPTURE_FAILURE_DOM", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                # Structural metadata only: never persist chat text, credentials,
+                # cookies, tokens, input values, or arbitrary body HTML.
+                evidence["dom_excerpt"] = page.evaluate(
+                    """(selector) => JSON.stringify(Array.from(document.querySelectorAll('.ReactModal__Overlay, [role=dialog]')).slice(0,3).map((node) => ({tag:node.tagName,role:node.getAttribute('role'),ariaLabel:node.getAttribute('aria-label'),className:String(node.className||'').slice(0,240),childCount:node.children.length,targetCount:node.querySelectorAll(selector).length}))).slice(0,2000)""",
+                    selector,
+                )
+            except Exception as exc:
+                evidence["dom_capture_error"] = type(exc).__name__
+        return evidence
+
     def _forward_modal_closed_after_click(self, page: Any) -> bool:
         try:
             overlay = page.locator(".ReactModal__Overlay")
@@ -145,7 +179,7 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
             return {"ok": False, "error_code": "element_selector_missing", "element": element_name}
         found = self.plugin._first_visible_selector(page, [selector], timeout_ms=timeout_ms or int(element.get("timeout_ms") or 5000))
         if not found:
-            return {"ok": False, "error_code": "element_not_found", "element": element_name, "selector": selector}
+            return {"ok": False, "error_code": "element_not_found", "element": element_name, **self._failure_evidence(selector)}
         if element_name == "source_message_items":
             self.source_verified = True
         if element_name == "recipient_search_input":
@@ -159,7 +193,7 @@ class BaleScenarioActionExecutor(ScenarioActionExecutor):
         if element_name == "recipient_result_rows":
             result = self._recipient_result_state(page, selector, timeout_ms or int(element.get("timeout_ms") or 4000))
             if not result.get("ok"):
-                return {"ok": False, "error_code": str(result.get("error_code") or "recipient_result_not_found"), "element": element_name, "selector": selector, **result}
+                return {"ok": False, "error_code": str(result.get("error_code") or "recipient_result_not_found"), "element": element_name, "selector": selector, **result, **self._failure_evidence(selector)}
             self.first_recipient_result = result
             visible_row_texts = result.get("visible_result_texts") if isinstance(result.get("visible_result_texts"), list) else []
             if not visible_row_texts and result.get("first_result_text"):
@@ -493,10 +527,13 @@ class BaleDeliveryAdapter:
         return self.create_runtime_session_for_account(plan.account_id, "", plan.worker_round_id, plan.effective_policy)
 
     def create_runtime_session_for_account(self, account_id: str, owner_token: str, worker_round_id: str, policy: dict[str, Any]) -> dict[str, Any]:
-        if not bool(policy.get("session_reuse_enabled")):
-            return {"platform": self.platform_name, "account_id": account_id, "profile_path": str(policy.get("profile_path") or _native_profile_dir(account_id)), "session_reuse_enabled": False}
-        payload = self.plugin.create_reusable_runtime_session(account_id, provider_mode="native_chrome", profile_path=policy.get("profile_path"))
-        return {"platform": self.platform_name, "account_id": account_id, "session_reuse_enabled": True, **payload}
+        payload = self.plugin.create_reusable_runtime_session(
+            account_id,
+            provider_mode="native_chrome",
+            profile_path=policy.get("profile_path"),
+            account_record=policy.get("account_record"),
+        )
+        return {"platform": self.platform_name, "account_id": account_id, "session_reuse_enabled": bool(policy.get("session_reuse_enabled")), **payload}
 
     def health_check_session(self, session: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "session": {key: session.get(key) for key in ["platform", "account_id"]}}
@@ -512,10 +549,35 @@ class BaleDeliveryAdapter:
         return self.execute_plan(plan, runtime_session=runtime_session)
 
     def execute_plan(self, plan: Any, runtime_session: Any | None = None) -> dict[str, Any]:
-        policy = getattr(plan, "effective_policy", {}) or {}
-        allow_final_send = bool(getattr(plan, "allow_final_send", False) or policy.get("allow_final_send"))
-        operation_mode = "no_send" if bool(getattr(plan, "dry_run", False)) else "live_send"
-        return self.execute_standalone_scenario(plan, operation_mode=operation_mode, allow_final_send=allow_final_send, runtime_session=runtime_session)
+        operation_mode = "live_send"
+        allow_final_send = True
+        logger.info(
+            "[BALE_UI_EXECUTION_START] account_id=%s recipient=%s chrome_launch=%s scenario_start=true",
+            plan.account_id,
+            plan.display_name or plan.phone,
+            "reused" if runtime_session is not None else "visible_persistent_context",
+        )
+        logger.info(
+            "[REAL_SEND_PATH] account_id=%s campaign_id=%s job_id=%s operation_mode=%s allow_final_send=%s",
+            plan.account_id,
+            plan.campaign_id,
+            plan.job_id,
+            operation_mode,
+            allow_final_send,
+        )
+        result = self.execute_standalone_scenario(
+            plan,
+            operation_mode=operation_mode,
+            allow_final_send=allow_final_send,
+            runtime_session=runtime_session,
+        )
+        logger.info(
+            "[REAL_SEND_RESULT] recipient=%s success=%s verification_result=%s",
+            plan.display_name or plan.phone,
+            bool(result.get("success")),
+            bool(result.get("delivery_verified") or result.get("forward_verified")),
+        )
+        return result
 
     def controlled_live_no_send(self, plan: Any, runtime_session: Any | None = None) -> dict[str, Any]:
         return self.execute_standalone_scenario(plan, operation_mode="no_send", allow_final_send=False, runtime_session=runtime_session)
@@ -556,7 +618,35 @@ class BaleDeliveryAdapter:
         send_action_verified = bool(records.get("send_action_verified"))
         delivery_status = str(records.get("delivery_status") or ("delivered" if records.get("send_success_verified") else "submitted" if send_action_verified else "send_unverified" if final_send_invoked else "not_sent"))
         delivery_verified = bool(records.get("delivery_verified") or records.get("send_success_verified"))
-        success = bool(scenario_result.get("ok"))
+        recipient_resolved = bool(records.get("recipient_resolved"))
+        live_send_success = bool(
+            recipient_resolved
+            and final_send_invoked
+            and confirm_click_count >= 1
+            and send_action_verified
+            and delivery_status in {"submitted", "delivered"}
+        )
+        success = bool(
+            scenario_result.get("ok")
+            and (live_send_success if operation_mode == "live_send" else True)
+            and not scenario_result.get("error_code")
+        )
+        final_error_code = scenario_result.get("error_code")
+        final_error_message = scenario_result.get("error_message")
+        if operation_mode == "live_send" and not success and not final_error_code:
+            final_error_code = "final_send_result_unverified"
+            final_error_message = "Recipient selection, confirm action, and final send verification are all required"
+        logger.info(
+            "[FINAL_SEND_RESULT] account_id=%s campaign_id=%s job_id=%s recipient_selected=%s confirm_count=%s send_verified=%s delivery_status=%s result=%s",
+            plan.account_id,
+            plan.campaign_id,
+            plan.job_id,
+            recipient_resolved,
+            confirm_click_count,
+            send_action_verified,
+            delivery_status,
+            "success" if success else "failed",
+        )
         return {
             "success": success,
             "ok": success,
@@ -571,7 +661,7 @@ class BaleDeliveryAdapter:
             "source_channel_uid": source_uid,
             "source_resolved": bool(records.get("source_resolved")),
             "source_timeline_detected": bool(records.get("source_timeline_detected")),
-            "recipient_resolved": bool(records.get("recipient_resolved")),
+            "recipient_resolved": recipient_resolved,
             "composer_visible": bool(records.get("confirmation_visible")),
             "final_send_control_visible": bool(records.get("confirmation_visible")),
             "stopped_before_send": bool(scenario_result.get("stopped_before_send") or records.get("stopped_before_send")),
@@ -587,8 +677,8 @@ class BaleDeliveryAdapter:
             "remote_message_id": records.get("remote_message_id") or None,
             "outcome": "sent" if final_send_invoked and success and delivery_status in {"submitted", "delivered"} else "cancelled",
             "failed_step": failed_step,
-            "error_code": scenario_result.get("error_code"),
-            "error_message": scenario_result.get("error_message"),
+            "error_code": final_error_code,
+            "error_message": final_error_message,
             "scenario_result": scenario_result,
             "diagnostics": records,
         }

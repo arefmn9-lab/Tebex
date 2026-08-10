@@ -1,50 +1,70 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
-  CircleOff,
   LockKeyhole,
   Plus,
   RefreshCw,
   Search,
-  ShieldCheck,
-  Stethoscope,
   X,
 } from "lucide-react";
 import {
-  auditBaleAuthentication,
-  closeBaleAuthentication,
-  disableBaleAccount,
-  getBaleAuthenticationStatus,
+  deleteBaleAccount,
+  getBaleAccountOperation,
   listBaleOnboardingAccounts,
   openBaleAuthentication,
+  recheckBaleAuthentication,
   preflightBaleAccount,
   provisionBaleAccount,
-  reconcileBaleAccount,
-  verifyBaleAuthentication,
+  resetBaleAccountProfile,
 } from "../api/baleOnboarding";
+import { recordDiagnosticEvent } from "../diagnostics";
+import { BALE_AUTH_LABELS, formatBaleAccountActionError, mapBaleAuthState } from "../baleAuthPresentation";
 
 const pageSize = 10;
 const draftStorageKey = "clinicos:bale-account-create-draft";
 const sessionStorageKey = "clinicos:bale-controlled-login-sessions";
+const TERMINAL_ACCOUNT_OPERATION_STATUSES = new Set(["completed", "succeeded", "failed", "cancelled", "interrupted", "timed_out"]);
 
-const statusLabels = {
-  discovered_existing: "اکانت موجود",
-  provisioned: "ایجاد شده",
-  login_required: "نیازمند ورود",
-  login_in_progress: "مرورگر ورود باز است",
-  authenticated: "احراز شده",
-  persistence_check_required: "نیازمند تست نشست",
-  ready: "آماده",
-  verification_expired: "تأیید منقضی",
-  blocked: "مسدود",
-  disabled: "غیرفعال",
-  retired: "بازنشسته",
-  provisioning_failed: "ایجاد ناموفق",
-  authentication_failed: "احراز ناموفق",
-};
+// ============================================================
+// BLOCK: BALE_ACCOUNT_CARD_PRESENTATION
+// PURPOSE:
+// Maps backend account data to the four simple MVP states shown to operators.
+// ACCOUNT_SCOPE:
+// One Bale account card only.
+// DEPENDENCIES:
+// Canonical onboarding account payload and local authentication session state.
+// LAYER:
+// UI
+// ============================================================
+
+function accountPhone(account) {
+  return account.phone || account.username_or_number || account.normalized_identifier || account.account_id.replace(/^bale_/, "") || "شماره ثبت نشده";
+}
+
+function backendAuthState(session) {
+  return session?.status?.auth?.auth_state || session?.auth?.auth_state || "";
+}
+
+function isTerminalAuthenticationError(account, sessionAuth) {
+  const errorCode = String(sessionAuth.error_code || "");
+  if (["authentication_failed", "blocked"].includes(account.lifecycle_status)) return true;
+  if (["blocked", "manual_review"].includes(account.health_status)) return true;
+  if (errorCode === "account_restricted") return true;
+  if (errorCode === "maintenance_session_not_found") return false;
+  return /(?:fatal|browser_(?:start|launch)|session_(?:closed|invalidated|page_closed)|profile_identity)/.test(errorCode);
+}
+
+function userState(account, session, busyKey = "") {
+  const sessionAuth = session?.status?.auth || session?.auth || {};
+  if (isTerminalAuthenticationError(account, sessionAuth)) return BALE_AUTH_LABELS.probe_failure;
+  return mapBaleAuthState(account, session, busyKey);
+}
+
+// ============================================================
+// END BLOCK: BALE_ACCOUNT_CARD_PRESENTATION
+// ============================================================
 
 function safeError(error, fallback) {
   return error?.data?.detail?.message || error?.data?.detail || error?.message || fallback;
@@ -58,17 +78,6 @@ function readStoredJson(key, fallback) {
   }
 }
 
-function Technical({ value }) {
-  const [open, setOpen] = useState(false);
-  if (!value) return null;
-  return (
-    <button className="technical-toggle" type="button" onClick={() => setOpen((value) => !value)}>
-      {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />} جزئیات فنی
-      {open ? <code>{typeof value === "string" ? value : JSON.stringify(value, null, 2)}</code> : null}
-    </button>
-  );
-}
-
 export default function BaleAccounts() {
   const [payload, setPayload] = useState({ items: [], summary: {}, configuration: {} });
   const [search, setSearch] = useState("");
@@ -76,13 +85,51 @@ export default function BaleAccounts() {
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
+  const [pendingActions, setPendingActions] = useState({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [expanded, setExpanded] = useState("");
   const [createModal, setCreateModal] = useState(() => readStoredJson(draftStorageKey, null));
-  const [diagnostics, setDiagnostics] = useState(null);
   const [sessions, setSessions] = useState(() => readStoredJson(sessionStorageKey, {}));
   const pollers = useRef(new Map());
+  const previousMappedStates = useRef(new Map());
+
+  function setActionPending(accountId, action, pending) {
+    setPendingActions((current) => ({
+      ...current,
+      [accountId]: { ...(current[accountId] || {}), [action]: pending },
+    }));
+  }
+
+  function actionAvailability(account, action) {
+    const pending = pendingActions[account.account_id] || {};
+    const authenticationPending = Boolean(pending.open_login || pending.session_recheck);
+    const destructivePending = Boolean(pending.delete_account || pending.reset_profile);
+    const anyPending = authenticationPending || destructivePending || Boolean(account.operation_busy);
+    const concreteRuntimeOwner = Boolean(account.active_job || account.account_lock || account.profile_lock);
+    if (action === "delete_account") {
+      return { disabled: anyPending, reason: anyPending ? "عملیات قبلی این اکانت هنوز تمام نشده است." : null };
+    }
+    if (action === "reset_profile") {
+      return { disabled: anyPending || concreteRuntimeOwner, reason: anyPending ? "عملیات قبلی هنوز تمام نشده است." : concreteRuntimeOwner ? "اکانت اکنون مشغول است؛ پس از پایان کار دوباره تلاش کنید." : null };
+    }
+    return { disabled: anyPending || concreteRuntimeOwner || Boolean(account.soft_deleted || account.retired), reason: anyPending ? "عملیات قبلی این اکانت هنوز تمام نشده است." : concreteRuntimeOwner ? "اکانت اکنون مشغول است؛ پس از پایان کار دوباره تلاش کنید." : (account.soft_deleted || account.retired) ? "این اکانت دیگر فعال نیست." : null };
+  }
+
+  function recordActionClick(account, action, availability) {
+    recordDiagnosticEvent({
+      action: "[BALE_UI_ACCOUNT_ACTION_CLICK]",
+      clicked_action: action,
+      module: "bale_accounts_ui",
+      account_id: account.account_id,
+      handler_reached: true,
+      button_disabled: availability.disabled,
+      disabled_reason: availability.reason,
+      pending_state: pendingActions[account.account_id] || {},
+      timestamp: new Date().toISOString(),
+      success: !availability.disabled,
+    });
+  }
 
   async function refresh() {
     setError("");
@@ -91,6 +138,8 @@ export default function BaleAccounts() {
 
   useEffect(() => {
     refresh().catch((err) => setError(safeError(err, "دریافت فهرست اکانت‌ها انجام نشد."))).finally(() => setLoading(false));
+    // Stored session metadata is display-only on mount. Only an explicit
+    // per-account action below may start polling or browser maintenance.
     return () => {
       for (const timer of pollers.current.values()) window.clearInterval(timer);
       pollers.current.clear();
@@ -106,18 +155,47 @@ export default function BaleAccounts() {
     localStorage.setItem(sessionStorageKey, JSON.stringify(sessions));
   }, [sessions]);
 
+  useEffect(() => {
+    for (const account of payload.items) {
+      const session = sessions[account.account_id];
+      const mappedState = userState(account, session, busy);
+      const previousState = previousMappedStates.current.get(account.account_id) || "initial";
+      if (previousState === mappedState) continue;
+      const backendState = backendAuthState(session) || account.authentication_status || "unknown";
+      const diagnosticState = {
+        account_id: account.account_id,
+        previous_state: previousState,
+        mapped_state: mappedState,
+        backend_auth_state: backendState,
+      };
+      console.info("[BALE_UI_AUTH_STATE]", diagnosticState);
+      recordDiagnosticEvent({
+        action: "[BALE_UI_AUTH_STATE]",
+        module: "bale_accounts_ui",
+        account_id: account.account_id,
+        success: mappedState !== "خطا",
+        status: mappedState,
+        error_message: JSON.stringify(diagnosticState),
+        related_files: ["frontend/src/pages/BaleAccounts.jsx"],
+      });
+      previousMappedStates.current.set(account.account_id, mappedState);
+    }
+  }, [payload.items, sessions, busy]);
+
   const filtered = useMemo(() => payload.items.filter((account) => {
-    const text = `${account.masked_identifier} ${account.account_id} ${account.lifecycle_status} ${account.authentication_status}`.toLowerCase();
-    return text.includes(search.trim().toLowerCase()) && (filter === "all" || account.lifecycle_status === filter);
-  }), [payload.items, search, filter]);
+    const session = sessions[account.account_id];
+    const text = `${accountPhone(account)} ${account.account_id} ${userState(account, session, busy)}`.toLowerCase();
+    return text.includes(search.trim().toLowerCase()) && (filter === "all" || userState(account, session, busy) === filter);
+  }), [payload.items, search, filter, sessions, busy]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
   const currentPage = Math.min(page, pageCount);
   const visible = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-  const config = payload.configuration || {};
-  const summary = payload.summary || {};
-  const disabledCount = payload.items.filter((account) => account.lifecycle_status === "disabled").length;
+  const operatorSummary = useMemo(() => {
+    const ready = payload.items.filter((account) => userState(account, sessions[account.account_id], busy) === BALE_AUTH_LABELS.ready).length;
+    return { total: payload.items.length, ready, needsAttention: Math.max(0, payload.items.length - ready) };
+  }, [payload.items, sessions, busy]);
 
-  async function act(key, action, success = "") {
+  async function act(key, action, success = "", formatError = safeError) {
     setBusy(key);
     setError("");
     setNotice("");
@@ -127,7 +205,7 @@ export default function BaleAccounts() {
       await refresh();
       return result;
     } catch (err) {
-      setError(safeError(err, "عملیات انجام نشد."));
+      setError(formatError(err, "عملیات اکانت کامل نشد. دوباره تلاش کنید."));
       return null;
     } finally {
       setBusy("");
@@ -140,7 +218,7 @@ export default function BaleAccounts() {
 
   async function validateAndProvision() {
     const phone = createModal.phone.trim();
-    const preflight = await act("create:preflight", () => preflightBaleAccount({ identifier: phone, account_id: null }));
+    const preflight = await act("create:preflight", () => preflightBaleAccount({ identifier: phone, account_id: null }), "", formatBaleAccountActionError);
     if (!preflight) return;
     setCreateModal((current) => ({ ...current, preflight, stage: "preflight" }));
     if (!preflight.provisioning_allowed) return;
@@ -151,7 +229,7 @@ export default function BaleAccounts() {
       account_id: preflight.account_id,
       idempotency_key: idempotencyKey,
       created_by: "operator-ui",
-    }), "اکانت و پروفایل دائمی ایجاد شدند.");
+    }), "اکانت و پروفایل دائمی ایجاد شدند.", formatBaleAccountActionError);
     if (result) {
       setCreateModal((current) => ({
         ...current,
@@ -162,91 +240,149 @@ export default function BaleAccounts() {
     }
   }
 
-  function startPolling(accountId, maintenanceSessionId) {
+  // FUNCTION:
+  // startPolling
+  // RESPONSIBILITY:
+  // Tracks one account authentication session and persists verified state.
+  // INPUT:
+  // accountId, maintenanceSessionId
+  // OUTPUT:
+  // None
+  // SIDE EFFECTS:
+  // Polls status, verifies authenticated sessions once, and removes stale sessions.
+  function startPolling(accountId, operationId, action) {
     const previous = pollers.current.get(accountId);
     if (previous) window.clearInterval(previous);
     const timer = window.setInterval(async () => {
       try {
-        const status = await getBaleAuthenticationStatus(maintenanceSessionId);
+        const status = await getBaleAccountOperation(operationId);
+        recordDiagnosticEvent({ action: "account_operation_poll", module: "bale_accounts_ui", account_id: accountId, operation_id: operationId, endpoint: `/automation/platforms/bale/account-operations/${operationId}`, http_method: "GET", stage: status.status, success: status.status !== "failed", result: { status: status.status, error_code: status.error_code } });
         setSessions((current) => ({ ...current, [accountId]: { ...current[accountId], status } }));
-        if (status.closed) {
+        if (TERMINAL_ACCOUNT_OPERATION_STATUSES.has(status.status)) {
+          let refreshError = null;
+          try {
+            await refresh();
+          } catch (rowRefreshError) {
+            refreshError = rowRefreshError;
+          }
+          const succeeded = ["completed", "succeeded"].includes(status.status);
+          recordDiagnosticEvent({ action: "account_operation_terminal_and_row_refreshed", clicked_action: action, module: "bale_accounts_ui", account_id: accountId, operation_id: operationId, endpoint: `/automation/platforms/bale/account-operations/${operationId}`, http_method: "GET", stage: status.status, success: succeeded && !refreshError, error_code: status.error_code || refreshError?.errorCode, error_message: status.error_message || (refreshError ? safeError(refreshError, "Account row refresh failed.") : null), result: status.result?.final_persisted_account_state || status.result?.after || null });
           window.clearInterval(timer);
           pollers.current.delete(accountId);
+          setBusy("");
+          setActionPending(accountId, action, false);
+          if (["failed", "cancelled", "interrupted", "timed_out"].includes(status.status)) {
+            setNotice("");
+            setError(formatBaleAccountActionError(status, "بازبینی اکانت کامل نشد. دوباره تلاش کنید."));
+          } else if (refreshError) setError(formatBaleAccountActionError(refreshError, "فهرست اکانت‌ها تازه‌سازی نشد. دوباره تلاش کنید."));
+          else if (action === "session_recheck") setNotice("بازبینی نشست با موفقیت انجام شد.");
+          else if (action === "open_login") setNotice("وضعیت ورود اکانت با موفقیت تأیید شد.");
+          return;
         }
-      } catch {
+      } catch (pollingError) {
         window.clearInterval(timer);
         pollers.current.delete(accountId);
+        setBusy("");
+        if (action) setActionPending(accountId, action, false);
+        setNotice("");
+        setError(formatBaleAccountActionError(pollingError, "بازبینی اکانت کامل نشد. دوباره تلاش کنید."));
       }
     }, 3000);
     pollers.current.set(accountId, timer);
   }
 
+  // FUNCTION:
+  // openLogin
+  // RESPONSIBILITY:
+  // Starts the existing authentication API flow from one account card.
+  // INPUT:
+  // Canonical account payload and authentication purpose
+  // OUTPUT:
+  // Authentication maintenance session payload or null
+  // SIDE EFFECTS:
+  // Records UI diagnostics and starts status polling for this account.
   async function openLogin(account, purpose = "login") {
-    const key = `open:${account.account_id}:${purpose}`;
+    const action = purpose === "session_recheck" ? "session_recheck" : "open_login";
+    const key = `${account.account_id}:${action}`;
+    const startedAt = performance.now();
+    const availability = actionAvailability(account, action);
+    recordActionClick(account, action, availability);
+    if (availability.disabled) return null;
+    setActionPending(account.account_id, action, true);
+    const endpoint = purpose === "session_recheck" ? "/automation/platforms/bale/authentication/session-recheck" : "/automation/platforms/bale/authentication/open";
+    recordDiagnosticEvent({ action: `${action}_request_started`, clicked_action: action, module: "bale_accounts_ui", account_id: account.account_id, endpoint, http_method: "POST", handler_reached: true, success: true, stage: "requesting_operation" });
+    recordDiagnosticEvent({
+      action: `${action}_started`,
+      module: "bale_accounts_ui",
+      account_id: account.account_id,
+      success: true,
+      status: "started",
+      endpoint,
+      related_files: ["frontend/src/pages/BaleAccounts.jsx"],
+    });
     const result = await act(key, async () => {
-      await auditBaleAuthentication(account.account_id);
-      return openBaleAuthentication(account.account_id, purpose);
-    }, purpose === "persistence" ? "همان پروفایل برای تست نشست باز شد." : "Chrome با پروفایل دائمی این اکانت باز شد.");
-    if (!result) return;
+      return purpose === "session_recheck"
+        ? recheckBaleAuthentication(account.account_id)
+        : openBaleAuthentication(account.account_id, purpose);
+    }, action === "open_login" ? "پنجره ورود این اکانت باز شد." : "", formatBaleAccountActionError);
+    recordDiagnosticEvent({
+      action: `${action}_accepted`,
+      module: "bale_accounts_ui",
+      account_id: account.account_id,
+      success: Boolean(result),
+      status: result ? "succeeded" : "failed",
+      endpoint,
+      duration_ms: performance.now() - startedAt,
+      related_files: ["frontend/src/pages/BaleAccounts.jsx"],
+    });
+    if (!result) {
+      setActionPending(account.account_id, action, false);
+      return null;
+    }
+    recordDiagnosticEvent({ action: "account_operation_accepted", clicked_action: action, module: "bale_accounts_ui", account_id: account.account_id, endpoint, http_method: "POST", operation_id: result.operation_id, stage: "accepted_202", success: true });
     setSessions((current) => ({
       ...current,
       [account.account_id]: {
-        maintenance_session_id: result.maintenance_session_id,
+        operation_id: result.operation_id,
         purpose,
         status: result,
       },
     }));
-    startPolling(account.account_id, result.maintenance_session_id);
+    startPolling(account.account_id, result.operation_id, action);
     return result;
   }
 
-  async function confirmLogin(account) {
-    const session = sessions[account.account_id];
-    if (!session?.maintenance_session_id) {
-      setError("ابتدا «ورود دستی» را برای این اکانت باز کنید.");
+  async function runAccountAction(account, action) {
+    const availability = actionAvailability(account, action);
+    recordActionClick(account, action, availability);
+    if (availability.disabled) return;
+    recordDiagnosticEvent({ action: "confirmation_opened", clicked_action: action, module: "bale_accounts_ui", account_id: account.account_id, handler_reached: true, success: true });
+    const confirmed = action === "delete_account"
+      ? window.confirm(`حذف اکانت ${accountPhone(account)} (${account.account_id})، ورود ذخیره‌شده و پروفایل مرورگر دائمی است. ادامه می‌دهید؟`)
+      : window.confirm(`پروفایل ذخیره‌شده ${account.account_id} بازنشانی شود؟`);
+    recordDiagnosticEvent({ action: confirmed ? "confirmation_accepted" : "confirmation_cancelled", clicked_action: action, module: "bale_accounts_ui", account_id: account.account_id, success: confirmed });
+    if (!confirmed) return;
+    setActionPending(account.account_id, action, true);
+    const endpoint = action === "delete_account" ? `/automation/platforms/bale/accounts/${account.account_id}?delete_profile=true` : `/automation/platforms/bale/onboarding/accounts/${account.account_id}/reset-profile`;
+    recordDiagnosticEvent({ action: `${action}_request_started`, clicked_action: action, module: "bale_accounts_ui", account_id: account.account_id, endpoint, http_method: action === "delete_account" ? "DELETE" : "POST", stage: "requesting_operation", success: true });
+    const operation = await act(`${account.account_id}:${action}`, () => (
+      action === "delete_account"
+        ? deleteBaleAccount(account.account_id)
+        : resetBaleAccountProfile(account.account_id, account.account_id)
+    ), "", formatBaleAccountActionError);
+    if (!operation) {
+      setActionPending(account.account_id, action, false);
       return;
     }
-    const result = await act(`verify:${account.account_id}`, () => verifyBaleAuthentication(session.maintenance_session_id), "نتیجه احراز هویت از بک‌اند دریافت شد.");
-    if (result) setSessions((current) => ({ ...current, [account.account_id]: { ...session, status: result } }));
-  }
-
-  async function closeBrowser(account) {
-    const session = sessions[account.account_id];
-    if (!session?.maintenance_session_id) {
-      setError("نشست مرورگر فعالی برای این اکانت ثبت نشده است.");
+    const terminal = operation.status && TERMINAL_ACCOUNT_OPERATION_STATUSES.has(operation.status);
+    recordDiagnosticEvent({ action: terminal ? "account_operation_terminal" : "account_operation_accepted", clicked_action: action, module: "bale_accounts_ui", account_id: account.account_id, endpoint, http_method: action === "delete_account" ? "DELETE" : "POST", operation_id: operation.operation_id, stage: terminal ? operation.status : "accepted_202", success: !terminal || ["completed", "succeeded"].includes(operation.status), error_code: operation.error_code, error_message: operation.error_message, result: terminal ? operation : null });
+    if (!operation.operation_id || terminal) {
+      setActionPending(account.account_id, action, false);
+      await refresh();
       return;
     }
-    const result = await act(`close:${account.account_id}`, () => closeBaleAuthentication(session.maintenance_session_id), "مرورگر به‌صورت امن بسته شد.");
-    if (result) {
-      const timer = pollers.current.get(account.account_id);
-      if (timer) window.clearInterval(timer);
-      pollers.current.delete(account.account_id);
-      setSessions((current) => {
-        const next = { ...current };
-        delete next[account.account_id];
-        return next;
-      });
-    }
-  }
-
-  async function reconcileAll() {
-    const results = [];
-    for (const account of payload.items) {
-      const result = await reconcileBaleAccount(account.account_id);
-      results.push(result);
-    }
-    setDiagnostics({ mode: "all", results });
-    setNotice("تطبیق فقط‌خواندنی همه اکانت‌ها انجام شد.");
-  }
-
-  async function showDiagnostics(account) {
-    const result = await act(`diagnostics:${account.account_id}`, () => reconcileBaleAccount(account.account_id));
-    if (result) setDiagnostics({ mode: "single", account, results: [result] });
-  }
-
-  async function disableAccount(account) {
-    if (!window.confirm(`اکانت ${account.account_id} غیرفعال شود؟ پروفایل و نشست ذخیره‌شده حذف نمی‌شوند.`)) return;
-    await act(`disable:${account.account_id}`, () => disableBaleAccount(account.account_id), "اکانت بدون حذف پروفایل غیرفعال شد.");
+    setSessions((current) => ({ ...current, [account.account_id]: { operation_id: operation.operation_id, action, status: operation } }));
+    startPolling(account.account_id, operation.operation_id, action);
   }
 
   return (
@@ -254,42 +390,64 @@ export default function BaleAccounts() {
       <header className="bale-accounts-header">
         <div>
           <p className="eyebrow">مدیریت اکانت‌های بله</p>
-          <h1>اکانت‌ها و پروفایل‌های دائمی</h1>
-          <p>هر اکانت مستقل است؛ ساخت، ورود و تست نشست به بچ یا تعداد اکانت‌ها وابسته نیست.</p>
+          <h1>اکانت‌ها</h1>
+          <p>ورود، بررسی نشست و وضعیت هر اکانت را از همین‌جا مدیریت کنید.</p>
         </div>
         <div className="header-actions">
           <button className="primary-button" onClick={beginCreate} disabled={Boolean(busy)}><Plus size={17} /> افزودن اکانت جدید</button>
           <button className="secondary-button" onClick={() => act("refresh", refresh)} disabled={Boolean(busy)}><RefreshCw size={16} /> بروزرسانی</button>
-          <button className="secondary-button" onClick={() => act("reconcile:all", reconcileAll)} disabled={Boolean(busy) || !payload.items.length}><Stethoscope size={16} /> تطبیق همه</button>
         </div>
       </header>
-
-      <section className="operational-banner" aria-label="وضعیت عملیاتی">
-        <strong>ONBOARDING MODE</strong>
-        <span>LIVE SENDING {config.live_sending_enabled ? "ENABLED" : "DISABLED"}</span>
-        <span>QUEUE {config.queue_enabled ? "ENABLED" : "DISABLED"}</span>
-        <span>LOGIN CONCURRENCY: {config.max_login_concurrency ?? "—"}</span>
-      </section>
 
       {error ? <div className="inline-error" role="alert">{typeof error === "string" ? error : JSON.stringify(error)}</div> : null}
       {notice ? <div className="onboarding-notice"><CheckCircle2 size={17} /> {notice}</div> : null}
 
+      {/*
+      <section className="account-list-panel" aria-label="تنظیمات ماندگاری نشست">
+        <button className="secondary-button" onClick={() => setSettingsOpen((value) => !value)}>تنظیمات ورود ذخیره‌شده</button>
+        {false ? (
+          <form className="account-advanced-details" onSubmit={(event) => {
+            event.preventDefault();
+            const form = new FormData(event.currentTarget);
+            act("session-policy", () => updateBaleOperationalConfiguration({
+              bale_session_maintenance_mode: form.get("maintenance_mode"),
+              session_revalidation_interval_seconds: Number(form.get("session_interval")),
+              session_revalidation_grace_seconds: Number(form.get("session_grace")),
+              identity_reverify_interval_seconds: Number(form.get("identity_interval")),
+              maintenance_browser_concurrency: Number(form.get("maintenance_concurrency")),
+              preserve_eligibility_during_inconclusive: form.get("preserve_grace") === "on",
+              require_periodic_full_identity_probe: form.get("periodic_identity") === "on",
+              activation_policy_after_identity_match: form.get("activation_policy"),
+            }), "تنظیمات نشست ذخیره شد.");
+          }}>
+            <label>حالت نگهداری نشست<select name="maintenance_mode" defaultValue={payload.configuration.bale_session_maintenance_mode || "manual_only"}><option value="manual_only">فقط دستی</option><option value="on_demand">هنگام استفاده</option><option value="scheduled">زمان‌بندی‌شده</option></select></label>
+            <label>فاصله بازبینی نشست (ثانیه)<input name="session_interval" type="number" min="30" defaultValue={payload.configuration.session_revalidation_interval_seconds} /></label>
+            <label>مهلت نشست (ثانیه)<input name="session_grace" type="number" min="0" defaultValue={payload.configuration.session_revalidation_grace_seconds} /></label>
+            <label>فاصله بازتأیید کامل هویت (ثانیه)<input name="identity_interval" type="number" min="60" defaultValue={payload.configuration.identity_reverify_interval_seconds} /></label>
+            <label>همزمانی مرورگر نگهداری<input name="maintenance_concurrency" type="number" min="1" defaultValue={payload.configuration.maintenance_browser_concurrency} /></label>
+            <label><input name="preserve_grace" type="checkbox" defaultChecked={payload.configuration.preserve_eligibility_during_inconclusive} /> حفظ آمادگی در خطای موقت و بدون شاهد خروج</label>
+            <label><input name="periodic_identity" type="checkbox" defaultChecked={payload.configuration.require_periodic_full_identity_probe} /> الزام بازتأیید دوره‌ای کامل هویت</label>
+            <label>سیاست فعال‌سازی<select name="activation_policy" defaultValue={payload.configuration.activation_policy_after_identity_match || "operator_approved"}><option value="operator_approved">اکانت تأییدشده اپراتور</option><option value="preserve_current">حفظ وضعیت فعلی</option><option value="manual">فعال‌سازی دستی</option></select></label>
+            <button className="primary-button" type="submit">ذخیره تنظیمات</button>
+          </form>
+        ) : null}
+      </section>
+      */}
+
       <section className="account-summary-grid" aria-label="آمار اکانت‌ها">
         {[
-          ["کل اکانت‌ها", summary.total_accounts],
-          ["احراز شده", summary.authenticated_accounts],
-          ["نیازمند ورود", summary.login_required_accounts],
-          ["آماده", summary.ready_accounts],
-          ["غیرفعال", disabledCount],
+          ["همه اکانت‌ها", operatorSummary.total],
+          [BALE_AUTH_LABELS.ready, operatorSummary.ready],
+          ["نیازمند اقدام", operatorSummary.needsAttention],
         ].map(([label, value]) => <article key={label}><span>{label}</span><strong>{loading ? "…" : value ?? 0}</strong></article>)}
       </section>
 
       <section className="account-list-panel">
         <div className="account-list-toolbar">
-          <label><Search size={16} /><input aria-label="جستجوی اکانت" placeholder="شماره ماسک‌شده، account_id یا وضعیت" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} /></label>
+          <label><Search size={16} /><input aria-label="جستجوی اکانت" placeholder="شماره کامل، account_id یا وضعیت" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} /></label>
           <select aria-label="فیلتر وضعیت" value={filter} onChange={(event) => { setFilter(event.target.value); setPage(1); }}>
             <option value="all">همه وضعیت‌ها</option>
-            {Object.entries(statusLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+            {[...new Set(Object.values(BALE_AUTH_LABELS))].map((label) => <option key={label} value={label}>{label}</option>)}
           </select>
         </div>
 
@@ -300,37 +458,32 @@ export default function BaleAccounts() {
           {visible.map((account) => {
             const session = sessions[account.account_id];
             const isOpen = expanded === account.account_id;
-            const hasActiveSession = Boolean(session?.maintenance_session_id && !session?.status?.closed);
-            const persistenceNeeded = account.lifecycle_status === "persistence_check_required";
+            const state = userState(account, session, busy);
+            const openAvailability = actionAvailability(account, "open_login");
+            const recheckAvailability = actionAvailability(account, "session_recheck");
+            const deleteAvailability = actionAvailability(account, "delete_account");
+            const resetAvailability = actionAvailability(account, "reset_profile");
             return (
               <article className="dynamic-account-row account-centric-row" key={account.account_id}>
-                <button className="account-row-main" onClick={() => setExpanded(isOpen ? "" : account.account_id)} aria-expanded={isOpen}>
+                <div className="account-row-main">
                   <span className={`health-dot health-${account.health_status}`} />
-                  <span><b>{account.masked_identifier || "شماره ثبت نشده"}</b><small>{account.account_id}</small></span>
-                  <span><b>{account.profile_present ? "پروفایل دائمی موجود" : "پروفایل ناموجود"}</b><small>{statusLabels[account.lifecycle_status] || account.lifecycle_status}</small></span>
-                  <span><b>{account.authentication_status}</b><small>نشست: {account.session_persistence_status}</small></span>
-                  {isOpen ? <ChevronUp /> : <ChevronDown />}
-                </button>
+                  <span><b>{account.display_name || accountPhone(account)}</b><small>{account.display_name ? accountPhone(account) : "اکانت بله"}</small></span>
+                  <span><small>وضعیت</small><b>{state}</b></span>
+                  <div className="row-actions account-actions account-primary-actions">
+                    <button type="button" className="primary-button" title={openAvailability.reason || ""} data-disabled-reason={openAvailability.reason || ""} onClick={() => openLogin(account, "login")} disabled={openAvailability.disabled}><LockKeyhole size={15} /> ورود</button>
+                    <button type="button" className="secondary-button" title={recheckAvailability.reason || ""} data-disabled-reason={recheckAvailability.reason || ""} onClick={() => openLogin(account, "session_recheck")} disabled={recheckAvailability.disabled}>بازبینی نشست</button>
+                    <button type="button" className="danger-button" title={deleteAvailability.reason || ""} data-disabled-reason={deleteAvailability.reason || ""} onClick={() => runAccountAction(account, "delete_account")} disabled={deleteAvailability.disabled}>حذف</button>
+                    <button type="button" className="secondary-button account-more-actions" onClick={() => setExpanded(isOpen ? "" : account.account_id)} aria-expanded={isOpen}>گزینه‌های بیشتر {isOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</button>
+                  </div>
+                </div>
 
                 {isOpen ? (
                   <div className="account-row-details">
-                    <dl className="account-facts">
-                      <div><dt>آخرین تأیید</dt><dd>{account.authentication_verified_at || "ثبت نشده"}</dd></div>
-                      <div><dt>قفل مرورگر</dt><dd>{hasActiveSession ? "فعال" : "آزاد"}</dd></div>
-                      <div><dt>پروفایل</dt><dd>{account.profile_present ? "موجود و اختصاصی" : "ناموجود"}</dd></div>
-                      <div><dt>ماندگاری</dt><dd>{account.session_persistence_status}</dd></div>
-                    </dl>
-                    {account.eligibility_reasons?.length ? <p className="blocking-reasons"><AlertTriangle size={15} /> {account.eligibility_reasons.join("، ")}</p> : null}
+                    <p className="account-advanced-copy">برای رفع مشکل ورود، ابتدا «بازبینی نشست» را انجام دهید. بازنشانی فقط برای عیب‌یابی است و ورود ذخیره‌شده را پاک می‌کند.</p>
+                    {account.last_error ? <div className="inline-error" role="alert">{formatBaleAccountActionError(account.last_error)}</div> : null}
                     <div className="row-actions account-actions">
-                      <button onClick={() => openLogin(account, "login")} disabled={Boolean(busy) || hasActiveSession || account.retired}><LockKeyhole size={15} /> ورود دستی</button>
-                      <button onClick={() => confirmLogin(account)} disabled={Boolean(busy) || !hasActiveSession}><ShieldCheck size={15} /> {session?.purpose === "persistence" ? "تأیید ماندگاری نشست" : "تأیید ورود"}</button>
-                      <button onClick={() => openLogin(account, "persistence")} disabled={Boolean(busy) || hasActiveSession || (!persistenceNeeded && account.session_persistence_status === "verified")}><RefreshCw size={15} /> تست نشست ذخیره‌شده</button>
-                      <button onClick={() => closeBrowser(account)} disabled={Boolean(busy) || !hasActiveSession}><X size={15} /> بستن امن مرورگر</button>
-                      <button onClick={() => showDiagnostics(account)} disabled={Boolean(busy)}><Stethoscope size={15} /> عیب‌یابی</button>
-                      <button className="danger-link" onClick={() => disableAccount(account)} disabled={Boolean(busy) || hasActiveSession || account.lifecycle_status === "disabled" || account.retired}><CircleOff size={15} /> غیرفعال‌کردن اکانت</button>
+                      <button type="button" className="danger-button" title={resetAvailability.reason || ""} data-disabled-reason={resetAvailability.reason || ""} onClick={() => runAccountAction(account, "reset_profile")} disabled={resetAvailability.disabled}>بازنشانی اکانت</button>
                     </div>
-                    <p className="otp-safety-note">شماره و OTP فقط داخل Bale Web وارد می‌شوند؛ ClinicOS هیچ فیلد OTP ندارد.</p>
-                    <Technical value={account.last_error_code} />
                   </div>
                 ) : null}
               </article>
@@ -363,7 +516,7 @@ export default function BaleAccounts() {
               <div className="wizard-body">
                 <h3>پیش‌بررسی نیازمند اصلاح است</h3>
                 <div className="preflight-checks">
-                  {createModal.preflight.checks.map((check) => <article className={`preflight-${check.status}`} key={check.check_name}><b>{check.status === "pass" ? "✓" : "×"} {check.message_fa}</b><Technical value={check.error_code} /></article>)}
+                  {createModal.preflight.checks.map((check) => <article className={`preflight-${check.status}`} key={check.check_name}><b>{check.status === "pass" ? "✓" : "×"} {check.message_fa}</b></article>)}
                 </div>
                 <button onClick={() => setCreateModal((current) => ({ ...current, stage: "details" }))}>اصلاح شماره</button>
               </div>
@@ -375,13 +528,13 @@ export default function BaleAccounts() {
                 <h3>اکانت و پروفایل دائمی ایجاد شدند</h3>
                 <dl>
                   <div><dt>اکانت</dt><dd>{createModal.account.account_id}</dd></div>
-                  <div><dt>شماره</dt><dd>{createModal.account.masked_identifier}</dd></div>
-                  <div><dt>پروفایل</dt><dd>{createModal.account.canonical_profile_path}</dd></div>
+                  <div><dt>شماره</dt><dd>{accountPhone(createModal.account)}</dd></div>
+                  <div><dt>وضعیت</dt><dd>نیازمند ورود</dd></div>
                 </dl>
                 <p>OTP را فقط داخل Bale Web وارد کنید.</p>
                 <div className="wizard-actions">
                   <button onClick={() => setCreateModal(null)}>فعلاً بستن</button>
-                  <button className="primary-button" onClick={async () => { const opened = await openLogin(createModal.account, "login"); if (opened) setCreateModal(null); }} disabled={Boolean(busy)}><LockKeyhole size={16} /> بازکردن Chrome برای ورود</button>
+                  <button className="primary-button" onClick={async () => { const opened = await openLogin(createModal.account, "login"); if (opened) setCreateModal(null); }} disabled={Boolean(busy)}><LockKeyhole size={16} /> ورود</button>
                 </div>
               </div>
             ) : null}
@@ -389,24 +542,6 @@ export default function BaleAccounts() {
         </div>
       ) : null}
 
-      {diagnostics ? (
-        <div className="onboarding-modal-backdrop" role="presentation">
-          <section className="onboarding-modal" role="dialog" aria-modal="true" aria-label="عیب‌یابی اکانت">
-            <button className="modal-close" onClick={() => setDiagnostics(null)} aria-label="بستن"><X /></button>
-            <h2>{diagnostics.mode === "all" ? "تطبیق همه اکانت‌ها" : "عیب‌یابی اکانت"}</h2>
-            {diagnostics.results.map((result) => (
-              <article className="diagnostic-result" key={result.account_id}>
-                <h3>{result.masked_identifier} <small>{result.account_id}</small></h3>
-                <div className="check-grid">
-                  {Object.entries(result).filter(([, value]) => typeof value === "boolean").map(([key, value]) => <span className={value ? "check-pass" : "check-warn"} key={key}>{value ? "✓" : "!"} {key}</span>)}
-                </div>
-                {result.conflicts?.length ? <div className="inline-error">{result.conflicts.join("، ")}</div> : <p>تعارضی گزارش نشد؛ هیچ تغییری روی پروفایل انجام نشد.</p>}
-                <Technical value={result.recommended_action} />
-              </article>
-            ))}
-          </section>
-        </div>
-      ) : null}
     </main>
   );
 }

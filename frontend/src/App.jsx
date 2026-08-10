@@ -5,13 +5,9 @@ import CommercialAccounts from "./pages/CommercialAccounts.jsx";
 import CommercialJobs from "./pages/CommercialJobs.jsx";
 import CommercialCampaigns from "./pages/CommercialCampaigns.jsx";
 import CommercialSettings from "./pages/CommercialSettings.jsx";
-import BaleBulkCampaigns from "./pages/BaleBulkCampaigns.jsx";
-import BaleWorkspace from "./pages/BaleWorkspace.jsx";
 import CampaignExecutionEntry from "./pages/CampaignExecutionEntry.jsx";
 import OperationsAndLogs from "./pages/OperationsAndLogs.jsx";
 import BaleAccounts from "./pages/BaleAccounts.jsx";
-import PlatformSelector from "./pages/PlatformSelector.jsx";
-import PlatformWorkspace from "./pages/PlatformWorkspace.jsx";
 import ActionErrorNotice from "./components/ActionErrorNotice.jsx";
 
 const pages = {
@@ -20,26 +16,21 @@ const pages = {
   jobs: CommercialJobs,
   operations: OperationsAndLogs,
   campaigns: CommercialCampaigns,
-  baleBulk: BaleBulkCampaigns,
   logs: OperationsAndLogs,
   reports: OperationsAndLogs,
   diagnostics: OperationsAndLogs,
   settings: CommercialSettings,
-  messaging: CampaignExecutionEntry,
-  platforms: PlatformSelector
+  messaging: CampaignExecutionEntry
 };
 
 function pageToHash(pageId) {
-  if (pageId.startsWith("platform:")) {
-    return `#/platform/${pageId.split(":")[1]}`;
-  }
   return `#/${pageId}`;
 }
 
 function hashToPage() {
   const hash = window.location.hash.replace(/^#\/?/, "");
-  if (hash.startsWith("platform/")) {
-    return `platform:${hash.split("/")[1]}`;
+  if (hash === "platforms" || hash === "baleBulk" || hash.startsWith("platform/")) {
+    return "campaigns";
   }
   return hash || "dashboard";
 }
@@ -61,7 +52,14 @@ export default function App() {
   }
 
   useEffect(() => {
-    const syncFromHash = () => setActivePage(hashToPage());
+    const syncFromHash = () => {
+      const page = hashToPage();
+      setActivePage(page);
+      if (page === "campaigns" && /^(platforms|baleBulk|platform\/)/.test(window.location.hash.replace(/^#\/?/, ""))) {
+        window.history.replaceState(null, "", "#/campaigns");
+      }
+    };
+    syncFromHash();
     window.addEventListener("hashchange", syncFromHash);
     return () => window.removeEventListener("hashchange", syncFromHash);
   }, []);
@@ -80,13 +78,7 @@ export default function App() {
 
   return (
     <MainLayout activePage={activePage} onNavigate={handleNavigate}>
-      {activePage === "platform:bale" ? (
-        <BaleWorkspace />
-      ) : activePage.startsWith("platform:") ? (
-        <PlatformWorkspace platformId={activePage.split(":")[1]} />
-      ) : (
-        <Page onNavigate={handleNavigate} />
-      )}
+      <Page onNavigate={handleNavigate} />
       <ActionErrorNotice />
     </MainLayout>
   );

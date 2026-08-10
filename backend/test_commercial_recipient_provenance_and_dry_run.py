@@ -232,7 +232,7 @@ def test_contact_preparation_and_live_validation_require_confirmed_manifest() ->
         recipient, job = service.repository.create_recipient_and_job(campaign, "09304073331", "989304073331", "Bale-000001", "manual")
         _authorize(service, recipient["id"])
         details = service.repository.get_job_with_recipient(job["id"])
-        assert service.validate_live_recipient_authorization(job, details, dry_run=False)["reason"] == "recipient_input_manifest_required"
+        assert service.validate_live_recipient_authorization(job, details, execution_mode="real_send")["reason"] == "recipient_input_manifest_required"
         assert service.validate_recipient_provenance_for_contact_preparation(recipient)["error_code"] == "recipient_input_manifest_required"
 
         confirmed = service.confirm_campaign_recipients(campaign["id"], ["09305000000"], confirmation_checked=True)
@@ -240,7 +240,7 @@ def test_contact_preparation_and_live_validation_require_confirmed_manifest() ->
         other_job = confirmed["import_result"]["created_jobs"][0]
         _authorize(service, other_recipient["id"])
         other_details = service.repository.get_job_with_recipient(other_job["id"])
-        assert service.validate_live_recipient_authorization(other_job, other_details, dry_run=False)["ok"] is True
+        assert service.validate_live_recipient_authorization(other_job, other_details, execution_mode="real_send")["ok"] is True
         assert service.validate_recipient_provenance_for_contact_preparation(other_recipient)["error_code"] == "unauthorized_contact_preparation"
 
 

@@ -1,6 +1,12 @@
 const events = [];
 const listeners = new Set();
 const SECRET_KEYS = /otp|cookie|token|secret|authorization|password|storage/i;
+// Diagnostics cannot import the API client because the API client already
+// records diagnostics. Keep this base expression in sync with api/client.js so
+// browser-originated events reach FastAPI rather than Vite's own origin.
+const DIAGNOSTICS_API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8011";
+export const FRONTEND_SOURCE_REVISION = __CLINICOS_SOURCE_REVISION__;
+export const FRONTEND_SOURCE_ROOT = __CLINICOS_FRONTEND_ROOT__;
 
 function mask(value) {
   const text = String(value || "");
@@ -32,7 +38,7 @@ export function createDiagnosticEvent(input) {
     event_id: input.event_id || crypto.randomUUID(),
     action: input.action || "unknown",
     module: input.module || "frontend",
-    account_id: mask(input.account_id || idFromPath(endpoint, "account")),
+    account_id: input.account_id || idFromPath(endpoint, "account"),
     campaign_id: input.campaign_id || idFromPath(endpoint, "campaign"),
     success: Boolean(input.success),
     status: input.status || (input.success ? "succeeded" : "failed"),
@@ -42,6 +48,16 @@ export function createDiagnosticEvent(input) {
     duration_ms: Number.isFinite(input.duration_ms) ? Math.round(input.duration_ms) : null,
     related_files: input.related_files || [],
     stack_trace: input.stack_trace || null,
+    source_revision: FRONTEND_SOURCE_REVISION,
+    clicked_action: input.clicked_action || null,
+    handler_reached: input.handler_reached ?? null,
+    button_disabled: input.button_disabled ?? null,
+    disabled_reason: input.disabled_reason || null,
+    pending_state: input.pending_state || null,
+    operation_id: input.operation_id || null,
+    http_method: input.http_method || null,
+    stage: input.stage || null,
+    result: input.result || null,
   });
 }
 
@@ -50,6 +66,12 @@ export function recordDiagnosticEvent(input) {
   events.unshift(event);
   events.splice(250);
   listeners.forEach((listener) => listener(event));
+  if (typeof fetch === "function") {
+    fetch(`${DIAGNOSTICS_API_BASE_URL}/automation/diagnostics/client-events`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event), keepalive: true,
+    }).catch(() => {});
+  }
   return event;
 }
 

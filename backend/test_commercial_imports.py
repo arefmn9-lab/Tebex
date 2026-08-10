@@ -8,6 +8,7 @@ from pathlib import Path
 from modules.automation_engine.commercial_queue.import_pipeline import parse_csv_bytes, parse_paste_content, parse_xlsx_bytes
 from modules.automation_engine.commercial_queue.repository import CommercialQueueRepository
 from modules.automation_engine.commercial_queue.service import CommercialQueueService
+from modules.automation_engine.plugins.bale.contact_store import BaleContactStore
 
 
 def _service(path: Path) -> CommercialQueueService:
@@ -16,6 +17,7 @@ def _service(path: Path) -> CommercialQueueService:
         orchestrator=lambda **payload: {"success": True, "dry_run": True},
         account_auth_checker=lambda account_id: True,
         sleeper=lambda seconds: None,
+        contact_store=BaleContactStore(path.with_name("contacts.json")),
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.main import app
 from app.routes import automation as automation_routes
@@ -52,7 +53,13 @@ def _service(path: Path, probe: AdapterProbe | None = None, live_enabled: bool =
 
 
 def _campaign(service: CommercialQueueService, **overrides: object) -> dict:
-    payload = {"name": "Live Readiness", "platform": "bale", "status": "running", "source_channel_uid": "5613544284"}
+    payload = {
+        "name": "Live Readiness",
+        "platform": "bale",
+        "status": "running",
+        "source_channel_uid": "5613544284",
+        "capacity_reservation": 10,
+    }
     payload.update(overrides)
     return service.create_campaign(payload)
 
@@ -246,7 +253,7 @@ def test_apis_launch_zero_browsers_adapters_or_messages_and_expose_no_secrets() 
             assert "live_execution_feature_disabled" in readiness["blocking_reasons"]
             assert approval["approval_status"] == "pending"
             assert listed["items"]
-            assert execute.status_code == 403
+            assert execute.status_code == 409
             body = str(approval) + str(listed)
             assert "cookies" not in body
             assert "localStorage" not in body
@@ -255,6 +262,114 @@ def test_apis_launch_zero_browsers_adapters_or_messages_and_expose_no_secrets() 
             assert service.runtime_session_manager.list_active_sessions() == []
         finally:
             automation_routes.commercial_queue_service = previous
+
+
+def test_approved_execution_sets_scoped_final_send_authorization() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = AdapterProbe()
+        service = _service(Path(tmp) / "live.db", probe)
+        campaign = _campaign(service, capacity_reservation=1)
+        recipient, _job = _recipient_job(service, campaign, "989304073336", "Bale-000006")
+        _authorize(service, recipient["id"])
+        approval = service.create_live_execution_approval(
+            campaign["id"],
+            "tester",
+            "one controlled recipient",
+            ["bale_09211690533"],
+            1,
+        )
+        service.approve_live_execution_approval(approval["approval_id"], "reviewer")
+
+        result = service.execute_approved_live_campaign(approval["approval_id"])
+
+        assert result["executed"] is True
+        assert len(probe.calls) == 1
+        plan = probe.calls[0]["execution_plan"]
+        assert "allow_final_send" not in plan
+        assert plan["live_approval_id"] == approval["approval_id"]
+        assert result["campaign_capacity_reservation"]["remaining_capacity"] == 0
+
+
+def test_approved_live_execution_endpoint_runs_bounded_campaign() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = AdapterProbe()
+        service = _service(Path(tmp) / "live.db", probe)
+        campaign = _campaign(service, capacity_reservation=1)
+        recipient, _job = _recipient_job(service, campaign, "989304073338", "Bale-000008")
+        _authorize(service, recipient["id"])
+        approval = service.create_live_execution_approval(
+            campaign["id"],
+            "tester",
+            "endpoint controlled recipient",
+            ["bale_09211690533"],
+            1,
+        )
+        service.approve_live_execution_approval(approval["approval_id"], "reviewer")
+        previous = automation_routes.commercial_queue_service
+        automation_routes.commercial_queue_service = service
+        try:
+            response = TestClient(app).post(f"/automation/live-approvals/{approval['approval_id']}/execute")
+        finally:
+            automation_routes.commercial_queue_service = previous
+
+        assert response.status_code == 200
+        assert response.json()["executed"] is True
+        assert "allow_final_send" not in probe.calls[0]["execution_plan"]
+
+
+def test_production_worker_round_uses_explicit_real_send_mode() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = AdapterProbe()
+        service = _service(Path(tmp) / "live.db", probe)
+        campaign = _campaign(service, capacity_reservation=1)
+        recipient, _job = _recipient_job(service, campaign, "989304073337", "Bale-000007")
+        _authorize(service, recipient["id"])
+
+        service.run_account_round("bale_09211690533", campaign["id"], max_jobs=1)
+
+        assert len(probe.calls) == 1
+        assert "dry_run" not in probe.calls[0]["execution_plan"]
+        assert probe.calls[0]["execution_mode"] == "real_send"
+        assert "allow_final_send" not in probe.calls[0]["execution_plan"]
+
+
+def test_multiple_authenticated_healthy_accounts_enter_worker_pool() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        service = CommercialQueueService(
+            repository=CommercialQueueRepository(Path(tmp) / "live.db"),
+            account_auth_checker=lambda _account_id: False,
+            sleeper=lambda _seconds: None,
+        )
+        canonical_accounts = [
+            {"account_id": "bale_worker_a", "daily_limit": 7},
+            {"account_id": "bale_worker_b", "daily_limit": 9},
+        ]
+        operational = {
+            "authentication_status": "authenticated",
+            "session_persistence_status": "verified",
+            "verification_expired": False,
+            "retired": False,
+        }
+        for account in canonical_accounts:
+            service.update_account_settings(
+                account["account_id"],
+                {"enabled": False, "daily_limit_override": account["daily_limit"]},
+            )
+        with (
+            patch(
+                "modules.automation_engine.commercial_queue.service.bale_account_store.list_accounts",
+                return_value=canonical_accounts,
+            ),
+            patch(
+                "modules.automation_engine.commercial_queue.service.bale_onboarding_service.get_account",
+                side_effect=lambda account_id: {"account_id": account_id, **operational},
+            ),
+        ):
+            result = service.refresh_authenticated_bale_worker_eligibility()
+
+        assert set(result["enabled_account_ids"]) == {"bale_worker_a", "bale_worker_b"}
+        assert service.resolve_account_settings("bale_worker_a")["enabled"] is True
+        assert service.resolve_account_settings("bale_worker_b")["enabled"] is True
 
 
 def test_bale_000001_historical_success_remains_unchanged() -> None:
